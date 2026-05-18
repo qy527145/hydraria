@@ -1,0 +1,1444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Hydraria — Multi-thread Stream Proxy</title>
+<style>
+  :root {
+    --bg: #0a0c12;
+    --bg-2: #0e1119;
+    --panel: #141823;
+    --panel-2: #1b202c;
+    --panel-3: #232838;
+    --border: #262c3a;
+    --border-strong: #344058;
+    --text: #e8ecf3;
+    --text-dim: #aab3c5;
+    --muted: #6b7689;
+    --accent: #6ea8ff;
+    --accent-2: #9b7bff;
+    --good: #4ade80;
+    --bad: #f87171;
+    --warn: #fbbf24;
+    --info: #38bdf8;
+    --shadow: 0 10px 40px rgba(0,0,0,0.45);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, #15192a 0, transparent 60%),
+                radial-gradient(900px 500px at 110% 10%, #1a1530 0, transparent 60%),
+                var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* Header */
+  header {
+    padding: 14px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(10, 12, 18, 0.78);
+    backdrop-filter: blur(10px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    gap: 16px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-logo {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    color: #0a0c12;
+    box-shadow: 0 6px 20px rgba(110, 168, 255, 0.3);
+  }
+  .brand h1 {
+    margin: 0;
+    font-size: 16px;
+    letter-spacing: 2px;
+    font-weight: 600;
+  }
+  .brand .tagline { color: var(--muted); font-size: 11px; }
+
+  .header-right {
+    display: flex; gap: 8px; align-items: center;
+  }
+  .global-spark {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 5px 12px 5px 8px;
+  }
+  .global-spark svg { display: block; }
+  .global-spark .speed { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 600; color: var(--text); }
+  .global-spark .speed-unit { color: var(--muted); font-size: 11px; }
+
+  .stat-pill {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--text-dim);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stat-pill b { color: var(--text); font-weight: 600; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); display: inline-block; }
+  .dot.idle { background: var(--muted); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+
+  /* Toolbar */
+  .toolbar {
+    padding: 16px 28px 0 28px;
+    max-width: 1400px;
+    margin: 0 auto;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .search-wrap {
+    flex: 1;
+    min-width: 200px;
+    max-width: 380px;
+    position: relative;
+  }
+  .search-wrap input {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px 9px 32px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  .search-wrap input:focus { border-color: var(--accent); }
+  .search-wrap::before {
+    content: "🔎";
+    position: absolute;
+    left: 10px; top: 50%; transform: translateY(-50%);
+    font-size: 12px;
+    opacity: 0.6;
+  }
+  .view-toggle {
+    display: inline-flex;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 2px;
+  }
+  .view-toggle button {
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    font-weight: 500;
+    box-shadow: none;
+    transform: none;
+  }
+  .view-toggle button.active {
+    background: var(--panel);
+    color: var(--text);
+  }
+
+  /* Layout */
+  main {
+    padding: 16px 28px 32px 28px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  .empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+    font-size: 13px;
+    background: var(--panel-2);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+
+  /* Grid view */
+  .grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  }
+
+  /* List view */
+  .list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .list .task { padding: 10px 14px; }
+  .list .task .task-meta { display: none; }
+  .list .task .progress { display: none; }
+  .list .task .task-url { display: none; }
+  .list .task .compact-row {
+    display: flex; align-items: center; gap: 12px;
+    width: 100%; min-width: 0;
+  }
+  .list .task .compact-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list .task .compact-row .mini {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: var(--text-dim);
+    background: var(--bg-2); padding: 2px 8px; border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .grid .compact-row { display: none; }
+
+  .task {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .task:hover { border-color: var(--border-strong); }
+  .task.paused { opacity: 0.78; }
+  .task.expanded { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset, var(--shadow); }
+  .task-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .task-name {
+    font-weight: 600;
+    color: var(--text);
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .task-id-tag {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--panel-3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+  .badge.running { background: rgba(74, 222, 128, 0.15); color: var(--good); }
+  .badge.paused { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .badge.cache { background: rgba(56, 189, 248, 0.15); color: var(--info); }
+  .badge.persist { background: rgba(155, 123, 255, 0.15); color: var(--accent-2); }
+  .badge.limit { background: rgba(248, 113, 113, 0.12); color: var(--bad); }
+
+  .task-url {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--bg-2);
+    padding: 8px 10px;
+    border-radius: 6px;
+    word-break: break-all;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .task-url .url-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .copy-btn {
+    flex-shrink: 0;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 3px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+    box-shadow: none;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--border-strong); transform: none; box-shadow: none; }
+  .copy-btn.copied {
+    color: #0a0c12;
+    background: var(--good);
+    border-color: var(--good);
+  }
+
+  .task-meta {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .meta-cell {
+    background: var(--bg-2);
+    padding: 8px 10px;
+    border-radius: 6px;
+  }
+  .meta-cell .label {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+  .meta-cell .value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 2px;
+  }
+  .task-spark {
+    margin-bottom: 10px;
+    background: var(--bg-2);
+    border-radius: 6px;
+    padding: 8px 10px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .task-spark .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+  .task-spark .value { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text); font-weight: 600; }
+  .task-spark .value .unit { color: var(--muted); font-weight: 400; margin-left: 2px; }
+
+  .progress {
+    height: 4px;
+    background: var(--bg-2);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--info));
+    transition: width 0.3s;
+  }
+
+  .task-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .task-actions .spacer { flex: 1; }
+
+  /* Source health panel */
+  .health-panel {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+  .health-panel h4 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+  }
+  .health-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 10px;
+    background: var(--bg-2);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 12px;
+  }
+  .health-row .src-status {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .health-row .src-status.ok { background: rgba(74, 222, 128, 0.15); color: var(--good); }
+  .health-row .src-status.warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .health-row .src-status.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+  .health-row .src-status.idle { background: var(--panel-3); color: var(--muted); }
+  .health-row .src-url {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .health-row .src-metric {
+    color: var(--text);
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+  }
+  .health-row .src-metric .unit { color: var(--muted); margin-left: 2px; }
+  .health-row .err { grid-column: 1 / -1; color: var(--bad); font-size: 11px; padding-left: 0; }
+
+  /* Buttons */
+  button {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #0a0c12;
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 13px;
+    transition: transform 0.1s, box-shadow 0.15s;
+  }
+  button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(110, 168, 255, 0.3); }
+  button:active:not(:disabled) { transform: translateY(0); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+  button.ghost {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    font-weight: 500;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+  button.ghost:hover:not(:disabled) { background: var(--panel-2); box-shadow: none; }
+  button.danger {
+    background: transparent;
+    color: var(--bad);
+    border: 1px solid var(--bad);
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  button.danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.1); box-shadow: none; }
+  button.warn {
+    background: transparent;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  button.warn:hover:not(:disabled) { background: rgba(251, 191, 36, 0.1); box-shadow: none; }
+  button.good {
+    background: transparent;
+    color: var(--good);
+    border: 1px solid var(--good);
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  button.good:hover:not(:disabled) { background: rgba(74, 222, 128, 0.1); box-shadow: none; }
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+  }
+  .modal-bg.show { display: flex; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    padding: 24px;
+    width: 600px;
+    max-width: 95vw;
+    max-height: 92vh;
+    overflow: auto;
+    box-shadow: var(--shadow);
+  }
+  .modal h3 {
+    margin: 0 0 4px;
+    font-size: 16px;
+  }
+  .modal .modal-sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 20px;
+  }
+
+  /* Form */
+  label.field {
+    display: block;
+    font-size: 11px;
+    color: var(--muted);
+    margin: 14px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 500;
+  }
+  label.field .hint-inline {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-dim);
+    font-weight: 400;
+    margin-left: 8px;
+  }
+  input[type="text"], input[type="number"], textarea, select {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+  input.invalid, textarea.invalid { border-color: var(--bad); }
+  textarea {
+    resize: vertical;
+    min-height: 76px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  textarea.headers { min-height: 84px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .check input { width: auto; margin: 0; }
+  .check span { font-size: 13px; }
+  .check .desc { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; }
+
+  .hint, .err-text { font-size: 11px; margin-top: 4px; }
+  .hint { color: var(--muted); }
+  .err-text { color: var(--bad); }
+  .ok-text { color: var(--good); font-size: 11px; margin-top: 4px; }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    padding: 12px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    box-shadow: var(--shadow);
+    transform: translateY(20px);
+    opacity: 0;
+    transition: all 0.25s ease;
+    z-index: 100;
+    max-width: 400px;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.error { border-color: var(--bad); color: var(--bad); }
+  .toast.ok { border-color: var(--good); color: var(--good); }
+
+  /* Tooltip — pure CSS, anchored above by default, below for in-header
+     elements so they don't get clipped by sticky-header overflow. */
+  [data-tip] { position: relative; }
+  [data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: 100%; left: 50%; transform: translateX(-50%) translateY(-6px);
+    background: var(--panel-3);
+    border: 1px solid var(--border-strong);
+    padding: 5px 9px;
+    border-radius: 6px;
+    font-size: 11px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 200;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    color: var(--text);
+  }
+  /* In header, tooltip flips downward to avoid being clipped by the
+     viewport top edge / sticky header overflow. */
+  header [data-tip]:hover::after {
+    bottom: auto;
+    top: 100%;
+    transform: translateX(-50%) translateY(6px);
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-logo">H</div>
+      <div>
+        <h1>HYDRARIA</h1>
+        <div class="tagline">multi-thread HTTP stream proxy</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="global-spark" title="实时全局吞吐">
+        <svg id="global-spark-svg" width="80" height="22"></svg>
+        <span class="speed" id="global-speed">0 B/s</span>
+      </div>
+      <span class="stat-pill" data-tip="任务数"><span class="dot" id="health-dot"></span>tasks <b id="stat-tasks">0</b></span>
+      <span class="stat-pill" data-tip="当前活跃连接">active <b id="stat-active">0</b></span>
+      <span class="stat-pill" data-tip="进程内已服务字节总计">served <b id="stat-served">0 B</b></span>
+      <span class="stat-pill" data-tip="所有任务的本地缓存占用">cache <b id="stat-cache">0 B</b></span>
+      <button class="ghost" id="btn-settings" data-tip="全局设置">⚙ 设置</button>
+      <button id="btn-open-create">+ 新建任务</button>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <input id="search" type="text" placeholder="按名称 / ID / URL 搜索任务" />
+    </div>
+    <div class="view-toggle">
+      <button id="view-grid" class="active" data-tip="网格视图">▦ 网格</button>
+      <button id="view-list" data-tip="列表视图">≡ 列表</button>
+    </div>
+    <span style="flex:1"></span>
+    <span class="stat-pill" id="filtered-pill" style="display:none;"></span>
+  </div>
+
+  <main>
+    <div id="task-container" class="grid"></div>
+  </main>
+
+  <!-- Create modal -->
+  <div class="modal-bg" id="create-modal">
+    <div class="modal">
+      <h3>新建代理任务</h3>
+      <div class="modal-sub">配置完成后将生成一个可粘进 VLC / 浏览器 / aria2 的短链 URL。</div>
+
+      <label class="field">源 URL — 每行一个 <span class="hint-inline" id="urls-count">尚未输入</span></label>
+      <textarea id="f-urls" placeholder="https://server1.com/file.mp4&#10;https://server2.com/file.mp4"></textarea>
+
+      <div class="row">
+        <div>
+          <label class="field">最大并发线程</label>
+          <input id="f-threads" type="number" value="16" min="1" max="128" />
+        </div>
+        <div>
+          <label class="field">分片大小 <span class="hint-inline">如 5M / 1M / 512K</span></label>
+          <input id="f-split" type="text" value="5M" />
+          <div class="hint" id="f-split-hint">合法</div>
+        </div>
+      </div>
+
+      <label class="field">自定义请求头 (JSON,可空) <span class="hint-inline" id="headers-status">空</span></label>
+      <textarea id="f-headers" class="headers" placeholder='{"User-Agent": "Mozilla/5.0", "Cookie": "session=xxxx"}'></textarea>
+
+      <div class="row">
+        <div>
+          <label class="field">任务名 (可选)</label>
+          <input id="f-name" type="text" placeholder="my-movie" />
+        </div>
+        <div>
+          <label class="field">单任务限速 <span class="hint-inline">如 2M, 留空 = 不限</span></label>
+          <input id="f-rate" type="text" placeholder="例如 2M" />
+        </div>
+      </div>
+
+      <label class="field">限速算法 <span class="hint-inline" id="f-algo-hint">仅当限速 &gt; 0 时生效</span></label>
+      <select id="f-algorithm">
+        <option value="token_bucket">令牌桶（默认） — 允许短突发</option>
+        <option value="sliding_window">滑动窗口 — 任意 1 秒内绝对不超</option>
+      </select>
+
+      <div class="row" style="margin-top: 12px;">
+        <label class="check">
+          <input type="checkbox" id="f-cache" />
+          <span>启用本地磁盘缓存<span class="desc">命中后零外发流量</span></span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="f-persist" />
+          <span>持久化保存<span class="desc">下次启动自动恢复</span></span>
+        </label>
+      </div>
+
+      <div class="modal-actions">
+        <button class="ghost" id="btn-create-cancel">取消</button>
+        <button id="btn-create" disabled>生成短链 &amp; 启动任务</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit modal -->
+  <div class="modal-bg" id="edit-modal">
+    <div class="modal">
+      <h3>编辑任务 <span style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);" id="edit-id"></span></h3>
+      <div class="modal-sub">更改会立刻应用到后续连接（已建立的流不受影响）。</div>
+
+      <label class="field">源 URL <span class="hint-inline" id="e-urls-count"></span></label>
+      <textarea id="e-urls"></textarea>
+
+      <div class="row">
+        <div>
+          <label class="field">线程数</label>
+          <input id="e-threads" type="number" min="1" max="128" />
+        </div>
+        <div>
+          <label class="field">分片大小</label>
+          <input id="e-split" type="text" />
+          <div class="hint" id="e-split-hint">&nbsp;</div>
+        </div>
+      </div>
+
+      <label class="field">请求头 (JSON) <span class="hint-inline" id="e-headers-status">空</span></label>
+      <textarea id="e-headers" class="headers"></textarea>
+
+      <div class="row">
+        <div>
+          <label class="field">名称</label>
+          <input id="e-name" type="text" />
+        </div>
+        <div>
+          <label class="field">单任务限速</label>
+          <input id="e-rate" type="text" placeholder="不限" />
+        </div>
+      </div>
+
+      <label class="field">限速算法</label>
+      <select id="e-algorithm">
+        <option value="token_bucket">令牌桶 — 允许短突发</option>
+        <option value="sliding_window">滑动窗口 — 任意 1 秒内绝对不超</option>
+      </select>
+
+      <div class="row" style="margin-top: 12px;">
+        <label class="check">
+          <input type="checkbox" id="e-cache" />
+          <span>启用磁盘缓存</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="e-persist" />
+          <span>持久化保存</span>
+        </label>
+      </div>
+
+      <div class="modal-actions">
+        <button class="ghost" id="btn-edit-cancel">取消</button>
+        <button id="btn-edit-save" disabled>保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div class="modal-bg" id="settings-modal">
+    <div class="modal">
+      <h3>全局设置</h3>
+      <div class="modal-sub">所有任务共享的限制与状态。</div>
+
+      <label class="field">全局限速 <span class="hint-inline">所有流量总和，留空或 0 = 不限</span></label>
+      <input id="s-rate" type="text" placeholder="例如 10M" />
+      <div class="hint" id="s-rate-hint">合法</div>
+
+      <label class="field">限速算法</label>
+      <select id="s-algorithm">
+        <option value="token_bucket">令牌桶 — 累计令牌，可短时突发（≤ 0.5s 配额）</option>
+        <option value="sliding_window">滑动窗口 — 任意 1 秒内累计字节绝对 ≤ 限速</option>
+      </select>
+      <div class="hint" id="s-algorithm-hint">切换会立刻生效，已累计的预算被清零。</div>
+
+      <div style="margin-top: 18px; padding: 14px; background: var(--panel-2); border-radius: 8px; border: 1px solid var(--border);">
+        <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px;">缓存占用 (当前进程)</div>
+        <div style="font-size: 20px; font-weight: 600; margin-top: 4px;" id="s-cache-total">0 B</div>
+        <div style="font-size: 11px; color: var(--muted); margin-top: 4px;" id="s-cache-detail"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="ghost" id="btn-settings-cancel">关闭</button>
+        <button id="btn-settings-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+
+let lastTasks = [];
+let lastGlobal = null;
+let viewMode = localStorage.getItem("hydraria.view") || "grid";
+let searchQuery = "";
+let expandedTaskId = null;
+let editingId = null;
+
+const SPLIT_RE = /^\s*[0-9]+(\.[0-9]+)?\s*([kKmMgG][bB]?|[bB])?\s*$/;
+
+/* ---- utils ---- */
+function toast(msg, kind = "") {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast show " + kind;
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.className = "toast " + kind; }, 2600);
+}
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "—";
+  if (n === 0) return "0 B";
+  const units = ["B","K","M","G","T"];
+  let i = 0; let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + units[i];
+}
+function fmtBps(n) {
+  return fmtBytes(n) + "/s";
+}
+function fmtAge(unix) {
+  if (!unix) return "—";
+  const now = Math.floor(Date.now() / 1000);
+  const s = now - unix;
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function fmtMs(n) {
+  if (!n && n !== 0) return "—";
+  if (n < 1000) return n + " ms";
+  return (n / 1000).toFixed(2) + " s";
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { const j = await res.json(); msg = j.error || msg; } catch {}
+    throw new Error(msg);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+/* ---- sparkline ---- */
+function sparkline(samples, w, h, color = "#6ea8ff") {
+  if (!samples || samples.length === 0) {
+    return `<svg width="${w}" height="${h}"></svg>`;
+  }
+  const peak = Math.max(1, ...samples);
+  const n = samples.length;
+  const step = n > 1 ? w / (n - 1) : 0;
+  const pts = samples.map((v, i) => {
+    const x = i * step;
+    const y = h - (v / peak) * (h - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />
+  </svg>`;
+}
+
+/* ---- refresh loop ---- */
+async function refresh() {
+  try {
+    const [tasks, global] = await Promise.all([
+      api("/api/tasks"),
+      api("/api/global"),
+    ]);
+    lastTasks = tasks;
+    lastGlobal = global;
+    renderHeader(global, tasks);
+    render(tasks);
+    $("#health-dot").className = "dot";
+  } catch (e) {
+    $("#health-dot").className = "dot bad";
+  }
+}
+
+function renderHeader(g, tasks) {
+  $("#stat-tasks").textContent = tasks.length;
+  const active = tasks.reduce((a, t) => a + (t.active_connections || 0), 0);
+  $("#stat-active").textContent = active;
+  $("#stat-served").textContent = fmtBytes(g.bytes_served_total);
+  $("#stat-cache").textContent = fmtBytes(g.cache_total_bytes);
+  $("#global-speed").innerHTML = `${fmtBps(g.current_speed_bps)}`;
+  $("#global-spark-svg").outerHTML =
+    `<svg id="global-spark-svg" width="80" height="22">${sparkline(g.speed_samples, 80, 22).replace(/<\/?svg[^>]*>/g,"")}</svg>`;
+}
+
+function filteredTasks() {
+  const q = searchQuery.trim().toLowerCase();
+  if (!q) return lastTasks;
+  return lastTasks.filter(t =>
+    (t.config.name || "").toLowerCase().includes(q) ||
+    t.task_id.toLowerCase().includes(q) ||
+    t.config.urls.some(u => u.toLowerCase().includes(q))
+  );
+}
+
+function render(tasks) {
+  const list = filteredTasks();
+  const container = $("#task-container");
+  container.className = viewMode === "grid" ? "grid" : "list";
+
+  if (!list.length) {
+    container.innerHTML = `<div class="empty">${
+      tasks.length === 0
+        ? '尚无任务。右上角 <b>+ 新建任务</b> 创建第一个代理短链。'
+        : `搜索 “${escapeHtml(searchQuery)}” 没有匹配的任务。`
+    }</div>`;
+    $("#filtered-pill").style.display = "none";
+    return;
+  }
+
+  if (searchQuery && list.length !== tasks.length) {
+    $("#filtered-pill").textContent = `匹配 ${list.length} / ${tasks.length} 个任务`;
+    $("#filtered-pill").style.display = "";
+  } else {
+    $("#filtered-pill").style.display = "none";
+  }
+
+  container.innerHTML = list.map(taskCard).join("");
+  attachCardEvents(container);
+}
+
+function taskCard(t) {
+  const isPaused = t.paused;
+  const isExpanded = expandedTaskId === t.task_id;
+  const name = (t.config.name || "(unnamed)");
+  const cache = t.cache;
+  const cachePct = cache && cache.blocks_total > 0
+    ? Math.round((cache.blocks_cached / cache.blocks_total) * 100)
+    : null;
+  const hitRate = cache && (cache.hits + cache.misses) > 0
+    ? Math.round((cache.hits / (cache.hits + cache.misses)) * 100)
+    : null;
+
+  const speedSvg = sparkline(t.speed_samples || [], 100, 22);
+
+  const badges = [];
+  if (isPaused) {
+    badges.push('<span class="badge paused">paused</span>');
+  } else {
+    badges.push('<span class="badge running"><span class="dot"></span>running</span>');
+  }
+  if (t.config.cache) badges.push('<span class="badge cache">cache</span>');
+  if (t.config.persist) badges.push('<span class="badge persist">persist</span>');
+  if (t.config.rate_limit_bps > 0) {
+    const algo = t.config.rate_limit_algorithm === "sliding_window" ? "SW" : "TB";
+    badges.push(`<span class="badge limit" data-tip="${algo === "TB" ? "令牌桶" : "滑动窗口"} · ≤ ${fmtBps(t.config.rate_limit_bps)}">≤${fmtBps(t.config.rate_limit_bps)} · ${algo}</span>`);
+  }
+
+  const healthHtml = isExpanded ? renderHealthPanel(t) : "";
+
+  return `
+  <div class="task ${isPaused ? 'paused' : ''} ${isExpanded ? 'expanded' : ''}" data-task="${t.task_id}">
+    <div class="compact-row">
+      <span class="task-id-tag">${t.task_id}</span>
+      <span class="name">${escapeHtml(name)}</span>
+      <span class="mini">${t.config.urls.length} src · ${fmtBps(t.current_speed_bps)}</span>
+      ${badges.join("")}
+      ${actionsHtml(t)}
+    </div>
+
+    <div class="task-head">
+      <div class="task-name">
+        <span class="task-id-tag">${t.task_id}</span>
+        <span>${escapeHtml(name)}</span>
+      </div>
+      <div style="display:flex; gap:6px;">${badges.join("")}</div>
+    </div>
+
+    <div class="task-url">
+      <span class="url-text">${t.proxy_url}</span>
+      <button class="copy-btn" data-copy="${t.proxy_url}">复制</button>
+    </div>
+
+    <div class="task-spark">
+      <span class="label">实时吞吐</span>
+      <span style="display:flex; align-items:center; gap:10px;">
+        ${speedSvg}
+        <span class="value">${fmtBytes(t.current_speed_bps)}<span class="unit">/s</span></span>
+      </span>
+    </div>
+
+    ${cachePct !== null ? `
+      <div class="progress" title="cached ${cache.blocks_cached}/${cache.blocks_total} blocks (${fmtBytes(cache.bytes_cached)}/${fmtBytes(cache.total_size)})">
+        <div class="progress-bar" style="width: ${cachePct}%;"></div>
+      </div>
+    ` : ''}
+
+    <div class="task-meta">
+      <div class="meta-cell">
+        <div class="label">sources</div>
+        <div class="value">${t.config.urls.length} · ${t.config.max_threads} thr</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">served</div>
+        <div class="value">${fmtBytes(t.bytes_served)}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">${cache ? 'cached' : 'split'}</div>
+        <div class="value">${cache
+          ? fmtBytes(cache.bytes_cached) + (cachePct !== null ? ` <span style="color:var(--muted);font-weight:400;font-size:11px;">(${cachePct}%)</span>` : '')
+          : fmtBytes(t.config.max_split)}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">${cache ? 'hit-rate' : 'conns'}</div>
+        <div class="value">${cache
+          ? (hitRate === null ? '—' : hitRate + '%') + ` <span style="color:var(--muted);font-weight:400;font-size:11px;">${cache.hits}H/${cache.misses}M</span>`
+          : t.active_connections}</div>
+      </div>
+    </div>
+
+    <div class="task-actions">
+      ${actionsHtml(t)}
+      <span class="spacer"></span>
+      <button class="ghost" data-toggle-health="${t.task_id}">${isExpanded ? '收起源看板 ▴' : '源看板 ▾'}</button>
+    </div>
+    ${healthHtml}
+  </div>`;
+}
+
+function actionsHtml(t) {
+  return `
+    ${t.paused
+      ? `<button class="good" data-resume="${t.task_id}">▶ 恢复</button>`
+      : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
+    <button class="ghost" data-edit="${t.task_id}">✎ 编辑</button>
+    ${t.cache ? `<button class="ghost" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : ''}
+    <button class="danger" data-del="${t.task_id}" data-tip="删除任务（保留缓存）">删除</button>
+    ${t.cache ? `<button class="danger" data-del-with-cache="${t.task_id}" data-tip="删除任务并清空缓存">删除+清缓存</button>` : ''}
+  `;
+}
+
+function renderHealthPanel(t) {
+  const rows = (t.url_health || []).map(h => {
+    const cls = healthClass(h);
+    const speed = h.current_speed_bps > 0 ? fmtBps(h.current_speed_bps) : '0 B/s';
+    return `
+      <div class="health-row">
+        <span class="src-status ${cls}">${h.last_status || (h.last_error ? 'ERR' : '—')}</span>
+        <span class="src-url" title="${escapeHtml(h.url)}">${escapeHtml(h.url)}</span>
+        <span class="src-metric" data-tip="last latency / ping">${fmtMs(h.last_latency_ms)}</span>
+        <span class="src-metric" data-tip="current speed">${speed}</span>
+        <span class="src-metric" data-tip="bytes contributed">${fmtBytes(h.bytes_contributed)}</span>
+        ${h.last_error ? `<div class="err">⚠ ${escapeHtml(h.last_error)}</div>` : ''}
+      </div>
+    `;
+  }).join("");
+  return `
+    <div class="health-panel">
+      <h4>源状态看板</h4>
+      ${rows || '<div style="color: var(--muted); font-size: 12px;">尚未发起请求，暂无数据。</div>'}
+    </div>
+  `;
+}
+
+function healthClass(h) {
+  if (h.last_error) return "bad";
+  if (h.last_status === null) return "idle";
+  if (h.last_status >= 200 && h.last_status < 400) return "ok";
+  if (h.last_status >= 400 && h.last_status < 500) return "warn";
+  return "bad";
+}
+
+function attachCardEvents(root) {
+  root.querySelectorAll("[data-copy]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    copyToClipboard(b.dataset.copy, b);
+  });
+  root.querySelectorAll("[data-pause]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.pause}/pause`, "POST", "已暂停");
+  });
+  root.querySelectorAll("[data-resume]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.resume}/resume`, "POST", "已恢复");
+  });
+  root.querySelectorAll("[data-edit]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    openEdit(b.dataset.edit);
+  });
+  root.querySelectorAll("[data-clear-cache]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm("清空该任务的磁盘缓存？")) return;
+    doAction(`/api/tasks/${b.dataset.clearCache}/cache`, "DELETE", "缓存已清空");
+  });
+  root.querySelectorAll("[data-del]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.del;
+    if (!confirm(`删除任务 ${id}？短链将立即失效（缓存保留在磁盘）。`)) return;
+    doAction(`/api/tasks/${id}`, "DELETE", "任务已删除");
+  });
+  root.querySelectorAll("[data-del-with-cache]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.delWithCache;
+    if (!confirm(`删除任务 ${id} 并清空它的缓存？`)) return;
+    (async () => {
+      try {
+        await api(`/api/tasks/${id}/cache`, { method: "DELETE" });
+        await api(`/api/tasks/${id}`, { method: "DELETE" });
+        toast("任务与缓存均已删除", "ok");
+        refresh();
+      } catch (e) { toast("失败：" + e.message, "error"); }
+    })();
+  });
+  root.querySelectorAll("[data-toggle-health]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.toggleHealth;
+    expandedTaskId = (expandedTaskId === id) ? null : id;
+    render(lastTasks);
+  });
+}
+
+async function copyToClipboard(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (btn) {
+      const orig = btn.textContent;
+      btn.classList.add("copied");
+      btn.textContent = "✓ 已复制";
+      setTimeout(() => {
+        btn.classList.remove("copied");
+        btn.textContent = orig;
+      }, 1500);
+    } else {
+      toast("已复制：" + text, "ok");
+    }
+  } catch (e) {
+    toast("复制失败：" + e.message, "error");
+  }
+}
+
+async function doAction(path, method, okMsg) {
+  try {
+    await api(path, { method });
+    toast(okMsg, "ok");
+    refresh();
+  } catch (e) {
+    toast("失败：" + e.message, "error");
+  }
+}
+
+/* ---- create modal ---- */
+
+function validateUrls(textareaEl, counterEl) {
+  const urls = textareaEl.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (urls.length === 0) {
+    counterEl.textContent = "尚未输入";
+    counterEl.style.color = "";
+    return { valid: false, urls };
+  }
+  const bad = urls.filter(u => !/^https?:\/\//i.test(u));
+  if (bad.length) {
+    counterEl.textContent = `已识别 ${urls.length} 行,但有 ${bad.length} 行不是 http(s) 开头`;
+    counterEl.style.color = "var(--warn)";
+    return { valid: false, urls };
+  }
+  counterEl.textContent = `已识别出 ${urls.length} 个有效下载源`;
+  counterEl.style.color = "var(--good)";
+  return { valid: true, urls };
+}
+
+function validateSplit(inputEl, hintEl) {
+  const v = inputEl.value.trim();
+  if (!v) { hintEl.textContent = "默认 5M"; hintEl.className = "hint"; inputEl.classList.remove("invalid"); return { valid: true, value: "5M" }; }
+  const ok = SPLIT_RE.test(v);
+  if (!ok) {
+    hintEl.textContent = '格式错误,需匹配 ^[0-9]+[kKmMgG]?B?$,例如 512K / 5M / 1G';
+    hintEl.className = "err-text";
+    inputEl.classList.add("invalid");
+    return { valid: false };
+  }
+  hintEl.textContent = "✓ 合法";
+  hintEl.className = "ok-text";
+  inputEl.classList.remove("invalid");
+  return { valid: true, value: v };
+}
+
+function validateHeaders(inputEl, statusEl) {
+  const raw = inputEl.value.trim();
+  if (!raw) {
+    statusEl.textContent = "空";
+    statusEl.style.color = "";
+    inputEl.classList.remove("invalid");
+    return { valid: true, headers: {} };
+  }
+  try {
+    const obj = JSON.parse(raw);
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+      throw new Error("must be a JSON object");
+    }
+    const n = Object.keys(obj).length;
+    statusEl.textContent = `✓ 合法 (${n} 项)`;
+    statusEl.style.color = "var(--good)";
+    inputEl.classList.remove("invalid");
+    return { valid: true, headers: obj };
+  } catch (e) {
+    statusEl.textContent = "✗ " + e.message;
+    statusEl.style.color = "var(--bad)";
+    inputEl.classList.add("invalid");
+    return { valid: false };
+  }
+}
+
+function validateRate(inputEl) {
+  const v = inputEl.value.trim();
+  if (!v) return { valid: true, value: 0 };
+  if (!SPLIT_RE.test(v)) {
+    inputEl.classList.add("invalid");
+    return { valid: false };
+  }
+  inputEl.classList.remove("invalid");
+  return { valid: true, value: v };
+}
+
+function revalidateCreate() {
+  const u = validateUrls($("#f-urls"), $("#urls-count"));
+  const s = validateSplit($("#f-split"), $("#f-split-hint"));
+  const h = validateHeaders($("#f-headers"), $("#headers-status"));
+  const r = validateRate($("#f-rate"));
+  $("#btn-create").disabled = !(u.valid && s.valid && h.valid && r.valid);
+}
+
+function revalidateEdit() {
+  const u = validateUrls($("#e-urls"), $("#e-urls-count"));
+  const s = validateSplit($("#e-split"), $("#e-split-hint"));
+  const h = validateHeaders($("#e-headers"), $("#e-headers-status"));
+  const r = validateRate($("#e-rate"));
+  $("#btn-edit-save").disabled = !(u.valid && s.valid && h.valid && r.valid);
+}
+
+["f-urls","f-split","f-headers","f-rate"].forEach(id =>
+  $("#"+id).addEventListener("input", revalidateCreate));
+["e-urls","e-split","e-headers","e-rate"].forEach(id =>
+  $("#"+id).addEventListener("input", revalidateEdit));
+
+function openCreate() {
+  $("#f-urls").value = "";
+  $("#f-headers").value = "";
+  $("#f-name").value = "";
+  $("#f-rate").value = "";
+  $("#f-threads").value = "16";
+  $("#f-split").value = "5M";
+  $("#f-cache").checked = false;
+  $("#f-persist").checked = false;
+  $("#f-algorithm").value = "token_bucket";
+  revalidateCreate();
+  $("#create-modal").classList.add("show");
+  setTimeout(() => $("#f-urls").focus(), 80);
+}
+function closeCreate() { $("#create-modal").classList.remove("show"); }
+
+$("#btn-open-create").onclick = openCreate;
+$("#btn-create-cancel").onclick = closeCreate;
+$("#create-modal").onclick = (e) => { if (e.target.id === "create-modal") closeCreate(); };
+
+$("#btn-create").onclick = async () => {
+  const u = validateUrls($("#f-urls"), $("#urls-count"));
+  const s = validateSplit($("#f-split"), $("#f-split-hint"));
+  const h = validateHeaders($("#f-headers"), $("#headers-status"));
+  const r = validateRate($("#f-rate"));
+  if (!(u.valid && s.valid && h.valid && r.valid)) return;
+  const payload = {
+    urls: u.urls,
+    max_threads: parseInt($("#f-threads").value, 10) || 8,
+    max_split: s.value,
+    cache: $("#f-cache").checked,
+    persist: $("#f-persist").checked,
+    headers: h.headers,
+    name: $("#f-name").value.trim() || null,
+    rate_limit_bps: r.value || 0,
+    rate_limit_algorithm: $("#f-algorithm").value,
+  };
+  try {
+    const res = await api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
+    toast("已创建：" + res.proxy_url, "ok");
+    closeCreate();
+    refresh();
+  } catch (e) {
+    toast("创建失败：" + e.message, "error");
+  }
+};
+
+/* ---- edit modal ---- */
+function openEdit(id) {
+  const t = lastTasks.find(x => x.task_id === id);
+  if (!t) return;
+  editingId = id;
+  $("#edit-id").textContent = id;
+  $("#e-urls").value = t.config.urls.join("\n");
+  $("#e-threads").value = t.config.max_threads;
+  $("#e-split").value = (fmtBytes(t.config.max_split)).replace(/ /g, '');
+  $("#e-headers").value = Object.keys(t.config.headers || {}).length
+    ? JSON.stringify(t.config.headers, null, 2)
+    : "";
+  $("#e-name").value = t.config.name || "";
+  $("#e-rate").value = t.config.rate_limit_bps > 0 ? fmtBytes(t.config.rate_limit_bps).replace(/ /g,'') : "";
+  $("#e-cache").checked = !!t.config.cache;
+  $("#e-persist").checked = !!t.config.persist;
+  $("#e-algorithm").value = t.config.rate_limit_algorithm || "token_bucket";
+  revalidateEdit();
+  $("#edit-modal").classList.add("show");
+}
+function closeEdit() { $("#edit-modal").classList.remove("show"); editingId = null; }
+$("#btn-edit-cancel").onclick = closeEdit;
+$("#edit-modal").onclick = (e) => { if (e.target.id === "edit-modal") closeEdit(); };
+$("#btn-edit-save").onclick = async () => {
+  if (!editingId) return;
+  const u = validateUrls($("#e-urls"), $("#e-urls-count"));
+  const s = validateSplit($("#e-split"), $("#e-split-hint"));
+  const h = validateHeaders($("#e-headers"), $("#e-headers-status"));
+  const r = validateRate($("#e-rate"));
+  if (!(u.valid && s.valid && h.valid && r.valid)) return;
+  const payload = {
+    urls: u.urls,
+    max_threads: parseInt($("#e-threads").value, 10) || 8,
+    max_split: s.value,
+    headers: h.headers,
+    name: $("#e-name").value.trim() || null,
+    cache: $("#e-cache").checked,
+    persist: $("#e-persist").checked,
+    rate_limit_bps: r.value || 0,
+    rate_limit_algorithm: $("#e-algorithm").value,
+  };
+  try {
+    await api(`/api/tasks/${editingId}`, { method: "PATCH", body: JSON.stringify(payload) });
+    toast("配置已保存", "ok");
+    closeEdit();
+    refresh();
+  } catch (e) {
+    toast("保存失败：" + e.message, "error");
+  }
+};
+
+/* ---- settings ---- */
+
+async function openSettings() {
+  try {
+    const s = await api("/api/settings");
+    $("#s-rate").value = s.global_rate_limit_bps > 0
+      ? fmtBytes(s.global_rate_limit_bps).replace(/ /g,'')
+      : "";
+    $("#s-rate-hint").textContent = "0 或留空 = 不限";
+    $("#s-rate-hint").className = "hint";
+    $("#s-algorithm").value = s.global_rate_limit_algorithm || "token_bucket";
+    if (lastGlobal) {
+      $("#s-cache-total").textContent = fmtBytes(lastGlobal.cache_total_bytes);
+      $("#s-cache-detail").textContent = `跨任务汇总；按 URL 哈希存于 ~/.hydraria/cache`;
+    }
+    $("#settings-modal").classList.add("show");
+  } catch (e) {
+    toast("加载设置失败：" + e.message, "error");
+  }
+}
+$("#btn-settings").onclick = openSettings;
+$("#btn-settings-cancel").onclick = () => $("#settings-modal").classList.remove("show");
+$("#settings-modal").onclick = (e) => { if (e.target.id === "settings-modal") $("#settings-modal").classList.remove("show"); };
+
+$("#s-rate").addEventListener("input", () => {
+  const v = $("#s-rate").value.trim();
+  if (!v || v === "0") {
+    $("#s-rate-hint").textContent = "0 或留空 = 不限";
+    $("#s-rate-hint").className = "hint";
+    $("#s-rate").classList.remove("invalid");
+    return;
+  }
+  if (SPLIT_RE.test(v)) {
+    $("#s-rate-hint").textContent = "✓ 合法";
+    $("#s-rate-hint").className = "ok-text";
+    $("#s-rate").classList.remove("invalid");
+  } else {
+    $("#s-rate-hint").textContent = "格式错误";
+    $("#s-rate-hint").className = "err-text";
+    $("#s-rate").classList.add("invalid");
+  }
+});
+
+$("#btn-settings-save").onclick = async () => {
+  const v = $("#s-rate").value.trim();
+  if (v && v !== "0" && !SPLIT_RE.test(v)) return;
+  const payload = {
+    global_rate_limit_bps: v || 0,
+    global_rate_limit_algorithm: $("#s-algorithm").value,
+  };
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
+    toast("设置已保存", "ok");
+    $("#settings-modal").classList.remove("show");
+    refresh();
+  } catch (e) {
+    toast("保存失败：" + e.message, "error");
+  }
+};
+
+/* ---- view + search ---- */
+$("#search").addEventListener("input", (e) => {
+  searchQuery = e.target.value;
+  render(lastTasks);
+});
+
+function setView(mode) {
+  viewMode = mode;
+  localStorage.setItem("hydraria.view", mode);
+  $("#view-grid").classList.toggle("active", mode === "grid");
+  $("#view-list").classList.toggle("active", mode === "list");
+  render(lastTasks);
+}
+$("#view-grid").onclick = () => setView("grid");
+$("#view-list").onclick = () => setView("list");
+setView(viewMode);
+
+/* ---- keyboard ---- */
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if ($("#create-modal").classList.contains("show")) closeCreate();
+    else if ($("#edit-modal").classList.contains("show")) closeEdit();
+    else if ($("#settings-modal").classList.contains("show")) $("#settings-modal").classList.remove("show");
+  }
+  if (e.key === "/" && !["INPUT","TEXTAREA"].includes(document.activeElement.tagName)) {
+    e.preventDefault();
+    $("#search").focus();
+  }
+});
+
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
