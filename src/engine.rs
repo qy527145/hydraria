@@ -78,68 +78,109 @@ impl Engine {
 
     pub async fn probe(&self) -> Result<UpstreamProbe> {
         let url = self.pick_url()?;
-        let headers = self.build_headers(None)?;
+        let base_headers = self.build_headers(None)?;
 
-        let resp = self
+        // Step 1: HEAD for cheap metadata (content-type, content-length, etag, ...).
+        // Some CDNs (nginx without `add_header Accept-Ranges`, Cloudflare in some
+        // configs, GCS, etc.) omit `Accept-Ranges` from HEAD even when they
+        // happily serve byte ranges, so HEAD alone cannot tell us whether ranges
+        // are supported.
+        let head = self
             .client
             .head(url)
-            .headers(headers.clone())
+            .headers(base_headers.clone())
             .send()
-            .await;
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
 
-        let resp = match resp {
-            Ok(r) if r.status().is_success() => r,
-            _ => {
-                let probe_headers = {
-                    let mut h = headers.clone();
-                    h.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
-                    h
-                };
-                self.client
-                    .get(url)
-                    .headers(probe_headers)
-                    .send()
-                    .await
-                    .map_err(ProxyError::Upstream)?
-            }
-        };
+        let mut total_size: Option<u64> = None;
+        let mut content_type: Option<String> = None;
+        let mut etag: Option<String> = None;
+        let mut last_modified: Option<String> = None;
+        let mut head_accept_ranges = false;
 
-        let status = resp.status();
-        if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
-            return Err(ProxyError::BadStatus(status.as_u16()));
+        if let Some(resp) = &head {
+            let h = resp.headers();
+            head_accept_ranges = h
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false);
+            total_size = h
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            content_type = h
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            etag = h
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            last_modified = h
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
         }
 
-        let h = resp.headers();
-        let accepts_ranges = h
-            .get(reqwest::header::ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("bytes"))
-            .unwrap_or(false)
-            || status == StatusCode::PARTIAL_CONTENT;
+        // Step 2: actively probe range support with a 1-byte ranged GET.
+        // This is the only reliable test: a server that returns 206 here truly
+        // supports byte ranges (even if it didn't advertise `Accept-Ranges`).
+        let mut probe_headers = base_headers.clone();
+        probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
+        let range_get = self.client.get(url).headers(probe_headers).send().await;
 
-        let total_size = if let Some(cr) = h.get(reqwest::header::CONTENT_RANGE) {
-            cr.to_str()
-                .ok()
-                .and_then(|s| s.rsplit('/').next())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-        } else {
-            h.get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        };
+        let mut accepts_ranges = head_accept_ranges;
+        if let Ok(resp) = &range_get {
+            let status = resp.status();
+            if status == StatusCode::PARTIAL_CONTENT {
+                accepts_ranges = true;
+            }
+            let h = resp.headers();
+            // Prefer Content-Range total when available (more authoritative than CL).
+            if let Some(cr) = h.get(reqwest::header::CONTENT_RANGE) {
+                if let Some(t) = cr
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.rsplit('/').next())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                {
+                    total_size = Some(t);
+                }
+            }
+            // Fill in metadata if HEAD was missing/failed.
+            if content_type.is_none() {
+                content_type = h
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+            }
+            if etag.is_none() {
+                etag = h
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+            }
+            if last_modified.is_none() {
+                last_modified = h
+                    .get(reqwest::header::LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+            }
+            if total_size.is_none() && status == StatusCode::OK {
+                // Server ignored our Range and sent the whole file: CL is the total.
+                total_size = h
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+            }
+        }
 
-        let content_type = h
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let etag = h
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let last_modified = h
-            .get(reqwest::header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        if head.is_none() && range_get.is_err() {
+            return Err(ProxyError::NoUpstream);
+        }
 
         Ok(UpstreamProbe {
             total_size,
@@ -276,22 +317,54 @@ impl Engine {
                 continue;
             }
 
+            // If server ignored Range and returned 200 OK, we got the whole
+            // file. Slice the [start, end] window out as we read, so the
+            // serializer still gets exactly the bytes for this chunk.
+            let needs_slice = status == StatusCode::OK;
+            let chunk_len = end - start + 1;
+            let mut cursor: u64 = 0;
+            let mut emitted: u64 = 0;
+
             let mut stream = resp.bytes_stream();
+            let mut had_err = false;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(b) => {
-                        if tx.send(Ok(b)).await.is_err() {
+                        let to_send = if needs_slice {
+                            let b_start = cursor;
+                            let b_end = cursor + b.len() as u64;
+                            cursor = b_end;
+                            if b_end <= start || b_start > end {
+                                if b_start > end {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let lo = start.saturating_sub(b_start) as usize;
+                            let hi = (end + 1 - b_start).min(b.len() as u64) as usize;
+                            b.slice(lo..hi)
+                        } else {
+                            b
+                        };
+                        if to_send.is_empty() {
+                            continue;
+                        }
+                        emitted += to_send.len() as u64;
+                        if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
+                        }
+                        if needs_slice && emitted >= chunk_len {
+                            break;
                         }
                     }
                     Err(e) => {
                         last_err = Some(ProxyError::Upstream(e));
-                        // Bail out of this attempt; outer loop retries from next URL.
+                        had_err = true;
                         break;
                     }
                 }
             }
-            if last_err.is_none() {
+            if !had_err {
                 return Ok(());
             }
         }

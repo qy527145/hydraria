@@ -207,6 +207,7 @@ async fn handle_stream(
     }
 
     let total = probe.total_size.unwrap();
+    let had_range = range_header.is_some();
     let (start, end) = if let Some(rh) = range_header {
         let (s, e) = parse_range_header(&rh, Some(total))?;
         let end = e.unwrap_or(total - 1).min(total - 1);
@@ -224,14 +225,20 @@ async fn handle_stream(
         HeaderValue::from_str(&length.to_string()).unwrap(),
     );
 
-    let status = if start == 0 && end == total - 1 {
-        StatusCode::OK
-    } else {
+    // Per RFC 7233: if the client sent a Range header that we honor, the
+    // response MUST be 206 (with Content-Range) — even when the range
+    // happens to cover the entire resource. Chrome's <video> element uses
+    // the 206-vs-200 distinction to decide whether the server supports
+    // seeking; returning 200 here makes playback hang ("downloading at full
+    // speed but the spinner keeps spinning").
+    let status = if had_range {
         resp_headers.insert(
             header::CONTENT_RANGE,
             HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total)).unwrap(),
         );
         StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
     };
 
     if head_only {
