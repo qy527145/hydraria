@@ -1,13 +1,13 @@
 use crate::cache::CacheEntry;
 use crate::error::{ProxyError, Result};
-use crate::models::TaskConfig;
+use crate::models::{TaskConfig, UrlHealthAcc};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
 use reqwest::{Client, StatusCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 pub struct UpstreamProbe {
@@ -23,6 +23,7 @@ pub struct Engine {
     config: Arc<TaskConfig>,
     rr_counter: AtomicUsize,
     cache: Option<Arc<CacheEntry>>,
+    health: Vec<Arc<UrlHealthAcc>>,
 }
 
 impl Engine {
@@ -41,12 +42,51 @@ impl Engine {
             config,
             rr_counter: AtomicUsize::new(0),
             cache: None,
+            health: Vec::new(),
         })
     }
 
     pub fn with_cache(mut self, cache: Option<Arc<CacheEntry>>) -> Self {
         self.cache = cache;
         self
+    }
+
+    pub fn with_health(mut self, health: Vec<Arc<UrlHealthAcc>>) -> Self {
+        self.health = health;
+        self
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn record_success(&self, url: &str, status: u16, latency_ms: u64) {
+        if let Some(h) = self.health.iter().find(|h| h.url == url) {
+            *h.last_status.lock() = Some(status);
+            *h.last_error.lock() = None;
+            h.last_latency_ms.store(latency_ms, Ordering::Relaxed);
+            h.successful_requests.fetch_add(1, Ordering::Relaxed);
+            h.last_used_at.store(Self::now_unix(), Ordering::Relaxed);
+        }
+    }
+
+    fn record_failure(&self, url: &str, status: Option<u16>, err: &str) {
+        if let Some(h) = self.health.iter().find(|h| h.url == url) {
+            *h.last_status.lock() = status;
+            *h.last_error.lock() = Some(err.to_string());
+            h.failed_requests.fetch_add(1, Ordering::Relaxed);
+            h.last_used_at.store(Self::now_unix(), Ordering::Relaxed);
+        }
+    }
+
+    fn record_bytes(&self, url: &str, n: u64) {
+        if let Some(h) = self.health.iter().find(|h| h.url == url) {
+            h.bytes_contributed.fetch_add(n, Ordering::Relaxed);
+            h.window_bytes.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     fn build_headers(&self, extra: Option<(u64, u64)>) -> Result<HeaderMap> {
@@ -93,6 +133,7 @@ impl Engine {
         // configs, GCS, etc.) omit `Accept-Ranges` from HEAD even when they
         // happily serve byte ranges, so HEAD alone cannot tell us whether ranges
         // are supported.
+        let head_start = Instant::now();
         let head = self
             .client
             .head(url)
@@ -101,6 +142,9 @@ impl Engine {
             .await
             .ok()
             .filter(|r| r.status().is_success());
+        if let Some(r) = &head {
+            self.record_success(url, r.status().as_u16(), head_start.elapsed().as_millis() as u64);
+        }
 
         let mut total_size: Option<u64> = None;
         let mut content_type: Option<String> = None;
@@ -408,24 +452,35 @@ impl Engine {
         let attempts = self.config.urls.len().max(1) * 2;
         let mut last_err: Option<ProxyError> = None;
         for attempt in 0..attempts {
-            let url = self.pick_url_for(idx + attempt)?;
+            let url = self.pick_url_for(idx + attempt)?.to_string();
             let headers = self.build_headers(Some((span_start, span_end)))?;
-            let resp = match self.client.get(url).headers(headers).send().await {
+            let req_start = Instant::now();
+            let resp = match self.client.get(&url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    let msg = e.to_string();
+                    self.record_failure(&url, None, &msg);
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
             };
+            let latency_ms = req_start.elapsed().as_millis() as u64;
+            let status_code = resp.status().as_u16();
             let status = resp.status();
             if status != StatusCode::PARTIAL_CONTENT {
                 // We asked for a range; we expect 206. A 200 means the origin
                 // sent the full file, which we can't safely write into a
                 // block-aligned cache (offsets would be off). Retry on next
                 // URL; if none oblige, surface the error.
+                self.record_failure(
+                    &url,
+                    Some(status_code),
+                    &format!("expected 206, got {status_code}"),
+                );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
             }
+            self.record_success(&url, status_code, latency_ms);
 
             let mut cursor = span_start;
             let mut stream = resp.bytes_stream();
@@ -450,6 +505,8 @@ impl Engine {
                             }
                         }
 
+                        self.record_bytes(&url, b.len() as u64);
+
                         if piece_end < chunk_start || piece_start > chunk_end {
                             continue;
                         }
@@ -466,6 +523,8 @@ impl Engine {
                         }
                     }
                     Err(e) => {
+                        let msg = e.to_string();
+                        self.record_failure(&url, Some(status_code), &msg);
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
@@ -489,20 +548,27 @@ impl Engine {
         let mut last_err: Option<ProxyError> = None;
         let attempts = self.config.urls.len().max(1) * 2;
         for attempt in 0..attempts {
-            let url = self.pick_url_for(idx + attempt)?;
+            let url = self.pick_url_for(idx + attempt)?.to_string();
             let headers = self.build_headers(Some((start, end)))?;
-            let resp = match self.client.get(url).headers(headers).send().await {
+            let req_start = Instant::now();
+            let resp = match self.client.get(&url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    let msg = e.to_string();
+                    self.record_failure(&url, None, &msg);
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
             };
+            let latency_ms = req_start.elapsed().as_millis() as u64;
+            let status_code = resp.status().as_u16();
             let status = resp.status();
             if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+                self.record_failure(&url, Some(status_code), &format!("status {status_code}"));
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
             }
+            self.record_success(&url, status_code, latency_ms);
 
             // If server ignored Range and returned 200 OK, we got the whole
             // file. Slice the [start, end] window out as we read, so the
@@ -536,6 +602,7 @@ impl Engine {
                         if to_send.is_empty() {
                             continue;
                         }
+                        self.record_bytes(&url, to_send.len() as u64);
                         emitted += to_send.len() as u64;
                         if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
@@ -545,6 +612,8 @@ impl Engine {
                         }
                     }
                     Err(e) => {
+                        let msg = e.to_string();
+                        self.record_failure(&url, Some(status_code), &msg);
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;

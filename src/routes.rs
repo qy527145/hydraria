@@ -1,7 +1,10 @@
 use crate::cache::{CacheEntry, CacheMeta};
 use crate::engine::{Engine, UpstreamProbe, parse_range_header};
 use crate::error::ProxyError;
-use crate::models::{AppState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate, short_id};
+use crate::models::{
+    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate,
+    short_id,
+};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -54,11 +57,29 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/pause", post(pause_task))
         .route("/api/tasks/{task_id}/resume", post(resume_task))
         .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
+        .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/global", get(get_global))
         .route("/stream/{task_id}", get(stream_task).head(stream_task_head))
         .route("/", get(crate::assets::serve_index))
         .route("/healthz", get(|| async { "ok" }))
         .route("/{*path}", get(crate::assets::serve_asset))
         .with_state(state)
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<crate::models::GlobalSettings> {
+    Json(state.settings.read().clone())
+}
+
+async fn put_settings(
+    State(state): State<AppState>,
+    Json(upd): Json<GlobalSettingsUpdate>,
+) -> Result<Json<crate::models::GlobalSettings>, ProxyError> {
+    let s = state.update_settings(upd).map_err(ProxyError::Internal)?;
+    Ok(Json(s))
+}
+
+async fn get_global(State(state): State<AppState>) -> Json<GlobalState> {
+    Json(state.global_state())
 }
 
 async fn create_task(
@@ -215,7 +236,8 @@ async fn handle_stream(
             }
         };
 
-    let engine = Arc::new(engine.with_cache(cache_entry.clone()));
+    let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
+    let engine = Arc::new(engine.with_cache(cache_entry.clone()).with_health(health));
 
     build_stream_response(state, task_id, entry, engine, probe, range_header, head_only)
         .await
@@ -298,17 +320,26 @@ async fn build_stream_response(
             return Ok(resp);
         }
         let upstream = engine.open_passthrough(None).await?;
+        entry.active_connections.fetch_add(1, Ordering::Relaxed);
         let entry_for_count = Arc::clone(&entry);
-        entry_for_count
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-        let stream = upstream.bytes_stream().map(move |item| {
-            if let Ok(ref b) = item {
-                entry_for_count
-                    .bytes_served
-                    .fetch_add(b.len() as u64, Ordering::Relaxed);
+        let state_for_count = state.clone();
+        let task_limiter = Arc::clone(&entry.limiter);
+        let global_limiter = Arc::clone(&state.global_limiter);
+        let stream = upstream.bytes_stream().then(move |item| {
+            let entry_for_count = Arc::clone(&entry_for_count);
+            let state_for_count = state_for_count.clone();
+            let task_limiter = Arc::clone(&task_limiter);
+            let global_limiter = Arc::clone(&global_limiter);
+            async move {
+                if let Ok(ref b) = item {
+                    let n = b.len() as u64;
+                    global_limiter.acquire(n).await;
+                    task_limiter.acquire(n).await;
+                    entry_for_count.count_bytes(n);
+                    state_for_count.count_bytes_global(n);
+                }
+                item
             }
-            item
         });
         let body = Body::from_stream(stream);
         let mut resp = Response::new(body);
@@ -356,20 +387,31 @@ async fn build_stream_response(
         return Ok(resp);
     }
 
+    entry.active_connections.fetch_add(1, Ordering::Relaxed);
     let entry_for_count = Arc::clone(&entry);
-    entry_for_count
-        .active_connections
-        .fetch_add(1, Ordering::Relaxed);
+    let state_for_count = state.clone();
+    let task_limiter = Arc::clone(&entry.limiter);
+    let global_limiter = Arc::clone(&state.global_limiter);
 
     let rx = engine.stream_range(start, end);
-    let stream = ReceiverStream::new(rx).map(move |item| match item {
-        Ok(b) => {
-            entry_for_count
-                .bytes_served
-                .fetch_add(b.len() as u64, Ordering::Relaxed);
-            Ok::<_, std::io::Error>(b)
+    let stream = ReceiverStream::new(rx).then(move |item| {
+        let entry_for_count = Arc::clone(&entry_for_count);
+        let state_for_count = state_for_count.clone();
+        let task_limiter = Arc::clone(&task_limiter);
+        let global_limiter = Arc::clone(&global_limiter);
+        async move {
+            match item {
+                Ok(b) => {
+                    let n = b.len() as u64;
+                    global_limiter.acquire(n).await;
+                    task_limiter.acquire(n).await;
+                    entry_for_count.count_bytes(n);
+                    state_for_count.count_bytes_global(n);
+                    Ok::<_, std::io::Error>(b)
+                }
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }
         }
-        Err(e) => Err(std::io::Error::other(e.to_string())),
     });
 
     let body = Body::from_stream(stream);

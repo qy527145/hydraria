@@ -328,6 +328,17 @@ impl CacheStore {
     pub fn stats(&self, key: &str) -> Option<CacheStats> {
         self.entries.read().get(key).map(|e| e.stats())
     }
+
+    /// Sum `bytes_cached` across all open entries. (Closed entries — wiped
+    /// or never opened in this process — are not counted; that's fine for
+    /// the UI's "current footprint" since we re-open lazily.)
+    pub fn total_bytes_on_disk(&self) -> u64 {
+        self.entries
+            .read()
+            .values()
+            .map(|e| e.bytes_cached.load(Ordering::Relaxed))
+            .sum()
+    }
 }
 
 fn cache_meta_compatible(stored: &CacheMeta, desired: &CacheMeta) -> bool {
