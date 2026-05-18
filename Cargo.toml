@@ -1,6 +1,6 @@
 [package]
 name = "hydraria"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "High-performance multi-threaded HTTP streaming proxy with web dashboard"
 license = "Apache-2.0"
