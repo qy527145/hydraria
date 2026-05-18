@@ -1,6 +1,7 @@
-use crate::engine::{Engine, parse_range_header};
+use crate::cache::{CacheEntry, CacheMeta};
+use crate::engine::{Engine, UpstreamProbe, parse_range_header};
 use crate::error::ProxyError;
-use crate::models::{AppState, TaskConfig, TaskEntry, TaskInfo, short_id};
+use crate::models::{AppState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate, short_id};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -46,7 +47,13 @@ impl IntoResponse for ProxyError {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/tasks", post(create_task).get(list_tasks))
-        .route("/api/tasks/{task_id}", delete(delete_task).get(get_task))
+        .route(
+            "/api/tasks/{task_id}",
+            get(get_task).patch(patch_task).delete(delete_task),
+        )
+        .route("/api/tasks/{task_id}/pause", post(pause_task))
+        .route("/api/tasks/{task_id}/resume", post(resume_task))
+        .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
         .route("/stream/{task_id}", get(stream_task).head(stream_task_head))
         .route("/", get(crate::assets::serve_index))
         .route("/healthz", get(|| async { "ok" }))
@@ -93,14 +100,21 @@ async fn get_task(
     let entry = state
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
-    Ok(Json(TaskInfo {
-        task_id: task_id.clone(),
-        proxy_url: format!("http://{}/stream/{}", state.bind_addr, task_id),
-        config: entry.config.clone(),
-        created_at: entry.created_at,
-        bytes_served: entry.bytes_served.load(Ordering::Relaxed),
-        active_connections: entry.active_connections.load(Ordering::Relaxed),
-    }))
+    Ok(Json(state.task_info(&task_id, &entry)))
+}
+
+async fn patch_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(update): Json<TaskUpdate>,
+) -> Result<Json<TaskInfo>, ProxyError> {
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+    entry
+        .apply_update(update)
+        .map_err(ProxyError::Internal)?;
+    Ok(Json(state.task_info(&task_id, &entry)))
 }
 
 async fn delete_task(
@@ -110,6 +124,41 @@ async fn delete_task(
     state
         .remove(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pause_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<TaskInfo>, ProxyError> {
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+    entry.paused.store(true, Ordering::Relaxed);
+    Ok(Json(state.task_info(&task_id, &entry)))
+}
+
+async fn resume_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<TaskInfo>, ProxyError> {
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+    entry.paused.store(false, Ordering::Relaxed);
+    Ok(Json(state.task_info(&task_id, &entry)))
+}
+
+async fn clear_task_cache(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ProxyError> {
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id))?;
+    let cfg = entry.config_snapshot();
+    let key = crate::cache::CacheStore::key_for_urls(&cfg.urls);
+    state.cache.clear(&key)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -142,10 +191,72 @@ async fn handle_stream(
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
 
-    let cfg = Arc::new(entry.config.clone());
-    let engine = Arc::new(Engine::new(Arc::clone(&cfg))?);
+    if entry.paused.load(Ordering::Relaxed) {
+        let body = Json(ApiError {
+            error: format!("task {} is paused", task_id),
+        });
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
+    }
 
+    let cfg = Arc::new(entry.config_snapshot());
+    let engine = Engine::new(Arc::clone(&cfg))?;
     let probe = engine.probe().await?;
+
+    // Resolve cache entry up-front when (a) the task wants caching, (b) the
+    // upstream supports ranges, and (c) we know a real total size. Any
+    // mismatch with previously-stored meta wipes the on-disk cache and
+    // starts over (auto-clear policy).
+    let cache_entry: Option<Arc<CacheEntry>> =
+        match resolve_cache(&state, &cfg, &probe) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("cache disabled for task {}: {}", task_id, e);
+                None
+            }
+        };
+
+    let engine = Arc::new(engine.with_cache(cache_entry.clone()));
+
+    build_stream_response(state, task_id, entry, engine, probe, range_header, head_only)
+        .await
+}
+
+fn resolve_cache(
+    state: &AppState,
+    cfg: &TaskConfig,
+    probe: &UpstreamProbe,
+) -> Result<Option<Arc<CacheEntry>>, ProxyError> {
+    if !cfg.cache || !probe.accepts_ranges {
+        return Ok(None);
+    }
+    let total = match probe.total_size {
+        Some(t) if t > 0 => t,
+        _ => return Ok(None),
+    };
+    let mut urls = cfg.urls.clone();
+    urls.sort_unstable();
+    let key = crate::cache::CacheStore::key_for_urls(&urls);
+    let meta = CacheMeta {
+        etag: probe.etag.clone(),
+        last_modified: probe.last_modified.clone(),
+        total_size: total,
+        content_type: probe.content_type.clone(),
+        block_size: crate::cache::BLOCK_SIZE,
+        urls,
+    };
+    state.cache.open(&key, meta).map(Some)
+}
+
+async fn build_stream_response(
+    state: AppState,
+    task_id: String,
+    entry: Arc<TaskEntry>,
+    engine: Arc<Engine>,
+    probe: UpstreamProbe,
+    range_header: Option<String>,
+    head_only: bool,
+) -> Result<Response, ProxyError> {
+    let _ = state; // reserved for future per-state telemetry
 
     let mut resp_headers = HeaderMap::new();
     if let Some(ct) = &probe.content_type {
@@ -188,7 +299,9 @@ async fn handle_stream(
         }
         let upstream = engine.open_passthrough(None).await?;
         let entry_for_count = Arc::clone(&entry);
-        entry_for_count.active_connections.fetch_add(1, Ordering::Relaxed);
+        entry_for_count
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         let stream = upstream.bytes_stream().map(move |item| {
             if let Ok(ref b) = item {
                 entry_for_count
@@ -201,8 +314,6 @@ async fn handle_stream(
         let mut resp = Response::new(body);
         *resp.status_mut() = StatusCode::OK;
         *resp.headers_mut() = resp_headers;
-        // Decrement on drop is best-effort; here we just leave it incremented for the lifetime
-        // of this connection — see note in README.
         return Ok(resp);
     }
 
@@ -225,12 +336,9 @@ async fn handle_stream(
         HeaderValue::from_str(&length.to_string()).unwrap(),
     );
 
-    // Per RFC 7233: if the client sent a Range header that we honor, the
-    // response MUST be 206 (with Content-Range) — even when the range
-    // happens to cover the entire resource. Chrome's <video> element uses
-    // the 206-vs-200 distinction to decide whether the server supports
-    // seeking; returning 200 here makes playback hang ("downloading at full
-    // speed but the spinner keeps spinning").
+    // Per RFC 7233: respond 206 whenever the client sent a Range header that
+    // we honor, even when it covers the entire file. Chrome's <video>
+    // element uses 200-vs-206 to decide whether seeking is supported.
     let status = if had_range {
         resp_headers.insert(
             header::CONTENT_RANGE,
@@ -249,19 +357,19 @@ async fn handle_stream(
     }
 
     let entry_for_count = Arc::clone(&entry);
-    entry_for_count.active_connections.fetch_add(1, Ordering::Relaxed);
+    entry_for_count
+        .active_connections
+        .fetch_add(1, Ordering::Relaxed);
 
     let rx = engine.stream_range(start, end);
-    let stream = ReceiverStream::new(rx).map(move |item| {
-        match item {
-            Ok(b) => {
-                entry_for_count
-                    .bytes_served
-                    .fetch_add(b.len() as u64, Ordering::Relaxed);
-                Ok::<_, std::io::Error>(b)
-            }
-            Err(e) => Err(std::io::Error::other(e.to_string())),
+    let stream = ReceiverStream::new(rx).map(move |item| match item {
+        Ok(b) => {
+            entry_for_count
+                .bytes_served
+                .fetch_add(b.len() as u64, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(b)
         }
+        Err(e) => Err(std::io::Error::other(e.to_string())),
     });
 
     let body = Body::from_stream(stream);

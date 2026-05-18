@@ -1,75 +1,143 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Hydraria — Multi-thread Stream Proxy</title>
 <style>
   :root {
-    --bg: #0b0d12;
-    --panel: #141821;
+    --bg: #0a0c12;
+    --bg-2: #0e1119;
+    --panel: #141823;
     --panel-2: #1b202c;
+    --panel-3: #232838;
     --border: #262c3a;
-    --text: #e5e9f0;
-    --muted: #8892a6;
+    --border-strong: #344058;
+    --text: #e8ecf3;
+    --text-dim: #aab3c5;
+    --muted: #6b7689;
     --accent: #6ea8ff;
     --accent-2: #9b7bff;
     --good: #4ade80;
     --bad: #f87171;
     --warn: #fbbf24;
+    --info: #38bdf8;
+    --shadow: 0 10px 40px rgba(0,0,0,0.45);
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif;
-    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, #15192a 0, transparent 60%),
+                radial-gradient(900px 500px at 110% 10%, #1a1530 0, transparent 60%),
+                var(--bg);
     color: var(--text);
     min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.45;
   }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* Header */
   header {
-    padding: 20px 32px;
+    padding: 16px 28px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: linear-gradient(180deg, #11141c, #0b0d12);
+    background: rgba(10, 12, 18, 0.7);
+    backdrop-filter: blur(10px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
   }
-  header h1 {
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand-logo {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    color: #0a0c12;
+    box-shadow: 0 6px 20px rgba(110, 168, 255, 0.3);
+  }
+  .brand h1 {
     margin: 0;
-    font-size: 20px;
-    letter-spacing: 1px;
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
+    font-size: 16px;
+    letter-spacing: 2px;
+    font-weight: 600;
   }
-  header .tagline { color: var(--muted); font-size: 12px; }
+  .brand .tagline { color: var(--muted); font-size: 11px; }
+
+  .header-stats {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .stat-pill {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--text-dim);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stat-pill b { color: var(--text); font-weight: 600; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); display: inline-block; }
+  .dot.idle { background: var(--muted); }
+  .dot.warn { background: var(--warn); }
+
+  /* Layout */
   main {
-    padding: 24px 32px;
-    max-width: 1200px;
+    padding: 24px 28px;
+    max-width: 1400px;
     margin: 0 auto;
     display: grid;
     gap: 24px;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 380px 1fr;
   }
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; }
+  }
+
   .card {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 14px;
     padding: 20px;
+    box-shadow: var(--shadow);
   }
   .card h2 {
     margin: 0 0 16px;
-    font-size: 14px;
+    font-size: 11px;
     color: var(--muted);
     text-transform: uppercase;
-    letter-spacing: 1.2px;
+    letter-spacing: 1.4px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
+  .card h2 .right { color: var(--text-dim); font-size: 11px; text-transform: none; letter-spacing: 0.5px; font-weight: 400; }
+
+  /* Form */
   label {
     display: block;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--muted);
     margin: 12px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
   }
   input, textarea, select {
     width: 100%;
@@ -81,164 +149,406 @@
     font-family: inherit;
     font-size: 13px;
     outline: none;
+    transition: border-color 0.15s;
   }
-  input:focus, textarea:focus { border-color: var(--accent); }
-  textarea { resize: vertical; min-height: 80px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+  textarea {
+    resize: vertical;
+    min-height: 76px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    margin-top: 6px;
+  }
+  .check input { width: auto; margin: 0; }
+  .check span { font-size: 13px; }
+
   button {
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    color: #0b0d12;
+    color: #0a0c12;
     border: 0;
     border-radius: 8px;
-    padding: 10px 16px;
+    padding: 11px 18px;
     font-weight: 600;
     cursor: pointer;
-    margin-top: 16px;
     font-size: 13px;
+    transition: transform 0.1s, box-shadow 0.15s;
   }
+  button:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(110, 168, 255, 0.3); }
+  button:active { transform: translateY(0); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
   button.ghost {
     background: transparent;
     color: var(--text);
-    border: 1px solid var(--border);
-    margin-top: 0;
+    border: 1px solid var(--border-strong);
+    font-weight: 500;
+    padding: 7px 12px;
+    font-size: 12px;
   }
+  button.ghost:hover { background: var(--panel-2); box-shadow: none; }
   button.danger {
     background: transparent;
     color: var(--bad);
     border: 1px solid var(--bad);
-    margin: 0;
-    padding: 6px 10px;
+    padding: 7px 12px;
     font-size: 12px;
+    font-weight: 500;
   }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td {
-    text-align: left;
-    padding: 10px 8px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: top;
+  button.danger:hover { background: rgba(248, 113, 113, 0.1); box-shadow: none; }
+  button.warn {
+    background: transparent;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 500;
   }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  td .url {
-    display: inline-flex;
+  button.warn:hover { background: rgba(251, 191, 36, 0.1); box-shadow: none; }
+  button.good {
+    background: transparent;
+    color: var(--good);
+    border: 1px solid var(--good);
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  button.good:hover { background: rgba(74, 222, 128, 0.1); box-shadow: none; }
+  button.primary-block { width: 100%; margin-top: 16px; padding: 12px; }
+
+  /* Task list */
+  .task-list { display: flex; flex-direction: column; gap: 12px; }
+  .empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+    font-size: 13px;
+    background: var(--panel-2);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+  .task {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    transition: border-color 0.15s;
+    cursor: pointer;
+  }
+  .task:hover { border-color: var(--border-strong); }
+  .task.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .task.paused { opacity: 0.7; }
+  .task-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .task-name {
+    font-weight: 600;
+    color: var(--text);
+    font-size: 14px;
+    display: flex;
     align-items: center;
     gap: 8px;
-    background: var(--panel-2);
-    padding: 4px 8px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .pill {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 999px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
+  .task-id-tag {
+    font-family: ui-monospace, monospace;
     font-size: 11px;
     color: var(--muted);
+    background: var(--panel-3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
   }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+  .badge.running { background: rgba(74, 222, 128, 0.15); color: var(--good); }
+  .badge.paused { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .badge.cache { background: rgba(56, 189, 248, 0.15); color: var(--info); }
+  .task-url {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--bg-2);
+    padding: 8px 10px;
+    border-radius: 6px;
+    word-break: break-all;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .task-url .copy-btn {
+    flex-shrink: 0;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .task-url .copy-btn:hover { color: var(--text); border-color: var(--border-strong); box-shadow: none; transform: none; }
+  .task-meta {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .meta-cell {
+    background: var(--bg-2);
+    padding: 8px 10px;
+    border-radius: 6px;
+  }
+  .meta-cell .label {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+  .meta-cell .value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 2px;
+  }
+  .progress {
+    height: 4px;
+    background: var(--bg-2);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--info));
+    transition: width 0.3s;
+  }
+  .task-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  /* Toast */
   .toast {
     position: fixed;
     bottom: 24px;
     right: 24px;
     background: var(--panel);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
     padding: 12px 16px;
-    border-radius: 8px;
+    border-radius: 10px;
     font-size: 13px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    box-shadow: var(--shadow);
     transform: translateY(20px);
     opacity: 0;
-    transition: all .25s ease;
+    transition: all 0.25s ease;
+    z-index: 100;
+    max-width: 400px;
   }
   .toast.show { transform: translateY(0); opacity: 1; }
   .toast.error { border-color: var(--bad); color: var(--bad); }
   .toast.ok { border-color: var(--good); color: var(--good); }
-  .empty {
-    text-align: center;
-    padding: 32px;
-    color: var(--muted);
-    font-size: 13px;
+
+  /* Modal */
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
   }
-  @media (max-width: 900px) {
-    main { grid-template-columns: 1fr; }
+  .modal-bg.show { display: flex; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    padding: 24px;
+    width: 560px;
+    max-width: 95vw;
+    max-height: 90vh;
+    overflow: auto;
+    box-shadow: var(--shadow);
+  }
+  .modal h3 {
+    margin: 0 0 16px;
+    font-size: 16px;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 20px;
+  }
+
+  /* Hint */
+  .hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
   }
 </style>
 </head>
 <body>
   <header>
-    <div>
-      <h1>HYDRARIA</h1>
-      <div class="tagline">multi-thread HTTP stream proxy · local dashboard</div>
+    <div class="brand">
+      <div class="brand-logo">H</div>
+      <div>
+        <h1>HYDRARIA</h1>
+        <div class="tagline">multi-thread HTTP stream proxy</div>
+      </div>
     </div>
-    <div>
-      <span class="pill" id="task-count">0 tasks</span>
+    <div class="header-stats">
+      <span class="stat-pill"><span class="dot" id="health-dot"></span><span id="health-text">live</span></span>
+      <span class="stat-pill">tasks <b id="stat-tasks">0</b></span>
+      <span class="stat-pill">active <b id="stat-active">0</b></span>
+      <span class="stat-pill">served <b id="stat-served">0 B</b></span>
     </div>
   </header>
+
   <main>
-    <section class="card">
-      <h2>New Proxy Task</h2>
-      <label>Source URLs (one per line — multiple = multi-source pull)</label>
+    <!-- Left: create + global cache info -->
+    <section class="card" id="create-card">
+      <h2>新建代理任务 <span class="right">create</span></h2>
+      <label>源 URL（每行一个，多 URL 即多源容错/负载）</label>
       <textarea id="f-urls" placeholder="https://server1.com/file.mp4&#10;https://server2.com/file.mp4"></textarea>
       <div class="row">
         <div>
-          <label>Max Threads</label>
+          <label>最大并发线程</label>
           <input id="f-threads" type="number" value="16" min="1" max="128" />
         </div>
         <div>
-          <label>Split Size (e.g. 5M, 1M, 512K)</label>
+          <label>分片大小</label>
           <input id="f-split" type="text" value="5M" />
+          <div class="hint">5M / 1M / 512K</div>
         </div>
       </div>
-      <label>Custom Headers (JSON, optional)</label>
+      <label>自定义请求头 (JSON, 可空)</label>
       <textarea id="f-headers" placeholder='{"User-Agent": "Mozilla/5.0", "Cookie": "session=xxxx"}'></textarea>
       <div class="row">
         <div>
-          <label>Name (optional)</label>
+          <label>任务名（可选）</label>
           <input id="f-name" type="text" placeholder="my-movie" />
         </div>
         <div>
-          <label>Cache</label>
-          <select id="f-cache">
-            <option value="false">disabled</option>
-            <option value="true">enabled</option>
-          </select>
+          <label>启用本地磁盘缓存</label>
+          <label class="check" style="margin-top: 0;">
+            <input type="checkbox" id="f-cache" />
+            <span>命中后零外发流量</span>
+          </label>
         </div>
       </div>
-      <button id="btn-create">Create Task &amp; Generate Short Link</button>
+      <button id="btn-create" class="primary-block">生成短链 &amp; 启动任务</button>
     </section>
 
+    <!-- Right: task list -->
     <section class="card">
-      <h2>Active Tasks</h2>
-      <div id="task-list"></div>
+      <h2>任务 <span class="right" id="task-count-label">0</span></h2>
+      <div id="task-list" class="task-list"></div>
     </section>
   </main>
+
+  <!-- Edit modal -->
+  <div class="modal-bg" id="edit-modal">
+    <div class="modal">
+      <h3>编辑任务 <span style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);" id="edit-id"></span></h3>
+      <label>源 URL（每行一个）</label>
+      <textarea id="e-urls"></textarea>
+      <div class="row">
+        <div>
+          <label>线程数</label>
+          <input id="e-threads" type="number" min="1" max="128" />
+        </div>
+        <div>
+          <label>分片大小</label>
+          <input id="e-split" type="text" />
+        </div>
+      </div>
+      <label>自定义请求头 (JSON)</label>
+      <textarea id="e-headers"></textarea>
+      <div class="row">
+        <div>
+          <label>名称</label>
+          <input id="e-name" type="text" />
+        </div>
+        <div>
+          <label>缓存</label>
+          <label class="check" style="margin-top: 0;">
+            <input type="checkbox" id="e-cache" />
+            <span>启用磁盘缓存</span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost" id="btn-edit-cancel">取消</button>
+        <button id="btn-edit-save">保存</button>
+      </div>
+    </div>
+  </div>
 
   <div class="toast" id="toast"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
 
+let editingId = null;
+let selectedId = null;
+let lastTasks = [];
+
 function toast(msg, kind = "") {
   const t = $("#toast");
   t.textContent = msg;
   t.className = "toast show " + kind;
   clearTimeout(t._h);
-  t._h = setTimeout(() => { t.className = "toast " + kind; }, 2400);
+  t._h = setTimeout(() => { t.className = "toast " + kind; }, 2600);
 }
 
 function fmtBytes(n) {
-  if (!n && n !== 0) return "-";
+  if (n === null || n === undefined) return "—";
+  if (n === 0) return "0 B";
   const units = ["B","K","M","G","T"];
   let i = 0; let v = n;
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + units[i];
+  return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + units[i];
 }
 
-function fmtTime(unix) {
-  if (!unix) return "-";
-  const d = new Date(unix * 1000);
-  return d.toLocaleString();
+function fmtAge(unix) {
+  if (!unix) return "—";
+  const now = Math.floor(Date.now() / 1000);
+  const s = now - unix;
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
 }
 
 async function api(path, options = {}) {
@@ -258,99 +568,249 @@ async function api(path, options = {}) {
 async function refresh() {
   try {
     const tasks = await api("/api/tasks");
+    lastTasks = tasks;
     render(tasks);
+    $("#health-dot").className = "dot";
+    $("#health-text").textContent = "live";
   } catch (e) {
-    console.warn("refresh failed", e);
+    $("#health-dot").className = "dot warn";
+    $("#health-text").textContent = "offline";
   }
 }
 
+function headerSummary(tasks) {
+  $("#stat-tasks").textContent = tasks.length;
+  $("#task-count-label").textContent = tasks.length;
+  const active = tasks.reduce((a, t) => a + (t.active_connections || 0), 0);
+  $("#stat-active").textContent = active;
+  const served = tasks.reduce((a, t) => a + (t.bytes_served || 0), 0);
+  $("#stat-served").textContent = fmtBytes(served);
+}
+
 function render(tasks) {
-  $("#task-count").textContent = tasks.length + (tasks.length === 1 ? " task" : " tasks");
+  headerSummary(tasks);
   const root = $("#task-list");
   if (!tasks.length) {
-    root.innerHTML = '<div class="empty">No active tasks yet. Create one to get a short link.</div>';
+    root.innerHTML = '<div class="empty">尚无任务。左侧填表 → 点击「生成短链」即可获得可直接放入 VLC / aria2 / 浏览器的代理 URL。</div>';
     return;
   }
-  const rows = tasks.map(t => `
-    <tr>
-      <td class="mono">${t.task_id}</td>
-      <td>
-        <div class="url"><span class="mono" id="u-${t.task_id}">${t.proxy_url}</span></div>
-        <div style="margin-top: 6px; display: flex; gap: 6px;">
-          <button class="ghost" data-copy="${t.task_id}">Copy</button>
-          <button class="danger" data-del="${t.task_id}">Delete</button>
-        </div>
-      </td>
-      <td>
-        <div>${t.config.urls.length} source(s)</div>
-        <div class="pill" title="threads">${t.config.max_threads} thr</div>
-        <div class="pill" title="split">${fmtBytes(t.config.max_split)}</div>
-      </td>
-      <td>${fmtBytes(t.bytes_served)}</td>
-      <td>${t.active_connections}</td>
-      <td>${fmtTime(t.created_at)}</td>
-    </tr>
-  `).join("");
-  root.innerHTML = `
-    <table>
-      <thead><tr>
-        <th>ID</th><th>Short Link</th><th>Config</th><th>Served</th><th>Conns</th><th>Created</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-  `;
-  root.querySelectorAll("[data-copy]").forEach(b => b.onclick = () => {
-    const id = b.dataset.copy;
-    const url = document.getElementById("u-" + id).textContent;
+  root.innerHTML = tasks.map(taskCard).join("");
+
+  root.querySelectorAll("[data-task]").forEach(card => {
+    card.addEventListener("click", (e) => {
+      // Don't toggle selection when clicking action buttons.
+      if (e.target.closest("button")) return;
+      const id = card.dataset.task;
+      selectedId = (selectedId === id) ? null : id;
+      render(lastTasks);
+    });
+  });
+  root.querySelectorAll("[data-copy]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const url = b.dataset.copy;
     navigator.clipboard.writeText(url).then(
-      () => toast("Copied: " + url, "ok"),
-      () => toast("Copy failed", "error"),
+      () => toast("已复制：" + url, "ok"),
+      () => toast("复制失败", "error"),
     );
   });
-  root.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
-    if (!confirm("Delete task " + b.dataset.del + "?")) return;
-    try {
-      await api("/api/tasks/" + b.dataset.del, { method: "DELETE" });
-      toast("Task deleted", "ok");
-      refresh();
-    } catch (e) {
-      toast("Delete failed: " + e.message, "error");
-    }
+  root.querySelectorAll("[data-pause]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.pause}/pause`, "POST", "已暂停");
+  });
+  root.querySelectorAll("[data-resume]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.resume}/resume`, "POST", "已恢复");
+  });
+  root.querySelectorAll("[data-edit]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    openEdit(b.dataset.edit);
+  });
+  root.querySelectorAll("[data-clear-cache]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm("清空该任务的磁盘缓存？")) return;
+    doAction(`/api/tasks/${b.dataset.clearCache}/cache`, "DELETE", "缓存已清空");
+  });
+  root.querySelectorAll("[data-del]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.del;
+    if (!confirm(`删除任务 ${id}？短链将立即失效。`)) return;
+    doAction(`/api/tasks/${id}`, "DELETE", "任务已删除");
   });
 }
+
+async function doAction(path, method, okMsg) {
+  try {
+    await api(path, { method });
+    toast(okMsg, "ok");
+    refresh();
+  } catch (e) {
+    toast("失败：" + e.message, "error");
+  }
+}
+
+function taskCard(t) {
+  const isSelected = selectedId === t.task_id;
+  const isPaused = t.paused;
+  const name = (t.config.name || "(unnamed)");
+  const cache = t.cache;
+  const cachePct = cache && cache.blocks_total > 0
+    ? Math.round((cache.blocks_cached / cache.blocks_total) * 100)
+    : null;
+  const hitRate = cache && (cache.hits + cache.misses) > 0
+    ? Math.round((cache.hits / (cache.hits + cache.misses)) * 100)
+    : null;
+
+  return `
+  <div class="task ${isPaused ? 'paused' : ''} ${isSelected ? 'selected' : ''}" data-task="${t.task_id}">
+    <div class="task-head">
+      <div class="task-name">
+        <span class="task-id-tag">${t.task_id}</span>
+        <span>${escapeHtml(name)}</span>
+      </div>
+      <div style="display:flex; gap:6px;">
+        ${isPaused ? '<span class="badge paused">paused</span>' : '<span class="badge running"><span class="dot"></span>running</span>'}
+        ${cache ? '<span class="badge cache">cache</span>' : ''}
+      </div>
+    </div>
+
+    <div class="task-url">
+      <span>${t.proxy_url}</span>
+      <button class="copy-btn" data-copy="${t.proxy_url}">copy</button>
+    </div>
+
+    ${cachePct !== null ? `
+      <div class="progress" title="cached ${cache.blocks_cached}/${cache.blocks_total} blocks (${fmtBytes(cache.bytes_cached)}/${fmtBytes(cache.total_size)})">
+        <div class="progress-bar" style="width: ${cachePct}%;"></div>
+      </div>
+    ` : ''}
+
+    <div class="task-meta">
+      <div class="meta-cell">
+        <div class="label">sources</div>
+        <div class="value">${t.config.urls.length} · ${t.config.max_threads} thr</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">served</div>
+        <div class="value">${fmtBytes(t.bytes_served)}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">${cache ? 'cached' : 'split'}</div>
+        <div class="value">${cache
+          ? fmtBytes(cache.bytes_cached) + (cachePct !== null ? ` <span style="color:var(--muted);font-weight:400;font-size:11px;">(${cachePct}%)</span>` : '')
+          : fmtBytes(t.config.max_split)}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">${cache ? 'hit-rate' : 'conns'}</div>
+        <div class="value">${cache
+          ? (hitRate === null ? '—' : hitRate + '%') + ` <span style="color:var(--muted);font-weight:400;font-size:11px;">${cache.hits}H/${cache.misses}M</span>`
+          : t.active_connections}</div>
+      </div>
+    </div>
+
+    <div class="task-actions">
+      ${isPaused
+        ? `<button class="good" data-resume="${t.task_id}">▶ 恢复</button>`
+        : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
+      <button class="ghost" data-edit="${t.task_id}">✎ 编辑</button>
+      ${cache ? `<button class="ghost" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : ''}
+      <button class="danger" data-del="${t.task_id}">删除</button>
+      ${isSelected ? `<span style="flex:1;text-align:right;font-size:11px;color:var(--muted);">created ${fmtAge(t.created_at)} · ${t.active_connections} conns</span>` : ''}
+    </div>
+  </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
+}
+
+function openEdit(id) {
+  const t = lastTasks.find(x => x.task_id === id);
+  if (!t) return;
+  editingId = id;
+  $("#edit-id").textContent = id;
+  $("#e-urls").value = t.config.urls.join("\n");
+  $("#e-threads").value = t.config.max_threads;
+  $("#e-split").value = fmtBytes(t.config.max_split).replace(/ /g, '');
+  $("#e-headers").value = Object.keys(t.config.headers || {}).length
+    ? JSON.stringify(t.config.headers, null, 2)
+    : "";
+  $("#e-name").value = t.config.name || "";
+  $("#e-cache").checked = !!t.config.cache;
+  $("#edit-modal").classList.add("show");
+}
+
+function closeEdit() {
+  $("#edit-modal").classList.remove("show");
+  editingId = null;
+}
+
+$("#btn-edit-cancel").onclick = closeEdit;
+$("#edit-modal").onclick = (e) => { if (e.target.id === "edit-modal") closeEdit(); };
+
+$("#btn-edit-save").onclick = async () => {
+  if (!editingId) return;
+  const urlsRaw = $("#e-urls").value.trim();
+  const urls = urlsRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (!urls.length) return toast("至少要有一个源 URL", "error");
+  let headers = {};
+  const hRaw = $("#e-headers").value.trim();
+  if (hRaw) {
+    try { headers = JSON.parse(hRaw); }
+    catch { return toast("Headers 不是合法 JSON", "error"); }
+  }
+  const payload = {
+    urls,
+    max_threads: parseInt($("#e-threads").value, 10) || 8,
+    max_split: $("#e-split").value.trim() || "5M",
+    headers,
+    name: $("#e-name").value.trim() || null,
+    cache: $("#e-cache").checked,
+  };
+  try {
+    await api(`/api/tasks/${editingId}`, { method: "PATCH", body: JSON.stringify(payload) });
+    toast("配置已保存", "ok");
+    closeEdit();
+    refresh();
+  } catch (e) {
+    toast("保存失败：" + e.message, "error");
+  }
+};
 
 $("#btn-create").onclick = async () => {
   const urlsRaw = $("#f-urls").value.trim();
   const urls = urlsRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  if (!urls.length) return toast("At least one URL is required", "error");
+  if (!urls.length) return toast("至少要有一个源 URL", "error");
 
   let headers = {};
   const hRaw = $("#f-headers").value.trim();
   if (hRaw) {
     try { headers = JSON.parse(hRaw); }
-    catch (e) { return toast("Headers must be valid JSON", "error"); }
+    catch { return toast("Headers 不是合法 JSON", "error"); }
   }
 
   const payload = {
     urls,
     max_threads: parseInt($("#f-threads").value, 10) || 8,
     max_split: $("#f-split").value.trim() || "5M",
-    cache: $("#f-cache").value === "true",
+    cache: $("#f-cache").checked,
     headers,
     name: $("#f-name").value.trim() || null,
   };
 
   try {
     const res = await api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
-    toast("Created: " + res.proxy_url, "ok");
+    toast("已创建：" + res.proxy_url, "ok");
+    $("#f-urls").value = "";
+    $("#f-headers").value = "";
+    $("#f-name").value = "";
     refresh();
   } catch (e) {
-    toast("Create failed: " + e.message, "error");
+    toast("创建失败：" + e.message, "error");
   }
 };
 
 refresh();
-setInterval(refresh, 3000);
+setInterval(refresh, 2000);
 </script>
 </body>
 </html>

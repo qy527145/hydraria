@@ -15,22 +15,25 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 
 ## Highlights
 
-- **Multi-threaded chunked fetching** — each request is split into `max_split`-sized byte ranges and pulled concurrently up to `max_threads`.
+- **Multi-threaded chunked fetching** — each request is split into `max_split`-sized byte ranges and pulled concurrently up to `max_threads`. The scheduler uses a sliding window over the in-flight set, so the chunk being drained is always among those running (no starvation).
 - **Multi-source failover** — list multiple origin URLs; chunks are round-robined across them and a failed chunk transparently retries on a different origin.
-- **Range / Seek support** — when a player issues `Range: bytes=…` (e.g. seeking forward in a video), Hydraria re-plans the chunks from that offset. No re-download of earlier bytes.
-- **Passthrough fallback** — if the origin doesn't advertise `Accept-Ranges: bytes` or doesn't return a `Content-Length`, Hydraria automatically falls back to a single-stream passthrough so unrangeable sources still work.
+- **Range / Seek support** — when a player issues `Range: bytes=…` (e.g. seeking forward in a video), Hydraria re-plans the chunks from that offset. No re-download of earlier bytes. Always responds with `206` when the client sent a Range header (which is what Chrome's `<video>` element relies on to know seeking is supported).
+- **Disk cache** — opt-in per task. Bytes are stored in a sparse file keyed by the SHA-256 of the URL list, with a bitmap tracking 1-MB block completion. A second request to the same task is served entirely from disk; no upstream traffic. ETag-validated on every probe; an upstream change auto-wipes and re-fetches.
+- **Passthrough fallback** — if the origin doesn't advertise byte-range support, Hydraria automatically falls back to a single-stream passthrough so unrangeable sources still work.
 - **Backpressure-aware streaming** — the chunk planner uses a bounded-channel pipeline (`tokio::sync::mpsc`), so a slow client throttles upstream fetches instead of blowing memory.
 - **Custom headers per task** — set `Cookie`, `User-Agent`, `Referer`, etc. once at task creation; every upstream chunk request carries them.
+- **Pause / resume / edit** — tasks can be paused (stream returns 503 while config + cache stay intact) and live-edited via `PATCH /api/tasks/:id`. No need to delete and recreate.
 - **Embedded dashboard** — the web UI is compiled into the binary (`rust-embed`); no external static-file directory needed.
 
 ## Architecture
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
-| Core engine (data plane) | [src/engine.rs](src/engine.rs) | Probe upstream, plan chunks, run the parallel fetcher, serialize chunks back into a single ordered byte stream. |
-| Control plane | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | Task manager, REST API, short-link generation, in-memory task store (`Arc<RwLock<HashMap>>`). |
-| Application layer | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI, axum server, embedded dashboard at `/`. |
-| Web UI | [web/index.html](web/index.html) | Single-file dashboard (vanilla JS, no build step). |
+| Core engine (data plane) | [src/engine.rs](src/engine.rs) | Probe upstream, plan chunks, run the parallel fetcher with a sliding-window scheduler, serialize chunks back into a single ordered byte stream. |
+| Cache | [src/cache.rs](src/cache.rs) | Per-URL-set sparse-file cache with a 1 MB block bitmap. Auto-clears on ETag mismatch. |
+| Control plane | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | Task manager, REST API, short-link generation, in-memory task store. |
+| Application layer | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI (`--bind`, `--cache-dir`), axum server, embedded dashboard at `/`. |
+| Web UI | [web/index.html](web/index.html) | Single-file dashboard (vanilla JS, no build step) with edit modal, pause / resume, cache stats and progress bars. |
 
 ## Tech stack
 
@@ -51,6 +54,8 @@ Requires Rust 1.85+ (edition 2024).
 ```bash
 cargo build --release
 ./target/release/hydraria --bind 127.0.0.1:9527
+# or specify a cache directory:
+./target/release/hydraria --bind 127.0.0.1:9527 --cache-dir ~/.hydraria/cache
 ```
 
 Then open the dashboard:
@@ -59,7 +64,8 @@ Then open the dashboard:
 http://127.0.0.1:9527/
 ```
 
-Logs go to stdout; control verbosity with `RUST_LOG`, e.g. `RUST_LOG=hydraria=debug,info`.
+`--cache-dir` defaults to `~/.hydraria/cache`. Logs go to stdout; control
+verbosity with `RUST_LOG`, e.g. `RUST_LOG=hydraria=debug,info`.
 
 ## API
 
@@ -104,6 +110,28 @@ Fetch a single task's status.
 
 Stop & remove a task. Returns `204`.
 
+#### `PATCH /api/tasks/:task_id`
+
+Partially update a task in place — any subset of `urls`, `max_threads`,
+`max_split`, `cache`, `headers`, `name`. Returns the updated `TaskInfo`.
+
+```bash
+curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
+  -H 'content-type: application/json' \
+  -d '{"max_threads": 32, "cache": true}'
+```
+
+#### `POST /api/tasks/:task_id/pause` and `…/resume`
+
+Pause makes `GET /stream/:task_id` return `503 Service Unavailable` while the
+task config + cache remain intact. Resume flips it back. Both return the
+current `TaskInfo`.
+
+#### `DELETE /api/tasks/:task_id/cache`
+
+Wipe this task's on-disk cache (sparse file + bitmap + meta). The task itself
+is kept. Returns `204`.
+
 ### Data plane
 
 #### `GET /stream/:task_id`
@@ -136,11 +164,13 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 
 ## How chunked streaming works
 
-1. **Probe** — when a client connects, Hydraria issues a `HEAD` (falling back to a tiny `Range: bytes=0-0` GET) to learn `Content-Length`, `Accept-Ranges`, MIME type, and ETag.
-2. **Plan** — given the client's effective range `[start, end]`, the engine slices it into `max_split`-sized sub-ranges.
-3. **Pull** — each sub-range is fetched in parallel under a `Semaphore(max_threads)`. Each sub-range gets its own bounded mpsc channel so its bytes can stream as soon as they arrive — no buffering whole chunks in memory.
-4. **Stitch** — a serializer task drains the per-chunk channels in plan order and forwards bytes to the client. Because the channels are bounded, a slow client naturally backpressures the fetchers.
-5. **Retry** — if a chunk's origin fails mid-stream, the engine retries that chunk on the next URL in the round-robin list.
+1. **Probe** — when a client connects, Hydraria first issues a `HEAD` for cheap metadata (Content-Type, Content-Length, ETag, Last-Modified) and then a `Range: bytes=0-0` `GET`. The 206 response from the GET is the only reliable signal that an origin actually supports byte ranges (many CDNs serve ranges but don't advertise `Accept-Ranges` on HEAD).
+2. **Cache check (if enabled)** — Hydraria opens (or rewires) the cache entry keyed by the SHA-256 of the URL list. A stored meta with a non-matching ETag/size is treated as stale and the on-disk state is wiped.
+3. **Plan** — given the client's effective range `[start, end]`, the engine slices it into `max_split`-sized sub-ranges.
+4. **Pull** — each sub-range fetches in parallel under a sliding-window scheduler. The same task that drains chunks in order also spawns the next chunk when the previous one finishes; this keeps `max_threads` chunks in-flight while guaranteeing the chunk being drained is always among the running set (a plain semaphore would deadlock against the bounded per-chunk channels).
+5. **Stitch** — a serializer task drains the per-chunk channels in plan order and forwards bytes to the client. Bounded channels backpressure the fetchers when the client reads slowly.
+6. **Cache writeback** — for cache-enabled tasks, every byte received from upstream is `pwrite`-ed to the sparse cache file at its absolute offset. Block-completion is tracked via a per-block byte-counter; when a block is fully covered, its bit is flipped in the bitmap (which is fsync-rotated to disk).
+7. **Retry** — if a chunk's origin fails mid-stream, the engine retries that chunk on the next URL in the round-robin list.
 
 ## Configuration reference
 
@@ -163,6 +193,7 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 │   ├── lib.rs         # module roots
 │   ├── models.rs      # TaskConfig, TaskStore, AppState, short_id()
 │   ├── engine.rs      # multi-threaded chunked fetcher + range parser
+│   ├── cache.rs       # sparse-file + bitmap cache, ETag-keyed
 │   ├── routes.rs      # axum router for control + data plane
 │   ├── assets.rs      # rust-embed-backed static asset handler
 │   └── error.rs       # ProxyError + IntoResponse
@@ -172,11 +203,11 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 
 ## Roadmap
 
-- On-disk LRU cache for hot byte ranges (the `cache` flag is wired but currently a no-op).
-- Persistent task store (SQLite) so tasks survive a restart.
+- Persistent task store (SQLite) so tasks survive a restart (the cache already does).
 - Per-task bandwidth limits.
 - A `download` CLI subcommand that drives the engine directly to a local file.
 - Auth / token gating on the control-plane API for non-localhost binds.
+- Probe-result caching to skip the upstream HEAD on warm cache hits.
 
 ## License
 

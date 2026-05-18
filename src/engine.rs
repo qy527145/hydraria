@@ -1,3 +1,4 @@
+use crate::cache::CacheEntry;
 use crate::error::{ProxyError, Result};
 use crate::models::TaskConfig;
 use bytes::Bytes;
@@ -21,6 +22,7 @@ pub struct Engine {
     client: Client,
     config: Arc<TaskConfig>,
     rr_counter: AtomicUsize,
+    cache: Option<Arc<CacheEntry>>,
 }
 
 impl Engine {
@@ -38,7 +40,13 @@ impl Engine {
             client,
             config,
             rr_counter: AtomicUsize::new(0),
+            cache: None,
         })
+    }
+
+    pub fn with_cache(mut self, cache: Option<Arc<CacheEntry>>) -> Self {
+        self.cache = cache;
+        self
     }
 
     fn build_headers(&self, extra: Option<(u64, u64)>) -> Result<HeaderMap> {
@@ -311,6 +319,167 @@ impl Engine {
     }
 
     async fn fetch_chunk_to(
+        &self,
+        idx: usize,
+        start: u64,
+        end: u64,
+        tx: &mpsc::Sender<Result<Bytes>>,
+    ) -> Result<()> {
+        if let Some(cache) = self.cache.clone() {
+            return self.fetch_chunk_cached(cache, idx, start, end, tx).await;
+        }
+        self.fetch_chunk_origin(idx, start, end, tx).await
+    }
+
+    async fn fetch_chunk_cached(
+        &self,
+        cache: Arc<CacheEntry>,
+        idx: usize,
+        start: u64,
+        end: u64,
+        tx: &mpsc::Sender<Result<Bytes>>,
+    ) -> Result<()> {
+        let bs = cache.meta.block_size;
+        let total = cache.meta.total_size;
+        if total == 0 || end >= total {
+            // Outside the cached file's bounds — fall back to origin.
+            return self.fetch_chunk_origin(idx, start, end, tx).await;
+        }
+
+        let first_block = start / bs;
+        let last_block = end / bs;
+
+        let mut i = first_block;
+        while i <= last_block {
+            let hit = cache.has_block(i);
+            let mut j = i;
+            while j + 1 <= last_block && cache.has_block(j + 1) == hit {
+                j += 1;
+            }
+            let span_start = (i * bs).max(start);
+            let span_end = (((j + 1) * bs - 1).min(total - 1)).min(end);
+
+            if hit {
+                match cache.read_range(span_start, span_end) {
+                    Ok(bytes) => {
+                        cache.hits.fetch_add(j - i + 1, Ordering::Relaxed);
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(_) => {
+                        // Disk read failed — fall back to origin for this span,
+                        // but don't try to cache the result (the underlying
+                        // file may be broken).
+                        let from = i * bs;
+                        let to = ((j + 1) * bs - 1).min(total - 1);
+                        self.fetch_span_to_tx(idx, from, to, start, end, None, tx)
+                            .await?;
+                    }
+                }
+            } else {
+                cache.misses.fetch_add(j - i + 1, Ordering::Relaxed);
+                // Fetch the BLOCK-aligned span from origin so writes land at
+                // the right offsets and complete whole blocks in the bitmap.
+                let from = i * bs;
+                let to = ((j + 1) * bs - 1).min(total - 1);
+                self.fetch_span_to_tx(idx, from, to, start, end, Some(&cache), tx)
+                    .await?;
+            }
+            i = j + 1;
+        }
+        Ok(())
+    }
+
+    /// Fetch [span_start, span_end] from any configured origin and:
+    ///   * forward the slice within [chunk_start, chunk_end] to `tx`, and
+    ///   * if `cache` is Some, persist the full span to the sparse file as it
+    ///     streams in (so partial reads still warm the cache).
+    async fn fetch_span_to_tx(
+        &self,
+        idx: usize,
+        span_start: u64,
+        span_end: u64,
+        chunk_start: u64,
+        chunk_end: u64,
+        cache: Option<&CacheEntry>,
+        tx: &mpsc::Sender<Result<Bytes>>,
+    ) -> Result<()> {
+        let attempts = self.config.urls.len().max(1) * 2;
+        let mut last_err: Option<ProxyError> = None;
+        for attempt in 0..attempts {
+            let url = self.pick_url_for(idx + attempt)?;
+            let headers = self.build_headers(Some((span_start, span_end)))?;
+            let resp = match self.client.get(url).headers(headers).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(ProxyError::Upstream(e));
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status != StatusCode::PARTIAL_CONTENT {
+                // We asked for a range; we expect 206. A 200 means the origin
+                // sent the full file, which we can't safely write into a
+                // block-aligned cache (offsets would be off). Retry on next
+                // URL; if none oblige, surface the error.
+                last_err = Some(ProxyError::BadStatus(status.as_u16()));
+                continue;
+            }
+
+            let mut cursor = span_start;
+            let mut stream = resp.bytes_stream();
+            let mut had_err = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(b) => {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        let piece_start = cursor;
+                        let piece_end = piece_start + b.len() as u64 - 1;
+                        cursor = piece_end + 1;
+
+                        if let Some(c) = cache {
+                            if let Err(e) = c.write_range(piece_start, &b) {
+                                tracing::warn!(
+                                    "cache write at offset {} failed: {}",
+                                    piece_start,
+                                    e
+                                );
+                            }
+                        }
+
+                        if piece_end < chunk_start || piece_start > chunk_end {
+                            continue;
+                        }
+                        let lo = chunk_start.saturating_sub(piece_start) as usize;
+                        let hi = ((chunk_end + 1)
+                            .saturating_sub(piece_start)
+                            .min(b.len() as u64)) as usize;
+                        if hi <= lo {
+                            continue;
+                        }
+                        let to_send = b.slice(lo..hi);
+                        if tx.send(Ok(to_send)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        last_err = Some(ProxyError::Upstream(e));
+                        had_err = true;
+                        break;
+                    }
+                }
+            }
+            if !had_err {
+                return Ok(());
+            }
+        }
+        Err(last_err.unwrap_or(ProxyError::NoUpstream))
+    }
+
+    async fn fetch_chunk_origin(
         &self,
         idx: usize,
         start: u64,
