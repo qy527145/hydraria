@@ -234,58 +234,76 @@ impl Engine {
         }
         let total_chunks = plan.len();
 
-        // Channels: one per chunk so we can stitch in order via a serializer task
-        let mut chunk_senders: Vec<mpsc::Sender<Result<Bytes>>> = Vec::with_capacity(total_chunks);
-        let mut chunk_receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
+        // Per-chunk channels so fetchers can run concurrently while the
+        // serializer stitches bytes back together in plan order.
+        let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
+            Vec::with_capacity(total_chunks);
+        let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
             Vec::with_capacity(total_chunks);
         for _ in 0..total_chunks {
             let (tx, rx) = mpsc::channel::<Result<Bytes>>(8);
-            chunk_senders.push(tx);
-            chunk_receivers.push(rx);
+            senders.push(Some(tx));
+            receivers.push(rx);
         }
 
         // Output channel to caller
         let (out_tx, out_rx) = mpsc::channel::<Result<Bytes>>(16);
 
-        // Concurrency limiter via a semaphore
-        let sem = Arc::new(tokio::sync::Semaphore::new(max_threads));
-
-        // Spawn per-chunk fetchers
-        for (idx, (cs, ce)) in plan.into_iter().enumerate() {
-            let engine = Arc::clone(&self);
-            let sem = Arc::clone(&sem);
-            let tx = chunk_senders[idx].clone();
-            tokio::spawn(async move {
-                let permit = match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        let _ = tx
-                            .send(Err(ProxyError::Internal("semaphore closed".into())))
-                            .await;
-                        return;
-                    }
-                };
-                let result = engine.fetch_chunk_to(idx, cs, ce, &tx).await;
-                if let Err(e) = result {
-                    let _ = tx.send(Err(e)).await;
-                }
-                drop(permit);
-            });
-        }
-        drop(chunk_senders);
-
-        // Serializer task: drain receivers in order and forward to out_tx
+        // Driver: spawns chunk fetchers in a sliding window AND drains them
+        // in order. This is the right way to bound concurrency for an
+        // *ordered* stream: a plain Semaphore would deadlock because a
+        // non-zero chunk could win the permit race, fill its bounded channel,
+        // block on `tx.send().await`, and starve chunk 0 forever — the
+        // serializer drains strictly in plan order, so chunks ahead can't
+        // make progress until the one being drained finishes.
+        let engine_arc = Arc::clone(&self);
         tokio::spawn(async move {
-            for mut rx in chunk_receivers.into_iter() {
+            let spawn_fetch =
+                |idx: usize, tx: mpsc::Sender<Result<Bytes>>, plan: &[(u64, u64)]| {
+                    let engine = Arc::clone(&engine_arc);
+                    let (cs, ce) = plan[idx];
+                    tokio::spawn(async move {
+                        let result = engine.fetch_chunk_to(idx, cs, ce, &tx).await;
+                        if let Err(e) = result {
+                            let _ = tx.send(Err(e)).await;
+                        }
+                        // `tx` dropped here — receiver for chunk `idx` closes.
+                    });
+                };
+
+            // Initial window: start the first `max_threads` chunks. Chunk 0
+            // is always in this set, so the serializer can immediately make
+            // progress.
+            let initial = max_threads.min(total_chunks);
+            for idx in 0..initial {
+                let tx = senders[idx]
+                    .take()
+                    .expect("sender should be present on first spawn");
+                spawn_fetch(idx, tx, &plan);
+            }
+
+            let mut next_to_spawn = initial;
+            for (i, mut rx) in receivers.into_iter().enumerate() {
+                // Drain chunk i in order, forwarding to the client.
                 while let Some(item) = rx.recv().await {
                     let is_err = item.is_err();
                     if out_tx.send(item).await.is_err() {
+                        // Client dropped the connection — abandon the rest.
                         return;
                     }
                     if is_err {
                         return;
                     }
                 }
+                // Chunk i is fully delivered; slide the window forward.
+                if next_to_spawn < total_chunks {
+                    let idx = next_to_spawn;
+                    if let Some(tx) = senders[idx].take() {
+                        spawn_fetch(idx, tx, &plan);
+                    }
+                    next_to_spawn += 1;
+                }
+                let _ = i;
             }
         });
 
