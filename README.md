@@ -23,17 +23,22 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 - **Backpressure-aware streaming** — the chunk planner uses a bounded-channel pipeline (`tokio::sync::mpsc`), so a slow client throttles upstream fetches instead of blowing memory.
 - **Custom headers per task** — set `Cookie`, `User-Agent`, `Referer`, etc. once at task creation; every upstream chunk request carries them.
 - **Pause / resume / edit** — tasks can be paused (stream returns 503 while config + cache stay intact) and live-edited via `PATCH /api/tasks/:id`. No need to delete and recreate.
+- **Rate limiting** — per-task and global token-bucket limiters (`rate_limit_bps` on the task config, `global_rate_limit_bps` on settings). Small bursts allowed; long-run average held to the cap.
+- **Persistence** — opt-in `persist: true` on a task writes it to `~/.hydraria/tasks.json` (atomic write every ~5s when state changes). Settings persist alongside it. Restored automatically at next startup.
+- **Per-source health** — each task tracks per-URL last status, TTFB latency, current throughput, total bytes contributed and last error — surfaced in the dashboard's "源状态看板".
+- **Real-time sparkline** — both global throughput and per-task throughput are sampled at ~1 Hz; the dashboard renders a live 60-sample SVG curve.
 - **Embedded dashboard** — the web UI is compiled into the binary (`rust-embed`); no external static-file directory needed.
 
 ## Architecture
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
-| Core engine (data plane) | [src/engine.rs](src/engine.rs) | Probe upstream, plan chunks, run the parallel fetcher with a sliding-window scheduler, serialize chunks back into a single ordered byte stream. |
+| Core engine (data plane) | [src/engine.rs](src/engine.rs) | Probe upstream, plan chunks, run the parallel fetcher with a sliding-window scheduler, serialize chunks back into a single ordered byte stream. Records per-URL fetch outcomes. |
 | Cache | [src/cache.rs](src/cache.rs) | Per-URL-set sparse-file cache with a 1 MB block bitmap. Auto-clears on ETag mismatch. |
-| Control plane | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | Task manager, REST API, short-link generation, in-memory task store. |
-| Application layer | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI (`--bind`, `--cache-dir`), axum server, embedded dashboard at `/`. |
-| Web UI | [web/index.html](web/index.html) | Single-file dashboard (vanilla JS, no build step) with edit modal, pause / resume, cache stats and progress bars. |
+| Rate limiter | [src/ratelimit.rs](src/ratelimit.rs) | Token-bucket limiter (per-task and global). |
+| Control plane | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | Task manager, REST API, short-link generation, in-memory task store, per-task health tracker, throughput sampler, persistence. |
+| Application layer | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI (`--bind`, `--cache-dir`, `--state-file`), axum server, embedded dashboard at `/`. |
+| Web UI | [web/index.html](web/index.html) | Single-file dashboard (vanilla JS, no build step) with: modal create form, grid/list toggle, search, source health panel, live sparkline, live input validation, copy-with-✓ feedback. |
 
 ## Tech stack
 
@@ -53,19 +58,17 @@ Requires Rust 1.85+ (edition 2024).
 
 ```bash
 cargo build --release
-./target/release/hydraria --bind 127.0.0.1:9527
-# or specify a cache directory:
-./target/release/hydraria --bind 127.0.0.1:9527 --cache-dir ~/.hydraria/cache
+./target/release/hydraria \
+  --bind 127.0.0.1:9527 \
+  --cache-dir ~/.hydraria/cache \
+  --state-file ~/.hydraria/tasks.json
 ```
 
-Then open the dashboard:
+Defaults: `--bind 127.0.0.1:9527`, `--cache-dir ~/.hydraria/cache`,
+`--state-file ~/.hydraria/tasks.json`.
 
-```
-http://127.0.0.1:9527/
-```
-
-`--cache-dir` defaults to `~/.hydraria/cache`. Logs go to stdout; control
-verbosity with `RUST_LOG`, e.g. `RUST_LOG=hydraria=debug,info`.
+Then open the dashboard at `http://127.0.0.1:9527/`. Logs go to stdout;
+control verbosity with `RUST_LOG`, e.g. `RUST_LOG=hydraria=debug,info`.
 
 ## API
 
@@ -132,6 +135,16 @@ current `TaskInfo`.
 Wipe this task's on-disk cache (sparse file + bitmap + meta). The task itself
 is kept. Returns `204`.
 
+#### `GET /api/settings` · `PUT /api/settings`
+
+Global settings (currently `global_rate_limit_bps`, in B/s or human size
+strings like `"10M"`; `0`/null = unlimited). The PUT body is a partial update.
+
+#### `GET /api/global`
+
+Snapshot used by the dashboard: aggregate stats, current global throughput, a
+60-sample sparkline of recent throughput, total cache footprint on disk.
+
 ### Data plane
 
 #### `GET /stream/:task_id`
@@ -191,9 +204,10 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 ├── src
 │   ├── main.rs        # CLI + axum server bootstrap
 │   ├── lib.rs         # module roots
-│   ├── models.rs      # TaskConfig, TaskStore, AppState, short_id()
-│   ├── engine.rs      # multi-threaded chunked fetcher + range parser
+│   ├── models.rs      # TaskConfig, TaskEntry, AppState, GlobalSettings, UrlHealth
+│   ├── engine.rs      # multi-threaded chunked fetcher + range parser + health hooks
 │   ├── cache.rs       # sparse-file + bitmap cache, ETag-keyed
+│   ├── ratelimit.rs   # token-bucket limiter (per-task + global)
 │   ├── routes.rs      # axum router for control + data plane
 │   ├── assets.rs      # rust-embed-backed static asset handler
 │   └── error.rs       # ProxyError + IntoResponse
@@ -203,10 +217,9 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 
 ## Roadmap
 
-- Persistent task store (SQLite) so tasks survive a restart (the cache already does).
-- Per-task bandwidth limits.
-- A `download` CLI subcommand that drives the engine directly to a local file.
+- LRU eviction for the cache directory (currently grows unbounded).
 - Auth / token gating on the control-plane API for non-localhost binds.
+- A `download` CLI subcommand that drives the engine directly to a local file.
 - Probe-result caching to skip the upstream HEAD on warm cache hits.
 
 ## License
