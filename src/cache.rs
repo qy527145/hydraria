@@ -4,10 +4,61 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Positional read at `offset`. Cross-platform wrapper:
+/// - Unix uses `FileExt::read_exact_at` directly.
+/// - Windows uses `seek_read` in a loop (it may return short reads), and we
+///   treat 0 bytes as unexpected EOF to match Unix's "exact" semantics.
+#[cfg(unix)]
+fn pread_exact(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(f: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected eof in positional read",
+            ));
+        }
+        let tmp = buf;
+        buf = &mut tmp[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Positional write at `offset`. Same shape as `pread_exact`.
+#[cfg(unix)]
+fn pwrite_all(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pwrite_all(f: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_write(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positional write returned 0",
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
 
 /// Block granularity used for the bitmap. Bytes are stored at their absolute
 /// file offset in a sparse `file.bin`; the bitmap simply records which
@@ -80,7 +131,7 @@ impl CacheEntry {
     pub fn read_range(&self, start: u64, end: u64) -> std::io::Result<Bytes> {
         let len = (end - start + 1) as usize;
         let mut buf = vec![0u8; len];
-        self.file.lock().read_exact_at(&mut buf, start)?;
+        pread_exact(&self.file.lock(), &mut buf, start)?;
         Ok(Bytes::from(buf))
     }
 
@@ -92,7 +143,7 @@ impl CacheEntry {
         if data.is_empty() {
             return Ok(());
         }
-        self.file.lock().write_all_at(data, start)?;
+        pwrite_all(&self.file.lock(), data, start)?;
 
         let end = start + data.len() as u64 - 1;
         let first_block = start / self.meta.block_size;
