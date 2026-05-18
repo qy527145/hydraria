@@ -1,5 +1,5 @@
 use crate::cache::CacheStats;
-use crate::ratelimit::TokenBucket;
+use crate::ratelimit::{Algorithm, Limiter};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +23,9 @@ pub struct TaskConfig {
     /// Per-task rate limit in bytes/sec. 0 = unlimited.
     #[serde(default, deserialize_with = "deserialize_opt_size_default_zero")]
     pub rate_limit_bps: u64,
+    /// Rate-limit algorithm. Falls back to TokenBucket if absent.
+    #[serde(default)]
+    pub rate_limit_algorithm: Algorithm,
     /// Persist this task across restarts.
     #[serde(default)]
     pub persist: bool,
@@ -107,6 +110,7 @@ pub struct TaskUpdate {
     pub name: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub rate_limit_bps: Option<u64>,
+    pub rate_limit_algorithm: Option<Algorithm>,
     pub persist: Option<bool>,
 }
 
@@ -233,7 +237,7 @@ pub struct TaskEntry {
     /// Per-URL health (slot index matches `config.urls` at creation time;
     /// `apply_update` rebuilds this list whenever URLs change).
     pub url_health: RwLock<Vec<Arc<UrlHealthAcc>>>,
-    pub limiter: Arc<TokenBucket>,
+    pub limiter: Arc<Limiter>,
     pub throughput: Arc<ThroughputSampler>,
     /// Bytes counted toward the next sampler tick.
     pub window_bytes: AtomicU64,
@@ -251,7 +255,10 @@ impl TaskEntry {
             .iter()
             .map(|u| Arc::new(UrlHealthAcc::new(u.clone())))
             .collect();
-        let limiter = Arc::new(TokenBucket::new(config.rate_limit_bps));
+        let limiter = Arc::new(Limiter::new(
+            config.rate_limit_bps,
+            config.rate_limit_algorithm,
+        ));
         Self {
             config: RwLock::new(config),
             created_at: now,
@@ -326,6 +333,10 @@ impl TaskEntry {
             cfg.rate_limit_bps = r;
             self.limiter.set_rate(r);
         }
+        if let Some(a) = upd.rate_limit_algorithm {
+            cfg.rate_limit_algorithm = a;
+            self.limiter.set_algorithm(a);
+        }
         if let Some(p) = upd.persist {
             cfg.persist = p;
         }
@@ -362,12 +373,15 @@ pub struct GlobalSettings {
     /// 0 = unlimited.
     #[serde(default, deserialize_with = "deserialize_opt_size_default_zero")]
     pub global_rate_limit_bps: u64,
+    #[serde(default)]
+    pub global_rate_limit_algorithm: Algorithm,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GlobalSettingsUpdate {
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub global_rate_limit_bps: Option<u64>,
+    pub global_rate_limit_algorithm: Option<Algorithm>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,7 +401,7 @@ pub struct AppState {
     pub bind_addr: String,
     pub cache: Arc<crate::cache::CacheStore>,
     pub settings: Arc<RwLock<GlobalSettings>>,
-    pub global_limiter: Arc<TokenBucket>,
+    pub global_limiter: Arc<Limiter>,
     pub global_throughput: Arc<ThroughputSampler>,
     pub global_window_bytes: Arc<AtomicU64>,
     pub persist_path: Arc<std::path::PathBuf>,
@@ -400,7 +414,10 @@ impl AppState {
         persist_path: std::path::PathBuf,
         settings: GlobalSettings,
     ) -> Self {
-        let limiter = Arc::new(TokenBucket::new(settings.global_rate_limit_bps));
+        let limiter = Arc::new(Limiter::new(
+            settings.global_rate_limit_bps,
+            settings.global_rate_limit_algorithm,
+        ));
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             bind_addr,
@@ -501,6 +518,10 @@ impl AppState {
             s.global_rate_limit_bps = r;
             self.global_limiter.set_rate(r);
         }
+        if let Some(a) = upd.global_rate_limit_algorithm {
+            s.global_rate_limit_algorithm = a;
+            self.global_limiter.set_algorithm(a);
+        }
         Ok(s.clone())
     }
 
@@ -588,6 +609,8 @@ impl AppState {
         }
         self.global_limiter
             .set_rate(p.settings.global_rate_limit_bps);
+        self.global_limiter
+            .set_algorithm(p.settings.global_rate_limit_algorithm);
 
         let mut count = 0;
         for pt in p.tasks {
@@ -645,7 +668,10 @@ impl AppState {
     fn persist_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.settings.read().global_rate_limit_bps.hash(&mut hasher);
+        let s = self.settings.read();
+        s.global_rate_limit_bps.hash(&mut hasher);
+        (s.global_rate_limit_algorithm as u8).hash(&mut hasher);
+        drop(s);
         for (id, e) in self.tasks.read().iter() {
             let cfg = e.config.read();
             if !cfg.persist {
@@ -657,6 +683,7 @@ impl AppState {
             cfg.max_split.hash(&mut hasher);
             cfg.cache.hash(&mut hasher);
             cfg.rate_limit_bps.hash(&mut hasher);
+            (cfg.rate_limit_algorithm as u8).hash(&mut hasher);
             cfg.name.hash(&mut hasher);
             for (k, v) in &cfg.headers {
                 k.hash(&mut hasher);
