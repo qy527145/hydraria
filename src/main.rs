@@ -34,7 +34,8 @@ fn home_subdir(sub: &str) -> PathBuf {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hyper=warn")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,reqwest=warn")),
         )
         .init();
 
@@ -67,15 +68,35 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router((*state).clone()).layer(tower_http::cors::CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Hydraria listening on http://{}", addr);
-    tracing::info!("Dashboard:   http://{}/", addr);
-    tracing::info!("Cache dir:   {}", cache_dir.display());
-    tracing::info!("State file:  {}", state_file.display());
+
+    // Bind-aware dashboard URL: 0.0.0.0 isn't clickable, so substitute the
+    // loopback. The URL is printed on its own line with no leading prefix so
+    // terminals (VSCode, Windows Terminal, iTerm, kitty, ...) recognize it
+    // as a hyperlink — ctrl+click jumps to the dashboard.
+    let dashboard_host = if addr.ip().is_unspecified() {
+        format!("127.0.0.1:{}", addr.port())
+    } else {
+        addr.to_string()
+    };
+    let dashboard_url = format!("http://{}/", dashboard_host);
+
+    println!();
+    println!("  ╭─────────────────────────────────────────────────────────╮");
+    println!("  │  Hydraria — multi-threaded HTTP streaming proxy         │");
+    println!("  ╰─────────────────────────────────────────────────────────╯");
+    println!();
+    println!("    Dashboard:");
+    println!("    {}", dashboard_url);
+    println!();
+    println!("    Bind:        {}", addr);
+    println!("    Cache dir:   {}", cache_dir.display());
+    println!("    State file:  {}", state_file.display());
     if restored > 0 {
-        tracing::info!("Restored {} persisted task(s) from disk", restored);
+        println!("    Restored:    {} task(s) from disk", restored);
     }
-    tracing::info!("Create task: POST http://{}/api/tasks", addr);
-    tracing::info!("Stream URL:  http://{}/stream/<task_id>", addr);
+    println!();
+    println!("    Logs: set RUST_LOG=hydraria=debug (or =trace) for more detail");
+    println!();
 
     axum::serve(listener, app).await?;
     Ok(())

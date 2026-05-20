@@ -333,6 +333,15 @@ impl Engine {
                 offset,
                 size,
             });
+            tracing::debug!(
+                "probe volume {}/{}: url={} size={} accepts_ranges={} etag={:?}",
+                vi + 1,
+                layout.len(),
+                working_url,
+                size,
+                p.accepts_ranges,
+                p.etag,
+            );
             total_size = total_size
                 .checked_add(size)
                 .ok_or_else(|| ProxyError::Internal("volume sizes overflow u64".into()))?;
@@ -537,6 +546,16 @@ impl Engine {
         let plan = plan_chunks(start, end, split, self.volumes.as_deref().map(|v| v.as_slice()));
         let total_chunks = plan.len();
 
+        tracing::debug!(
+            "stream_range [{}, {}] split={} max_threads={} vol_count={} chunks={}",
+            start,
+            end,
+            split,
+            max_threads,
+            self.volumes.as_deref().map(|v| v.len()).unwrap_or(1),
+            total_chunks,
+        );
+
         // Per-chunk channels so fetchers can run concurrently while the
         // serializer stitches bytes back together in plan order.
         let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
@@ -559,7 +578,26 @@ impl Engine {
         // block on `tx.send().await`, and starve chunk 0 forever — the
         // serializer drains strictly in plan order, so chunks ahead can't
         // make progress until the one being drained finishes.
+        //
+        // Cross-volume warm-up (multi-volume only): the main scheduler still
+        // spawns the plan-prefix `[0..max_threads)` in order (so the
+        // serializer's drain[i] always finds sender[i] already taken). But on
+        // top of that we also pre-spawn one fetcher per *uncovered* volume —
+        // the volume's first chunk in the plan, which lives at some index
+        // > max_threads. These prefetchers open extra TCP connections to the
+        // other volumes' single URL each, so per-connection rate limits (e.g.
+        // nginx `limit_rate`) can't pin total throughput to volume 0. When
+        // the main scheduler later slides forward past a prefetched index it
+        // sees `senders[idx].take() == None` and just skips ahead.
+        let vol_count = self
+            .volumes
+            .as_deref()
+            .map(|v| v.len())
+            .unwrap_or(1)
+            .max(1);
+
         let engine_arc = Arc::clone(&self);
+        let volumes_for_warmup = self.volumes.clone();
         tokio::spawn(async move {
             let spawn_fetch =
                 |idx: usize, tx: mpsc::Sender<Result<Bytes>>, plan: &[(u64, u64)]| {
@@ -574,15 +612,53 @@ impl Engine {
                     });
                 };
 
-            // Initial window: start the first `max_threads` chunks. Chunk 0
-            // is always in this set, so the serializer can immediately make
-            // progress.
+            // Initial window: start the first `max_threads` chunks in plan
+            // order. Chunk 0 is always in this set, so the serializer can
+            // immediately make progress.
             let initial = max_threads.min(total_chunks);
             for idx in 0..initial {
                 let tx = senders[idx]
                     .take()
                     .expect("sender should be present on first spawn");
                 spawn_fetch(idx, tx, &plan);
+            }
+
+            // Cross-volume warm-up: for every volume *not* represented in the
+            // initial window, additionally spawn its first chunk. These extra
+            // fetchers exceed `max_threads` by at most `vol_count - 1`, which
+            // is the unavoidable cost of opening one connection per volume.
+            if vol_count > 1 {
+                let vol_of = plan_volume_indices(
+                    &plan,
+                    volumes_for_warmup.as_deref().map(|v| v.as_slice()),
+                );
+                let mut covered: Vec<bool> = vec![false; vol_count];
+                for idx in 0..initial {
+                    if let Some(&vi) = vol_of.get(idx) {
+                        if vi < covered.len() {
+                            covered[vi] = true;
+                        }
+                    }
+                }
+                let mut warmed: Vec<usize> = Vec::new();
+                for vi in 0..vol_count {
+                    if covered[vi] {
+                        continue;
+                    }
+                    if let Some(idx) = vol_of.iter().position(|&v| v == vi) {
+                        if let Some(tx) = senders[idx].take() {
+                            spawn_fetch(idx, tx, &plan);
+                            warmed.push(idx);
+                        }
+                    }
+                }
+                if !warmed.is_empty() {
+                    tracing::debug!(
+                        "warmup spawned {} extra fetcher(s) for uncovered volumes: idxs={:?}",
+                        warmed.len(),
+                        warmed,
+                    );
+                }
             }
 
             let mut next_to_spawn = initial;
@@ -592,19 +668,23 @@ impl Engine {
                     let is_err = item.is_err();
                     if out_tx.send(item).await.is_err() {
                         // Client dropped the connection — abandon the rest.
+                        tracing::debug!("client gone at chunk {}, abandoning stream", i);
                         return;
                     }
                     if is_err {
+                        tracing::debug!("chunk {} produced an error, ending stream", i);
                         return;
                     }
                 }
-                // Chunk i is fully delivered; slide the window forward.
-                if next_to_spawn < total_chunks {
+                // Chunk i is fully delivered; slide the window forward. Skip
+                // over any already-prefetched indices (their sender is None).
+                while next_to_spawn < total_chunks {
                     let idx = next_to_spawn;
+                    next_to_spawn += 1;
                     if let Some(tx) = senders[idx].take() {
                         spawn_fetch(idx, tx, &plan);
+                        break;
                     }
-                    next_to_spawn += 1;
                 }
                 let _ = i;
             }
@@ -655,6 +735,10 @@ impl Engine {
             let span_end = (((j + 1) * bs - 1).min(total - 1)).min(end);
 
             if hit {
+                tracing::trace!(
+                    "cache HIT chunk={} blocks=[{}..={}]",
+                    idx, i, j,
+                );
                 match cache.read_range(span_start, span_end) {
                     Ok(bytes) => {
                         cache.hits.fetch_add(j - i + 1, Ordering::Relaxed);
@@ -662,10 +746,14 @@ impl Engine {
                             return Ok(());
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Disk read failed — fall back to origin for this span,
                         // but don't try to cache the result (the underlying
                         // file may be broken).
+                        tracing::warn!(
+                            "cache read failed chunk={} blocks=[{}..={}]: {}; falling back to origin",
+                            idx, i, j, e,
+                        );
                         let from = i * bs;
                         let to = ((j + 1) * bs - 1).min(total - 1);
                         self.fetch_span_to_tx(idx, from, to, start, end, None, tx)
@@ -673,6 +761,10 @@ impl Engine {
                     }
                 }
             } else {
+                tracing::trace!(
+                    "cache MISS chunk={} blocks=[{}..={}]",
+                    idx, i, j,
+                );
                 cache.misses.fetch_add(j - i + 1, Ordering::Relaxed);
                 // Fetch the BLOCK-aligned span from origin so writes land at
                 // the right offsets and complete whole blocks in the bitmap.
@@ -712,12 +804,20 @@ impl Engine {
                 None => return Ok(()),
             };
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
+            tracing::trace!(
+                "fetch span chunk={} attempt={} url={} range={}-{} merged_start={}",
+                idx, attempt, target.url, target.local_start, target.local_end, target.merged_start,
+            );
             let req_start = Instant::now();
             let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
                     self.record_failure(&target.url, None, &msg);
+                    tracing::debug!(
+                        "fetch span chunk={} attempt={} url={} network error: {}",
+                        idx, attempt, target.url, msg,
+                    );
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
@@ -734,6 +834,10 @@ impl Engine {
                     &target.url,
                     Some(status_code),
                     &format!("expected 206, got {status_code}"),
+                );
+                tracing::debug!(
+                    "fetch span chunk={} attempt={} url={} expected 206, got {}",
+                    idx, attempt, target.url, status_code,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
@@ -817,12 +921,20 @@ impl Engine {
                 None => return Ok(()),
             };
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
+            tracing::trace!(
+                "fetch chunk={} attempt={} url={} range={}-{}",
+                idx, attempt, target.url, target.local_start, target.local_end,
+            );
             let req_start = Instant::now();
             let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
                     self.record_failure(&target.url, None, &msg);
+                    tracing::debug!(
+                        "fetch chunk={} attempt={} url={} network error: {}",
+                        idx, attempt, target.url, msg,
+                    );
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
@@ -836,6 +948,10 @@ impl Engine {
                     Some(status_code),
                     &format!("status {status_code}"),
                 );
+                tracing::debug!(
+                    "fetch chunk={} attempt={} url={} bad status {}",
+                    idx, attempt, target.url, status_code,
+                );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
             }
@@ -847,6 +963,10 @@ impl Engine {
                     &target.url,
                     Some(status_code),
                     "volume returned 200 OK to a ranged request",
+                );
+                tracing::debug!(
+                    "fetch chunk={} attempt={} url={} multi-volume task got 200 (expected 206), retrying",
+                    idx, attempt, target.url,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
@@ -907,6 +1027,10 @@ impl Engine {
                 }
             }
             if !had_err {
+                tracing::trace!(
+                    "chunk done idx={} emitted={} attempt={}",
+                    idx, emitted, attempt,
+                );
                 return Ok(());
             }
         }
@@ -1148,6 +1272,24 @@ fn short_digest(parts: &[String]) -> String {
         h.update(b"\n");
     }
     hex::encode(&h.finalize()[..8])
+}
+
+/// Map each chunk in `plan` to the volume that contains it. In mirror mode
+/// (`volumes == None`) every chunk maps to bucket 0. In volume mode, since
+/// `plan_chunks` clips each chunk to live entirely inside one volume, the
+/// chunk's start offset uniquely identifies its volume.
+fn plan_volume_indices(plan: &[(u64, u64)], volumes: Option<&[VolumeMeta]>) -> Vec<usize> {
+    match volumes {
+        None => vec![0; plan.len()],
+        Some(vols) => plan
+            .iter()
+            .map(|(cs, _)| {
+                vols.iter()
+                    .position(|v| v.size > 0 && *cs >= v.offset && *cs < v.offset + v.size)
+                    .unwrap_or(0)
+            })
+            .collect(),
+    }
 }
 
 /// Build the per-chunk fetch plan for a merged range. In volume mode, every
@@ -1436,5 +1578,135 @@ mod tests {
             TaskConfig::flat_unique_urls(&layout),
             vec!["a".to_string(), "b".into(), "c".into()],
         );
+    }
+
+    /// Pure-data simulation of the warm-up coverage logic in `stream_range`:
+    /// given the volume index per plan chunk, `max_threads`, and `vol_count`,
+    /// return the set of chunk indices that get spawned *before* the
+    /// serializer starts draining (initial window + cross-volume warm-up).
+    fn initial_spawn_set(vol_of: &[usize], max_threads: usize, vol_count: usize) -> Vec<usize> {
+        let initial = max_threads.min(vol_of.len());
+        let mut spawned: Vec<usize> = (0..initial).collect();
+        if vol_count > 1 {
+            let mut covered = vec![false; vol_count];
+            for &idx in &spawned {
+                if let Some(&vi) = vol_of.get(idx) {
+                    if vi < covered.len() {
+                        covered[vi] = true;
+                    }
+                }
+            }
+            for vi in 0..vol_count {
+                if covered[vi] {
+                    continue;
+                }
+                if let Some(idx) = vol_of.iter().position(|&v| v == vi) {
+                    if !spawned.contains(&idx) {
+                        spawned.push(idx);
+                    }
+                }
+            }
+        }
+        spawned
+    }
+
+    #[test]
+    fn warmup_covers_all_volumes_when_initial_window_only_hits_first() {
+        // 3 volumes, max_threads=2. Initial window covers chunks 0,1 — both
+        // in volume 0. Warm-up must spawn volume 1's first chunk and volume
+        // 2's first chunk.
+        // plan: v0 has 5 chunks, v1 has 5 chunks, v2 has 5 chunks.
+        let vol_of: Vec<usize> = [0; 5]
+            .into_iter()
+            .chain([1; 5])
+            .chain([2; 5])
+            .collect();
+        let spawned = initial_spawn_set(&vol_of, 2, 3);
+        assert!(spawned.contains(&0), "initial chunk 0 must spawn");
+        assert!(spawned.contains(&1), "initial chunk 1 must spawn");
+        assert!(spawned.contains(&5), "v1's first chunk (idx=5) must be warmed up");
+        assert!(spawned.contains(&10), "v2's first chunk (idx=10) must be warmed up");
+        assert_eq!(spawned.len(), 4);
+    }
+
+    #[test]
+    fn warmup_is_noop_when_initial_window_already_covers_all_volumes() {
+        // 3 volumes, max_threads=8. Plan order means initial 8 may already
+        // span volumes 0 and 1 but not 2 if v0 is large.
+        let vol_of: Vec<usize> = [0; 20]
+            .into_iter()
+            .chain([1; 20])
+            .chain([2; 20])
+            .collect();
+        let spawned = initial_spawn_set(&vol_of, 8, 3);
+        // Initial window is all in v0; warm-up adds v1's first (idx=20) and
+        // v2's first (idx=40).
+        assert_eq!(spawned.len(), 10);
+        assert!(spawned.contains(&20));
+        assert!(spawned.contains(&40));
+    }
+
+    #[test]
+    fn warmup_skips_volumes_already_covered_by_initial() {
+        // Plan ordering puts v0 first then v1 (small v0).
+        let vol_of: Vec<usize> = [0, 0, 1, 1, 1, 1].to_vec();
+        // max_threads=4 covers chunks 0..4 which span v0 and v1.
+        let spawned = initial_spawn_set(&vol_of, 4, 2);
+        assert_eq!(spawned, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn warmup_noop_for_single_volume_tasks() {
+        // Mirror mode (vol_count=1): no extra warm-up; behaves exactly like
+        // the pre-multi-volume scheduler.
+        let vol_of: Vec<usize> = vec![0; 10];
+        let spawned = initial_spawn_set(&vol_of, 4, 1);
+        assert_eq!(spawned, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn warmup_chunk_zero_always_first() {
+        // No-deadlock invariant: chunk 0 must be in the spawn set.
+        let vol_of: Vec<usize> = [0; 3]
+            .into_iter()
+            .chain([1; 3])
+            .chain([2; 3])
+            .collect();
+        let spawned = initial_spawn_set(&vol_of, 1, 3);
+        assert!(spawned.contains(&0));
+        // Warm-up adds first chunk of v1 (idx=3) and v2 (idx=6).
+        assert!(spawned.contains(&3));
+        assert!(spawned.contains(&6));
+    }
+
+    #[test]
+    fn plan_volume_indices_mirror_mode_all_zero() {
+        let plan = vec![(0, 99), (100, 199), (200, 299)];
+        assert_eq!(plan_volume_indices(&plan, None), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn plan_volume_indices_volume_mode_maps_by_offset() {
+        // Volumes: [0..100), [100..250), [250..400)
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150), vol("c", 250, 150)];
+        // Plan derived from plan_chunks: each chunk lives in exactly one volume.
+        let plan = plan_chunks(0, 399, 80, Some(&vols));
+        let mapped = plan_volume_indices(&plan, Some(&vols));
+        // Every chunk's volume index matches the volume containing its start.
+        for ((cs, _ce), &vi) in plan.iter().zip(mapped.iter()) {
+            let v = &vols[vi];
+            assert!(*cs >= v.offset && *cs < v.offset + v.size,
+                    "chunk start {} not in volume {} [{},{})", cs, vi, v.offset, v.offset + v.size);
+        }
+    }
+
+    #[test]
+    fn plan_volume_indices_skips_empty_volumes() {
+        // Empty volume in the middle — plan_chunks skips it, so no chunk
+        // should ever map to its index. (We still must not panic.)
+        let vols = vec![vol("a", 0, 50), vol("empty", 50, 0), vol("c", 50, 50)];
+        let plan = plan_chunks(0, 99, 200, Some(&vols));
+        let mapped = plan_volume_indices(&plan, Some(&vols));
+        assert!(!mapped.contains(&1), "empty volume must not appear in mapping");
     }
 }

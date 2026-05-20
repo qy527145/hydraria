@@ -300,7 +300,15 @@ async fn handle_stream(
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
 
+    tracing::info!(
+        "stream start task={} range={} head_only={}",
+        task_id,
+        range_header.as_deref().unwrap_or("none"),
+        head_only,
+    );
+
     if entry.paused.load(Ordering::Relaxed) {
+        tracing::debug!("stream task={} paused, returning 503", task_id);
         let body = Json(ApiError {
             error: format!("task {} is paused", task_id),
         });
@@ -309,7 +317,17 @@ async fn handle_stream(
 
     let cfg = Arc::new(entry.config_snapshot());
     let engine = Engine::new(Arc::clone(&cfg))?;
+    let probe_t0 = std::time::Instant::now();
     let mut probe = engine.probe().await?;
+    tracing::info!(
+        "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} ({}ms)",
+        task_id,
+        probe.total_size.map(|t| t.to_string()).unwrap_or_else(|| "unknown".into()),
+        probe.volumes.as_ref().map(|v| v.len()).unwrap_or(0),
+        probe.accepts_ranges,
+        probe.etag,
+        probe_t0.elapsed().as_millis(),
+    );
 
     // Resolve which filename to advertise. Precedence:
     //   auto_filename=true  → probe result → output_filename → name → URL guess
@@ -328,6 +346,12 @@ async fn handle_stream(
                 None
             }
         };
+    tracing::debug!(
+        "stream task={} cache={} mode={}",
+        task_id,
+        cache_entry.is_some(),
+        if probe.accepts_ranges && probe.total_size.is_some() { "ranged" } else { "passthrough" },
+    );
 
     let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
     let engine = Arc::new(
@@ -369,12 +393,20 @@ fn resolve_cache(
     cfg: &TaskConfig,
     probe: &UpstreamProbe,
 ) -> Result<Option<Arc<CacheEntry>>, ProxyError> {
-    if !cfg.cache || !probe.accepts_ranges {
+    if !cfg.cache {
+        tracing::trace!("cache skipped: task.cache = false");
+        return Ok(None);
+    }
+    if !probe.accepts_ranges {
+        tracing::trace!("cache skipped: upstream doesn't support ranges");
         return Ok(None);
     }
     let total = match probe.total_size {
         Some(t) if t > 0 => t,
-        _ => return Ok(None),
+        _ => {
+            tracing::trace!("cache skipped: unknown total size");
+            return Ok(None);
+        }
     };
     let key = crate::cache::CacheStore::key_for_task(cfg);
     // Stored URL list is just a traceability hint — we record it sorted and
@@ -390,7 +422,12 @@ fn resolve_cache(
         block_size: crate::cache::BLOCK_SIZE,
         urls,
     };
-    state.cache.open(&key, meta).map(Some)
+    let entry = state.cache.open(&key, meta)?;
+    tracing::debug!(
+        "cache opened key={} total={} etag={:?}",
+        key, total, probe.etag,
+    );
+    Ok(Some(entry))
 }
 
 async fn build_stream_response(

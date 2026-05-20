@@ -1230,6 +1230,18 @@ function renderVolumesEditor(scope, volumes) {
   const host = $(`#${scope}-volumes-host`);
   host.innerHTML = "";
   const list = volumes.length === 0 ? [[""]] : volumes;
+  const revalidate = () => {
+    if (scope === "f") {
+      revalidateCreate();
+      if (typeof saveCreateDraft === "function") saveCreateDraft();
+    } else {
+      revalidateEdit();
+    }
+  };
+  const rerender = (next) => {
+    renderVolumesEditor(scope, next);
+    revalidate();
+  };
   list.forEach((mirrors, idx) => {
     const card = document.createElement("div");
     card.className = "vol-card";
@@ -1244,19 +1256,54 @@ function renderVolumesEditor(scope, volumes) {
     head.appendChild(title);
     head.appendChild(stats);
 
+    const actions = document.createElement("span");
+    actions.style.display = "inline-flex";
+    actions.style.gap = "4px";
+
+    const mkBtn = (label, title, enabled, onClick) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ghost";
+      b.textContent = label;
+      b.title = title;
+      if (!enabled) {
+        b.disabled = true;
+        b.style.opacity = "0.4";
+        b.style.cursor = "not-allowed";
+      } else {
+        b.addEventListener("click", onClick);
+      }
+      return b;
+    };
+
+    // ↑ move up
+    actions.appendChild(mkBtn("↑", "上移此卷", idx > 0, () => {
+      const vols = readVolumes(scope);
+      [vols[idx - 1], vols[idx]] = [vols[idx], vols[idx - 1]];
+      rerender(vols);
+    }));
+    // ↓ move down
+    actions.appendChild(mkBtn("↓", "下移此卷", idx < list.length - 1, () => {
+      const vols = readVolumes(scope);
+      [vols[idx + 1], vols[idx]] = [vols[idx], vols[idx + 1]];
+      rerender(vols);
+    }));
+    // + insert new volume below this one
+    actions.appendChild(mkBtn("+", "在此卷下方插入新卷", true, () => {
+      const vols = readVolumes(scope);
+      vols.splice(idx + 1, 0, [""]);
+      rerender(vols);
+    }));
+    // ✕ remove (only when more than one)
     if (list.length > 1) {
-      const rm = document.createElement("button");
-      rm.type = "button";
-      rm.className = "ghost";
-      rm.textContent = "✕ 删除";
-      rm.addEventListener("click", () => {
+      actions.appendChild(mkBtn("✕", "删除此卷", true, () => {
         const vols = readVolumes(scope);
         vols.splice(idx, 1);
-        renderVolumesEditor(scope, vols);
-        scope === "f" ? revalidateCreate() : revalidateEdit();
-      });
-      head.appendChild(rm);
+        rerender(vols);
+      }));
     }
+
+    head.appendChild(actions);
     card.appendChild(head);
 
     const ta = document.createElement("textarea");
@@ -1455,18 +1502,57 @@ function bindFilenameControls(scope) {
 bindFilenameControls("f");
 bindFilenameControls("e");
 
+// Create-modal draft: persisted to localStorage so accidental Esc / refresh
+// doesn't lose half-typed volume URLs. Cleared on successful submit or on
+// explicit Cancel (both communicate intent to discard).
+const CREATE_DRAFT_KEY = "hydraria.createDraft.v1";
+const CREATE_DEFAULTS = {
+  headers: "", name: "", rate: "", threads: "16", split: "5M",
+  cache: false, persist: false, algorithm: "token_bucket",
+  volumes: [], autoFilename: true, outputFilename: "",
+};
+function loadCreateDraft() {
+  try {
+    const raw = localStorage.getItem(CREATE_DRAFT_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    return d && typeof d === "object" ? d : null;
+  } catch { return null; }
+}
+function saveCreateDraft() {
+  if (!$("#create-modal").classList.contains("show")) return;
+  const draft = {
+    headers: $("#f-headers").value,
+    name: $("#f-name").value,
+    rate: $("#f-rate").value,
+    threads: $("#f-threads").value,
+    split: $("#f-split").value,
+    cache: $("#f-cache").checked,
+    persist: $("#f-persist").checked,
+    algorithm: $("#f-algorithm").value,
+    volumes: readVolumes("f"),
+    autoFilename: $("#f-auto-filename").checked,
+    outputFilename: $("#f-output-filename").value,
+  };
+  try { localStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(draft)); } catch {}
+}
+function clearCreateDraft() {
+  try { localStorage.removeItem(CREATE_DRAFT_KEY); } catch {}
+}
+
 function openCreate() {
-  $("#f-headers").value = "";
-  $("#f-name").value = "";
-  $("#f-rate").value = "";
-  $("#f-threads").value = "16";
-  $("#f-split").value = "5M";
-  $("#f-cache").checked = false;
-  $("#f-persist").checked = false;
-  $("#f-algorithm").value = "token_bucket";
-  renderVolumesEditor("f", []);
-  $("#f-auto-filename").checked = true;
-  $("#f-output-filename").value = "";
+  const d = loadCreateDraft() || CREATE_DEFAULTS;
+  $("#f-headers").value = d.headers ?? "";
+  $("#f-name").value = d.name ?? "";
+  $("#f-rate").value = d.rate ?? "";
+  $("#f-threads").value = d.threads ?? "16";
+  $("#f-split").value = d.split ?? "5M";
+  $("#f-cache").checked = !!d.cache;
+  $("#f-persist").checked = !!d.persist;
+  $("#f-algorithm").value = d.algorithm ?? "token_bucket";
+  renderVolumesEditor("f", Array.isArray(d.volumes) ? d.volumes : []);
+  $("#f-auto-filename").checked = d.autoFilename !== false;
+  $("#f-output-filename").value = d.outputFilename ?? "";
   $("#f-output-filename").dataset.detected = "";
   $("#f-fname-status").textContent = "未探测";
   revalidateCreate();
@@ -1476,11 +1562,17 @@ function openCreate() {
     if (ta) ta.focus();
   }, 80);
 }
-function closeCreate() { $("#create-modal").classList.remove("show"); }
+// Esc / hide just closes — draft stays.
+function closeCreate() { saveCreateDraft(); $("#create-modal").classList.remove("show"); }
+// Explicit Cancel discards.
+function cancelCreate() { clearCreateDraft(); $("#create-modal").classList.remove("show"); }
+
+// Auto-save draft on every change inside the create modal.
+$("#create-modal").addEventListener("input", saveCreateDraft, true);
+$("#create-modal").addEventListener("change", saveCreateDraft, true);
 
 $("#btn-open-create").onclick = openCreate;
-$("#btn-create-cancel").onclick = closeCreate;
-$("#create-modal").onclick = (e) => { if (e.target.id === "create-modal") closeCreate(); };
+$("#btn-create-cancel").onclick = cancelCreate;
 
 $("#btn-create").onclick = async () => {
   const u = validateVolumes("f", $("#urls-count"));
@@ -1505,6 +1597,7 @@ $("#btn-create").onclick = async () => {
     const res = await api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
     toast("已创建：" + res.proxy_url, "ok");
     closeCreate();
+    clearCreateDraft();
     refresh();
   } catch (e) {
     toast("创建失败：" + e.message, "error");
@@ -1551,7 +1644,6 @@ function openEdit(id) {
 }
 function closeEdit() { $("#edit-modal").classList.remove("show"); editingId = null; }
 $("#btn-edit-cancel").onclick = closeEdit;
-$("#edit-modal").onclick = (e) => { if (e.target.id === "edit-modal") closeEdit(); };
 $("#btn-edit-save").onclick = async () => {
   if (!editingId) return;
   const u = validateVolumes("e", $("#e-urls-count"));
@@ -1604,7 +1696,17 @@ async function openSettings() {
 }
 $("#btn-settings").onclick = openSettings;
 $("#btn-settings-cancel").onclick = () => $("#settings-modal").classList.remove("show");
-$("#settings-modal").onclick = (e) => { if (e.target.id === "settings-modal") $("#settings-modal").classList.remove("show"); };
+
+// Esc closes whichever modal is open. Clicking the backdrop no longer
+// closes — too easy to discard in-progress config by accident.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if ($("#create-modal").classList.contains("show")) { closeCreate(); return; }
+  if ($("#edit-modal").classList.contains("show")) { closeEdit(); return; }
+  if ($("#settings-modal").classList.contains("show")) {
+    $("#settings-modal").classList.remove("show");
+  }
+});
 
 $("#s-rate").addEventListener("input", () => {
   const v = $("#s-rate").value.trim();
