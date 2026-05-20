@@ -556,6 +556,55 @@
     font-size: 11px;
   }
   .vol-card textarea { min-height: 56px; margin: 0; }
+
+  /* Drag handle: only this glyph is draggable, so textarea text selection
+     and clicks elsewhere on the card stay normal. */
+  .vol-grab {
+    display: inline-flex;
+    align-items: center;
+    cursor: grab;
+    user-select: none;
+    padding: 2px 4px;
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+    letter-spacing: -3px;
+    border-radius: 4px;
+  }
+  .vol-grab:hover { color: var(--text-dim); background: rgba(255,255,255,0.04); }
+  .vol-grab:active { cursor: grabbing; }
+  .vol-card.vol-dragging { opacity: 0.4; }
+
+  /* Insert gap between cards: collapsed by default, expands on hover or
+     when a drag is hovering over it. Click anywhere on the expanded bar
+     to insert a new empty volume at that position. */
+  .vol-gap {
+    height: 6px;
+    margin: -1px 0;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: height 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+    border: 1px dashed transparent;
+  }
+  .vol-gap:hover,
+  .vol-gap.vol-drop-target {
+    height: 24px;
+    background: rgba(110, 168, 255, 0.08);
+    border-color: var(--border-strong);
+  }
+  .vol-gap.vol-drop-target {
+    background: rgba(110, 168, 255, 0.18);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .vol-gap-label { opacity: 0; transition: opacity 0.12s; pointer-events: none; }
+  .vol-gap:hover .vol-gap-label,
+  .vol-gap.vol-drop-target .vol-gap-label { opacity: 1; }
   .check {
     display: flex;
     align-items: center;
@@ -1242,68 +1291,112 @@ function renderVolumesEditor(scope, volumes) {
     renderVolumesEditor(scope, next);
     revalidate();
   };
+
+  // Insert gap: clicking inserts a new empty volume at `dropIdx`; dragging
+  // a card over it and releasing reorders the dragged card to `dropIdx`.
+  const makeGap = (dropIdx) => {
+    const gap = document.createElement("div");
+    gap.className = "vol-gap";
+    gap.dataset.dropIdx = String(dropIdx);
+    gap.title = "在此处插入新分卷";
+    const label = document.createElement("span");
+    label.className = "vol-gap-label";
+    label.textContent = "+ 在此处插入";
+    gap.appendChild(label);
+
+    gap.addEventListener("click", () => {
+      const vols = readVolumes(scope);
+      vols.splice(dropIdx, 0, [""]);
+      rerender(vols);
+    });
+    gap.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      host.querySelectorAll(".vol-gap.vol-drop-target")
+        .forEach(g => g.classList.remove("vol-drop-target"));
+      gap.classList.add("vol-drop-target");
+    });
+    gap.addEventListener("dragleave", () => {
+      gap.classList.remove("vol-drop-target");
+    });
+    gap.addEventListener("drop", (e) => {
+      e.preventDefault();
+      gap.classList.remove("vol-drop-target");
+      const srcIdx = parseInt(e.dataTransfer.getData("text/plain"), 10);
+      if (Number.isNaN(srcIdx)) return;
+      const vols = readVolumes(scope);
+      if (srcIdx < 0 || srcIdx >= vols.length) return;
+      // Adjust target index: removing srcIdx shifts everything > srcIdx left by 1.
+      let target = dropIdx;
+      if (srcIdx < target) target -= 1;
+      if (target === srcIdx) return; // no-op
+      const [moved] = vols.splice(srcIdx, 1);
+      vols.splice(target, 0, moved);
+      rerender(vols);
+    });
+    return gap;
+  };
+
   list.forEach((mirrors, idx) => {
+    // Gap *before* this card — insertion / drop position `idx`.
+    host.appendChild(makeGap(idx));
+
     const card = document.createElement("div");
     card.className = "vol-card";
     card.dataset.volumeIdx = String(idx);
 
     const head = document.createElement("div");
     head.className = "vol-card-head";
+
+    // Drag handle (the only draggable element — keeps textarea text
+    // selection and clicks elsewhere working as normal).
+    const grab = document.createElement("span");
+    grab.className = "vol-grab";
+    grab.draggable = true;
+    grab.textContent = "⋮⋮";
+    grab.title = "拖动以重新排序此卷";
+    grab.addEventListener("dragstart", (e) => {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", String(idx));
+      // Drag image = the whole card (looks more natural than just the handle).
+      try { e.dataTransfer.setDragImage(card, 12, 12); } catch {}
+      card.classList.add("vol-dragging");
+    });
+    grab.addEventListener("dragend", () => {
+      card.classList.remove("vol-dragging");
+      host.querySelectorAll(".vol-gap.vol-drop-target")
+        .forEach(g => g.classList.remove("vol-drop-target"));
+    });
+
     const title = document.createElement("span");
     title.textContent = list.length > 1 ? `卷 ${idx + 1}` : "唯一卷";
     const stats = document.createElement("span");
     stats.className = "vol-stats";
-    head.appendChild(title);
-    head.appendChild(stats);
 
-    const actions = document.createElement("span");
-    actions.style.display = "inline-flex";
-    actions.style.gap = "4px";
+    const left = document.createElement("span");
+    left.style.display = "inline-flex";
+    left.style.alignItems = "center";
+    left.style.gap = "8px";
+    left.appendChild(grab);
+    left.appendChild(title);
+    left.appendChild(stats);
+    head.appendChild(left);
 
-    const mkBtn = (label, title, enabled, onClick) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "ghost";
-      b.textContent = label;
-      b.title = title;
-      if (!enabled) {
-        b.disabled = true;
-        b.style.opacity = "0.4";
-        b.style.cursor = "not-allowed";
-      } else {
-        b.addEventListener("click", onClick);
-      }
-      return b;
-    };
-
-    // ↑ move up
-    actions.appendChild(mkBtn("↑", "上移此卷", idx > 0, () => {
-      const vols = readVolumes(scope);
-      [vols[idx - 1], vols[idx]] = [vols[idx], vols[idx - 1]];
-      rerender(vols);
-    }));
-    // ↓ move down
-    actions.appendChild(mkBtn("↓", "下移此卷", idx < list.length - 1, () => {
-      const vols = readVolumes(scope);
-      [vols[idx + 1], vols[idx]] = [vols[idx], vols[idx + 1]];
-      rerender(vols);
-    }));
-    // + insert new volume below this one
-    actions.appendChild(mkBtn("+", "在此卷下方插入新卷", true, () => {
-      const vols = readVolumes(scope);
-      vols.splice(idx + 1, 0, [""]);
-      rerender(vols);
-    }));
-    // ✕ remove (only when more than one)
+    // Only the ✕ button remains in the head — move/insert moved to drag
+    // handle and inter-card gaps respectively.
     if (list.length > 1) {
-      actions.appendChild(mkBtn("✕", "删除此卷", true, () => {
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "ghost";
+      rm.textContent = "✕ 删除";
+      rm.title = "删除此卷";
+      rm.addEventListener("click", () => {
         const vols = readVolumes(scope);
         vols.splice(idx, 1);
         rerender(vols);
-      }));
+      });
+      head.appendChild(rm);
     }
-
-    head.appendChild(actions);
     card.appendChild(head);
 
     const ta = document.createElement("textarea");
@@ -1315,6 +1408,9 @@ function renderVolumesEditor(scope, volumes) {
 
     host.appendChild(card);
   });
+
+  // Trailing gap — drop position = end of list.
+  host.appendChild(makeGap(list.length));
 }
 
 function readVolumes(scope) {

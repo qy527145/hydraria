@@ -260,6 +260,12 @@ impl Engine {
         let mut last_modified_first: Option<String> = None;
         let mut composite_etag_parts: Vec<String> = Vec::with_capacity(layout.len());
         let mut composite_lm_parts: Vec<String> = Vec::with_capacity(layout.len());
+        // Per-volume detected filenames (from Content-Disposition or URL path),
+        // collected so we can LCP-merge them at the end. Without this the
+        // returned filename is just volume 0's name (e.g. "movie.part01" or
+        // "t.mkv.01") — wrong for the stitched stream.
+        let mut per_volume_filenames: Vec<Option<String>> = Vec::with_capacity(layout.len());
+        let mut representative_urls: Vec<String> = Vec::with_capacity(layout.len());
         let mut accepts_ranges_all = true;
         let mut total_size: u64 = 0;
         let mut size_known_all = true;
@@ -325,6 +331,8 @@ impl Engine {
                 etag_first = p.etag.clone();
                 last_modified_first = p.last_modified.clone();
             }
+            per_volume_filenames.push(p.filename.clone());
+            representative_urls.push(working_url.clone());
             composite_etag_parts.push(p.etag.clone().unwrap_or_default());
             composite_lm_parts.push(p.last_modified.clone().unwrap_or_default());
 
@@ -365,6 +373,14 @@ impl Engine {
         } else {
             last_modified_first
         };
+
+        // Multi-volume filename: merge per-volume names via longest-common-
+        // prefix so we surface the stitched name (e.g. "movie") instead of
+        // volume 0's (e.g. "movie.part01"). Single-volume tasks pass through.
+        if multi_volume {
+            filename = merge_volume_filenames(&per_volume_filenames, &representative_urls)
+                .or(filename);
+        }
 
         let total = if size_known_all { Some(total_size) } else { None };
         Ok(UpstreamProbe {
@@ -1157,6 +1173,35 @@ fn filename_from_url(url: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Merge per-volume detected filenames into a single name representing the
+/// stitched file. Prefers names from Content-Disposition / URL probes when
+/// available (more accurate than re-parsing URLs); falls back to deriving
+/// from the representative URLs when too few volumes returned a name.
+///
+/// Used by `probe_layout` so multi-volume tasks advertise e.g. `movie.mkv`
+/// instead of volume 0's `movie.mkv.01`.
+fn merge_volume_filenames(
+    per_vol: &[Option<String>],
+    representative_urls: &[String],
+) -> Option<String> {
+    // Count how many volumes detected a name. With ≥2 we can do LCP on the
+    // detected names directly; otherwise fall back to URL-derived names.
+    let detected: Vec<String> = per_vol.iter().filter_map(|s| s.clone()).collect();
+    if detected.len() >= 2 {
+        if detected.len() == 1 {
+            return Some(detected.into_iter().next().unwrap());
+        }
+        let prefix = longest_common_prefix(&detected);
+        let trimmed = trim_filename_tail(&prefix);
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+        // LCP trimmed to nothing — the detected names diverge too much; fall
+        // through to URL-based suggestion.
+    }
+    suggest_volume_filename(representative_urls)
+}
+
 /// Public entry point: given a volume task's URL list, derive a sensible
 /// merged filename. Strategy:
 ///   1. Extract each volume's filename (last path segment, percent-decoded).
@@ -1488,6 +1533,50 @@ mod tests {
         ];
         // Should not panic on multibyte boundary slicing.
         assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("电影"));
+    }
+
+    #[test]
+    fn merge_filenames_prefers_lcp_of_detected_names() {
+        // Every volume reports a Content-Disposition name like "t.mkv.01" —
+        // LCP + trim should give "t.mkv", not the first volume's raw name.
+        let per_vol = vec![
+            Some("t.mkv.01".to_string()),
+            Some("t.mkv.02".to_string()),
+            Some("t.mkv.03".to_string()),
+        ];
+        let urls = vec![
+            "http://host/t.mkv.01".to_string(),
+            "http://host/t.mkv.02".to_string(),
+            "http://host/t.mkv.03".to_string(),
+        ];
+        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("t.mkv"));
+    }
+
+    #[test]
+    fn merge_filenames_falls_back_to_urls_when_detection_sparse() {
+        // Only volume 0 had a detected name — not enough to LCP. Fall back
+        // to URL-derived suggestion.
+        let per_vol = vec![Some("ignored.part01".to_string()), None, None];
+        let urls = vec![
+            "http://host/movie.part01.mp4".to_string(),
+            "http://host/movie.part02.mp4".to_string(),
+            "http://host/movie.part03.mp4".to_string(),
+        ];
+        // suggest_volume_filename on the URLs trims to "movie".
+        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("movie"));
+    }
+
+    #[test]
+    fn merge_filenames_falls_back_when_lcp_is_empty() {
+        // Detected names diverge completely — LCP is empty, must not return
+        // empty string; fall through to URL derivation.
+        let per_vol = vec![Some("alpha.bin".into()), Some("beta.bin".into())];
+        let urls = vec![
+            "http://host/x.part01".to_string(),
+            "http://host/x.part02".to_string(),
+        ];
+        // URL fallback gives "x".
+        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("x"));
     }
 
     #[test]
