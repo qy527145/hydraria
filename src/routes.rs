@@ -1,9 +1,9 @@
 use crate::cache::{CacheEntry, CacheMeta};
-use crate::engine::{Engine, UpstreamProbe, parse_range_header};
+use crate::engine::{Engine, UpstreamProbe, parse_range_header, suggest_volume_filename};
 use crate::error::ProxyError;
 use crate::models::{
-    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate,
-    short_id,
+    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskMode,
+    TaskUpdate, short_id,
 };
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -12,7 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio_stream::wrappers::ReceiverStream;
@@ -26,6 +27,35 @@ struct CreateResp {
 #[derive(Serialize)]
 struct ApiError {
     error: String,
+}
+
+#[derive(Deserialize)]
+struct ProbeReq {
+    #[serde(default)]
+    urls: Vec<String>,
+    /// Structured volume layout. When supplied, this overrides `urls`.
+    #[serde(default)]
+    volumes: Vec<Vec<String>>,
+    /// Legacy hint — only consulted when `volumes` is empty and we need to
+    /// know whether to wrap each `urls` entry as its own volume.
+    #[serde(default)]
+    mode: Option<TaskMode>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
+}
+
+#[derive(Serialize)]
+struct ProbeResp {
+    /// Filename detected from an upstream Content-Disposition (or URL path
+    /// fallback). `None` if probing produced nothing usable.
+    detected_filename: Option<String>,
+    /// What the UI should put in the output-filename input by default. For
+    /// volume mode this is the longest common prefix of the per-volume
+    /// filenames; for mirror mode it's the detected filename.
+    suggested_filename: Option<String>,
+    total_size: Option<u64>,
+    content_type: Option<String>,
+    accepts_ranges: bool,
 }
 
 impl IntoResponse for ProxyError {
@@ -57,6 +87,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/pause", post(pause_task))
         .route("/api/tasks/{task_id}/resume", post(resume_task))
         .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
+        .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/global", get(get_global))
         .route("/stream/{task_id}", get(stream_task).head(stream_task_head))
@@ -84,10 +115,13 @@ async fn get_global(State(state): State<AppState>) -> Json<GlobalState> {
 
 async fn create_task(
     State(state): State<AppState>,
-    Json(cfg): Json<TaskConfig>,
+    Json(mut cfg): Json<TaskConfig>,
 ) -> Result<Json<CreateResp>, ProxyError> {
+    cfg.normalize();
     if cfg.urls.is_empty() {
-        return Err(ProxyError::Internal("urls must not be empty".into()));
+        return Err(ProxyError::Internal(
+            "at least one URL is required across all volumes".into(),
+        ));
     }
     let id = {
         let mut tries = 0;
@@ -112,6 +146,60 @@ async fn create_task(
 
 async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
     Json(state.list())
+}
+
+/// Cheap one-shot probe used by the create/edit form to preview the detected
+/// filename and metadata before the task exists. Builds a throwaway `Engine`
+/// with the supplied URLs/volumes/headers, runs the same probe path the
+/// streamer would, then derives a "suggested" filename (LCP across volumes).
+async fn probe_urls(
+    State(_state): State<AppState>,
+    Json(req): Json<ProbeReq>,
+) -> Result<Json<ProbeResp>, ProxyError> {
+    if req.urls.is_empty() && req.volumes.iter().all(|v| v.is_empty()) {
+        return Err(ProxyError::Internal("urls must not be empty".into()));
+    }
+    let mut cfg = TaskConfig {
+        urls: req.urls.clone(),
+        volumes: req.volumes.clone(),
+        mode: req.mode.unwrap_or_default(),
+        max_threads: 1,
+        max_split: 5 * 1024 * 1024,
+        cache: false,
+        headers: req.headers.unwrap_or_default(),
+        name: None,
+        output_filename: None,
+        auto_filename: true,
+        rate_limit_bps: 0,
+        rate_limit_algorithm: Default::default(),
+        persist: false,
+    };
+    cfg.normalize();
+    let layout = cfg.effective_volumes();
+    let engine = Engine::new(Arc::new(cfg))?;
+    let probe = engine.probe().await?;
+
+    // Suggested filename for the UI: when there are 2+ volumes, take the
+    // longest common prefix of the per-volume filenames (the parts are
+    // usually named "movie.part01", "movie.part02", … so the LCP is the
+    // unsuffixed name the user wants). For one volume — i.e. the historic
+    // mirror case — just use what the upstream advertised.
+    let suggested = if layout.len() > 1 {
+        // One representative URL per volume — pick the first mirror.
+        let representatives: Vec<String> =
+            layout.iter().filter_map(|v| v.first().cloned()).collect();
+        suggest_volume_filename(&representatives).or_else(|| probe.filename.clone())
+    } else {
+        probe.filename.clone()
+    };
+
+    Ok(Json(ProbeResp {
+        detected_filename: probe.filename,
+        suggested_filename: suggested,
+        total_size: probe.total_size,
+        content_type: probe.content_type,
+        accepts_ranges: probe.accepts_ranges,
+    }))
 }
 
 async fn get_task(
@@ -178,7 +266,7 @@ async fn clear_task_cache(
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id))?;
     let cfg = entry.config_snapshot();
-    let key = crate::cache::CacheStore::key_for_urls(&cfg.urls);
+    let key = crate::cache::CacheStore::key_for_task(&cfg);
     state.cache.clear(&key)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -221,7 +309,12 @@ async fn handle_stream(
 
     let cfg = Arc::new(entry.config_snapshot());
     let engine = Engine::new(Arc::clone(&cfg))?;
-    let probe = engine.probe().await?;
+    let mut probe = engine.probe().await?;
+
+    // Resolve which filename to advertise. Precedence:
+    //   auto_filename=true  → probe result → output_filename → name → URL guess
+    //   auto_filename=false → output_filename (None ⇒ no Content-Disposition)
+    probe.filename = resolve_served_filename(&cfg, probe.filename.take());
 
     // Resolve cache entry up-front when (a) the task wants caching, (b) the
     // upstream supports ranges, and (c) we know a real total size. Any
@@ -237,10 +330,38 @@ async fn handle_stream(
         };
 
     let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
-    let engine = Arc::new(engine.with_cache(cache_entry.clone()).with_health(health));
+    let engine = Arc::new(
+        engine
+            .with_cache(cache_entry.clone())
+            .with_health(health)
+            .with_volumes(probe.volumes.clone()),
+    );
 
     build_stream_response(state, task_id, entry, engine, probe, range_header, head_only)
         .await
+}
+
+/// Decide which filename (if any) to advertise on Content-Disposition.
+///
+/// * `auto_filename = true` → take whatever the upstream probe detected; if
+///   probing returned nothing, fall back to the user's saved value, then to
+///   the task's display name. This makes "auto" mean "always reflect the live
+///   server" without losing a usable name when detection fails.
+/// * `auto_filename = false` → use `output_filename` verbatim. Empty/None
+///   means "no Content-Disposition header" — let the client pick its own.
+fn resolve_served_filename(cfg: &TaskConfig, detected: Option<String>) -> Option<String> {
+    let trim_opt = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if cfg.auto_filename {
+        detected
+            .or_else(|| trim_opt(cfg.output_filename.as_deref()))
+            .or_else(|| trim_opt(cfg.name.as_deref()))
+    } else {
+        trim_opt(cfg.output_filename.as_deref())
+    }
 }
 
 fn resolve_cache(
@@ -255,9 +376,12 @@ fn resolve_cache(
         Some(t) if t > 0 => t,
         _ => return Ok(None),
     };
+    let key = crate::cache::CacheStore::key_for_task(cfg);
+    // Stored URL list is just a traceability hint — we record it sorted and
+    // deduped (across all mirrors of all volumes) so it's stable regardless
+    // of how the user ordered things.
     let mut urls = cfg.urls.clone();
     urls.sort_unstable();
-    let key = crate::cache::CacheStore::key_for_urls(&urls);
     let meta = CacheMeta {
         etag: probe.etag.clone(),
         last_modified: probe.last_modified.clone(),
@@ -294,6 +418,13 @@ async fn build_stream_response(
     if let Some(lm) = &probe.last_modified {
         if let Ok(v) = HeaderValue::from_str(lm) {
             resp_headers.insert(header::LAST_MODIFIED, v);
+        }
+    }
+    if let Some(name) = &probe.filename {
+        if let Some(cd) = build_content_disposition(name) {
+            if let Ok(v) = HeaderValue::from_str(&cd) {
+                resp_headers.insert(header::CONTENT_DISPOSITION, v);
+            }
         }
     }
     resp_headers.insert(
@@ -419,4 +550,55 @@ async fn build_stream_response(
     *resp.status_mut() = status;
     *resp.headers_mut() = resp_headers;
     Ok(resp)
+}
+
+/// Build an RFC 6266-compliant Content-Disposition header value for a filename.
+/// Emits both an ASCII `filename=` fallback and an RFC 5987 `filename*=UTF-8''…`
+/// form whenever the name contains anything non-ASCII or quote-unsafe, so old
+/// clients see something readable while modern ones get the exact name.
+fn build_content_disposition(filename: &str) -> Option<String> {
+    let name = filename.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let needs_encoding = name
+        .bytes()
+        .any(|b| !b.is_ascii() || b < 0x20 || b == b'"' || b == b'\\');
+    let ascii_fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !needs_encoding {
+        Some(format!("inline; filename=\"{}\"", ascii_fallback))
+    } else {
+        let encoded = percent_encode_rfc5987(name);
+        Some(format!(
+            "inline; filename=\"{}\"; filename*=UTF-8''{}",
+            ascii_fallback, encoded
+        ))
+    }
+}
+
+fn percent_encode_rfc5987(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        // RFC 5987 attr-char set.
+        let safe = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }

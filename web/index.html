@@ -532,6 +532,30 @@
   textarea.headers { min-height: 84px; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .vol-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--panel-2);
+  }
+  .vol-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .vol-card-head .vol-stats { font-size: 11px; letter-spacing: 0; text-transform: none; }
+  .vol-card-head button {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+  .vol-card textarea { min-height: 56px; margin: 0; }
   .check {
     display: flex;
     align-items: center;
@@ -645,8 +669,16 @@
       <h3>新建代理任务</h3>
       <div class="modal-sub">配置完成后将生成一个可粘进 VLC / 浏览器 / aria2 的短链 URL。</div>
 
-      <label class="field">源 URL — 每行一个 <span class="hint-inline" id="urls-count">尚未输入</span></label>
-      <textarea id="f-urls" placeholder="https://server1.com/file.mp4&#10;https://server2.com/file.mp4"></textarea>
+      <label class="field">
+        分卷 / 源 URL
+        <span class="hint-inline" id="urls-count">尚未输入</span>
+      </label>
+      <div class="modal-sub" style="margin-top: -2px; margin-bottom: 8px;">
+        每个"卷"是一段在最终文件里**按顺序**出现的字节,卷里的多个 URL 是这一卷的镜像(任一可用即可)。
+        只填一个卷时就是普通的"多镜像同一文件"场景。
+      </div>
+      <div id="f-volumes-host"></div>
+      <button type="button" class="ghost" id="btn-f-add-volume" style="margin-top: 8px;">+ 添加分卷</button>
 
       <div class="row">
         <div>
@@ -673,6 +705,19 @@
           <input id="f-rate" type="text" placeholder="例如 2M" />
         </div>
       </div>
+
+      <label class="field">
+        下载文件名
+        <span class="hint-inline" id="f-fname-status">未探测</span>
+      </label>
+      <div class="row" style="grid-template-columns: 1fr auto;">
+        <input id="f-output-filename" type="text" placeholder="点击右侧探测自动填入,或手动输入" />
+        <button type="button" class="ghost" id="btn-f-probe" style="white-space: nowrap;">探测</button>
+      </div>
+      <label class="check" style="margin-top: 6px;">
+        <input type="checkbox" id="f-auto-filename" checked />
+        <span>自动检测<span class="desc">运行时优先使用上游探测结果;手动编辑此输入框会自动关闭</span></span>
+      </label>
 
       <label class="field">限速算法 <span class="hint-inline" id="f-algo-hint">仅当限速 &gt; 0 时生效</span></label>
       <select id="f-algorithm">
@@ -704,8 +749,12 @@
       <h3>编辑任务 <span style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);" id="edit-id"></span></h3>
       <div class="modal-sub">更改会立刻应用到后续连接（已建立的流不受影响）。</div>
 
-      <label class="field">源 URL <span class="hint-inline" id="e-urls-count"></span></label>
-      <textarea id="e-urls"></textarea>
+      <label class="field">
+        分卷 / 源 URL
+        <span class="hint-inline" id="e-urls-count"></span>
+      </label>
+      <div id="e-volumes-host"></div>
+      <button type="button" class="ghost" id="btn-e-add-volume" style="margin-top: 8px;">+ 添加分卷</button>
 
       <div class="row">
         <div>
@@ -732,6 +781,19 @@
           <input id="e-rate" type="text" placeholder="不限" />
         </div>
       </div>
+
+      <label class="field">
+        下载文件名
+        <span class="hint-inline" id="e-fname-status"></span>
+      </label>
+      <div class="row" style="grid-template-columns: 1fr auto;">
+        <input id="e-output-filename" type="text" placeholder="点击右侧探测自动填入,或手动输入" />
+        <button type="button" class="ghost" id="btn-e-probe" style="white-space: nowrap;">探测</button>
+      </div>
+      <label class="check" style="margin-top: 6px;">
+        <input type="checkbox" id="e-auto-filename" />
+        <span>自动检测<span class="desc">运行时优先使用上游探测结果;手动编辑会自动关闭</span></span>
+      </label>
 
       <label class="field">限速算法</label>
       <select id="e-algorithm">
@@ -1157,22 +1219,91 @@ async function doAction(path, method, okMsg) {
 
 /* ---- create modal ---- */
 
-function validateUrls(textareaEl, counterEl) {
-  const urls = textareaEl.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  if (urls.length === 0) {
+/* Structured "volumes" editor.
+ *
+ * The DOM under #{f|e}-volumes-host is rebuilt declaratively from a JS
+ * array-of-arrays (`volumes[i]` is volume i's mirror URL list). Each render
+ * is a full replace, so we never have stale event handlers — the only state
+ * we need to read back is the textareas' .value during validate/submit.
+ */
+function renderVolumesEditor(scope, volumes) {
+  const host = $(`#${scope}-volumes-host`);
+  host.innerHTML = "";
+  const list = volumes.length === 0 ? [[""]] : volumes;
+  list.forEach((mirrors, idx) => {
+    const card = document.createElement("div");
+    card.className = "vol-card";
+    card.dataset.volumeIdx = String(idx);
+
+    const head = document.createElement("div");
+    head.className = "vol-card-head";
+    const title = document.createElement("span");
+    title.textContent = list.length > 1 ? `卷 ${idx + 1}` : "唯一卷";
+    const stats = document.createElement("span");
+    stats.className = "vol-stats";
+    head.appendChild(title);
+    head.appendChild(stats);
+
+    if (list.length > 1) {
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "ghost";
+      rm.textContent = "✕ 删除";
+      rm.addEventListener("click", () => {
+        const vols = readVolumes(scope);
+        vols.splice(idx, 1);
+        renderVolumesEditor(scope, vols);
+        scope === "f" ? revalidateCreate() : revalidateEdit();
+      });
+      head.appendChild(rm);
+    }
+    card.appendChild(head);
+
+    const ta = document.createElement("textarea");
+    ta.placeholder =
+      "本卷的镜像 URL,每行一个\nhttps://cdn-a.com/movie.part01.mp4\nhttps://cdn-b.com/movie.part01.mp4";
+    ta.value = mirrors.join("\n");
+    ta.addEventListener("input", scope === "f" ? revalidateCreate : revalidateEdit);
+    card.appendChild(ta);
+
+    host.appendChild(card);
+  });
+}
+
+function readVolumes(scope) {
+  const host = $(`#${scope}-volumes-host`);
+  return Array.from(host.querySelectorAll(".vol-card textarea")).map(ta =>
+    ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  );
+}
+
+function validateVolumes(scope, counterEl) {
+  const vols = readVolumes(scope);
+  // Drop empty volume cards before validating — an empty card from an "add"
+  // click that was never filled in shouldn't fail the form.
+  const nonEmpty = vols.filter(m => m.length > 0);
+  if (nonEmpty.length === 0) {
     counterEl.textContent = "尚未输入";
     counterEl.style.color = "";
-    return { valid: false, urls };
+    return { valid: false, volumes: nonEmpty };
   }
-  const bad = urls.filter(u => !/^https?:\/\//i.test(u));
-  if (bad.length) {
-    counterEl.textContent = `已识别 ${urls.length} 行,但有 ${bad.length} 行不是 http(s) 开头`;
+  let bad = 0;
+  let total = 0;
+  for (const v of nonEmpty) {
+    total += v.length;
+    bad += v.filter(u => !/^https?:\/\//i.test(u)).length;
+  }
+  if (bad > 0) {
+    counterEl.textContent = `共 ${nonEmpty.length} 卷 / ${total} 个 URL,但有 ${bad} 行不是 http(s)`;
     counterEl.style.color = "var(--warn)";
-    return { valid: false, urls };
+    return { valid: false, volumes: nonEmpty };
   }
-  counterEl.textContent = `已识别出 ${urls.length} 个有效下载源`;
+  counterEl.textContent =
+    nonEmpty.length === 1
+      ? `1 卷 · ${total} 个镜像`
+      : `${nonEmpty.length} 卷 · 共 ${total} 个 URL`;
   counterEl.style.color = "var(--good)";
-  return { valid: true, urls };
+  return { valid: true, volumes: nonEmpty };
 }
 
 function validateSplit(inputEl, hintEl) {
@@ -1229,7 +1360,7 @@ function validateRate(inputEl) {
 }
 
 function revalidateCreate() {
-  const u = validateUrls($("#f-urls"), $("#urls-count"));
+  const u = validateVolumes("f", $("#urls-count"));
   const s = validateSplit($("#f-split"), $("#f-split-hint"));
   const h = validateHeaders($("#f-headers"), $("#headers-status"));
   const r = validateRate($("#f-rate"));
@@ -1237,20 +1368,94 @@ function revalidateCreate() {
 }
 
 function revalidateEdit() {
-  const u = validateUrls($("#e-urls"), $("#e-urls-count"));
+  const u = validateVolumes("e", $("#e-urls-count"));
   const s = validateSplit($("#e-split"), $("#e-split-hint"));
   const h = validateHeaders($("#e-headers"), $("#e-headers-status"));
   const r = validateRate($("#e-rate"));
   $("#btn-edit-save").disabled = !(u.valid && s.valid && h.valid && r.valid);
 }
 
-["f-urls","f-split","f-headers","f-rate"].forEach(id =>
+["f-split","f-headers","f-rate"].forEach(id =>
   $("#"+id).addEventListener("input", revalidateCreate));
-["e-urls","e-split","e-headers","e-rate"].forEach(id =>
+["e-split","e-headers","e-rate"].forEach(id =>
   $("#"+id).addEventListener("input", revalidateEdit));
 
+$("#btn-f-add-volume").addEventListener("click", () => {
+  const vols = readVolumes("f");
+  vols.push([""]);
+  renderVolumesEditor("f", vols);
+  revalidateCreate();
+});
+$("#btn-e-add-volume").addEventListener("click", () => {
+  const vols = readVolumes("e");
+  vols.push([""]);
+  renderVolumesEditor("e", vols);
+  revalidateEdit();
+});
+
+/* ---- output filename + probe controls ----
+ * `auto` checkbox toggles whether the filename input is the authoritative
+ * value or a hint. When auto is on, the input is disabled and just shows
+ * what the server *would* detect (best-effort, may be empty until probe).
+ * `Probe` button runs a one-shot `/api/probe` against the current URL list
+ * and fills the input with the suggested name.
+ */
+function bindFilenameControls(scope) {
+  // scope = "f" (create) or "e" (edit)
+  const auto = $(`#${scope}-auto-filename`);
+  const input = $(`#${scope}-output-filename`);
+  const status = $(`#${scope}-fname-status`);
+  const probeBtn = $(`#btn-${scope}-probe`);
+
+  // The input is always editable. The "auto" checkbox only controls what
+  // happens at stream time (server picks live probe vs saved value); it does
+  // not gate UI editing. Any divergence from the last probe result means the
+  // user is manually overriding, so we flip auto off to reflect that.
+  input.addEventListener("input", () => {
+    const detected = (input.dataset.detected || "").trim();
+    const typed = input.value.trim();
+    if (auto.checked && typed && typed !== detected) {
+      auto.checked = false;
+    }
+  });
+
+  probeBtn.addEventListener("click", async () => {
+    const volumes = readVolumes(scope).filter(v => v.length > 0);
+    if (volumes.length === 0) {
+      toast("先填入至少一个 URL", "error");
+      return;
+    }
+    const headersEl = scope === "f" ? $("#f-headers") : $("#e-headers");
+    let parsedHeaders = {};
+    if (headersEl.value.trim()) {
+      try { parsedHeaders = JSON.parse(headersEl.value); } catch {}
+    }
+    status.textContent = "探测中…";
+    probeBtn.disabled = true;
+    try {
+      const res = await api("/api/probe", {
+        method: "POST",
+        body: JSON.stringify({ volumes, headers: parsedHeaders }),
+      });
+      const suggested = res.suggested_filename || "";
+      input.dataset.detected = suggested;
+      // Always overwrite the input with the probe result so the user can
+      // see and refine it. They asked for a probe by clicking the button.
+      input.value = suggested;
+      status.textContent = suggested
+        ? `已检测：${suggested} — 可直接编辑`
+        : "未检测到文件名,可手动填写";
+    } catch (e) {
+      status.textContent = "探测失败：" + e.message;
+    } finally {
+      probeBtn.disabled = false;
+    }
+  });
+}
+bindFilenameControls("f");
+bindFilenameControls("e");
+
 function openCreate() {
-  $("#f-urls").value = "";
   $("#f-headers").value = "";
   $("#f-name").value = "";
   $("#f-rate").value = "";
@@ -1259,9 +1464,17 @@ function openCreate() {
   $("#f-cache").checked = false;
   $("#f-persist").checked = false;
   $("#f-algorithm").value = "token_bucket";
+  renderVolumesEditor("f", []);
+  $("#f-auto-filename").checked = true;
+  $("#f-output-filename").value = "";
+  $("#f-output-filename").dataset.detected = "";
+  $("#f-fname-status").textContent = "未探测";
   revalidateCreate();
   $("#create-modal").classList.add("show");
-  setTimeout(() => $("#f-urls").focus(), 80);
+  setTimeout(() => {
+    const ta = $("#f-volumes-host textarea");
+    if (ta) ta.focus();
+  }, 80);
 }
 function closeCreate() { $("#create-modal").classList.remove("show"); }
 
@@ -1270,19 +1483,21 @@ $("#btn-create-cancel").onclick = closeCreate;
 $("#create-modal").onclick = (e) => { if (e.target.id === "create-modal") closeCreate(); };
 
 $("#btn-create").onclick = async () => {
-  const u = validateUrls($("#f-urls"), $("#urls-count"));
+  const u = validateVolumes("f", $("#urls-count"));
   const s = validateSplit($("#f-split"), $("#f-split-hint"));
   const h = validateHeaders($("#f-headers"), $("#headers-status"));
   const r = validateRate($("#f-rate"));
   if (!(u.valid && s.valid && h.valid && r.valid)) return;
   const payload = {
-    urls: u.urls,
+    volumes: u.volumes,
     max_threads: parseInt($("#f-threads").value, 10) || 8,
     max_split: s.value,
     cache: $("#f-cache").checked,
     persist: $("#f-persist").checked,
     headers: h.headers,
     name: $("#f-name").value.trim() || null,
+    output_filename: $("#f-output-filename").value.trim() || null,
+    auto_filename: $("#f-auto-filename").checked,
     rate_limit_bps: r.value || 0,
     rate_limit_algorithm: $("#f-algorithm").value,
   };
@@ -1302,7 +1517,17 @@ function openEdit(id) {
   if (!t) return;
   editingId = id;
   $("#edit-id").textContent = id;
-  $("#e-urls").value = t.config.urls.join("\n");
+  // Reconstruct volume layout from config: prefer the structured `volumes`
+  // field; fall back to the flat `urls` shape (which old configs use). The
+  // backend's `effective_volumes` does the same thing — this mirrors that.
+  let layout = Array.isArray(t.config.volumes) ? t.config.volumes.filter(v => v.length) : [];
+  if (layout.length === 0) {
+    const flat = t.config.urls || [];
+    layout = t.config.mode === "volumes"
+      ? flat.map(u => [u])
+      : flat.length ? [flat] : [];
+  }
+  renderVolumesEditor("e", layout);
   $("#e-threads").value = t.config.max_threads;
   $("#e-split").value = (fmtBytes(t.config.max_split)).replace(/ /g, '');
   $("#e-headers").value = Object.keys(t.config.headers || {}).length
@@ -1313,6 +1538,14 @@ function openEdit(id) {
   $("#e-cache").checked = !!t.config.cache;
   $("#e-persist").checked = !!t.config.persist;
   $("#e-algorithm").value = t.config.rate_limit_algorithm || "token_bucket";
+  const autoOn = t.config.auto_filename !== false;
+  $("#e-auto-filename").checked = autoOn;
+  $("#e-output-filename").value = t.config.output_filename || "";
+  $("#e-output-filename").dataset.detected = t.config.output_filename || "";
+  $("#e-output-filename").dataset.detected = t.config.output_filename || "";
+  $("#e-fname-status").textContent = t.config.output_filename
+    ? `当前：${t.config.output_filename}`
+    : "未设置";
   revalidateEdit();
   $("#edit-modal").classList.add("show");
 }
@@ -1321,17 +1554,19 @@ $("#btn-edit-cancel").onclick = closeEdit;
 $("#edit-modal").onclick = (e) => { if (e.target.id === "edit-modal") closeEdit(); };
 $("#btn-edit-save").onclick = async () => {
   if (!editingId) return;
-  const u = validateUrls($("#e-urls"), $("#e-urls-count"));
+  const u = validateVolumes("e", $("#e-urls-count"));
   const s = validateSplit($("#e-split"), $("#e-split-hint"));
   const h = validateHeaders($("#e-headers"), $("#e-headers-status"));
   const r = validateRate($("#e-rate"));
   if (!(u.valid && s.valid && h.valid && r.valid)) return;
   const payload = {
-    urls: u.urls,
+    volumes: u.volumes,
     max_threads: parseInt($("#e-threads").value, 10) || 8,
     max_split: s.value,
     headers: h.headers,
     name: $("#e-name").value.trim() || null,
+    output_filename: $("#e-output-filename").value.trim() || null,
+    auto_filename: $("#e-auto-filename").checked,
     cache: $("#e-cache").checked,
     persist: $("#e-persist").checked,
     rate_limit_bps: r.value || 0,

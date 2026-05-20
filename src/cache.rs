@@ -263,6 +263,37 @@ impl CacheStore {
         hex::encode(&hasher.finalize()[..12])
     }
 
+    /// Cache key for a structured volume layout. Volumes are hashed in order
+    /// (their sequence is part of the merged file's identity); mirrors within
+    /// a volume are hashed sorted (they're interchangeable, so reordering or
+    /// adding a synonym shouldn't trigger a re-fetch).
+    pub fn key_for_volume_layout(volumes: &[Vec<String>]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"vols-v2:");
+        for vol in volumes {
+            hasher.update(b"|");
+            let mut sorted: Vec<&str> = vol.iter().map(|s| s.as_str()).collect();
+            sorted.sort_unstable();
+            for u in &sorted {
+                hasher.update(u.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+        hex::encode(&hasher.finalize()[..12])
+    }
+
+    /// Pick the right key derivation for a task. Single-volume tasks reuse the
+    /// flat mirror-mode key (so existing caches keep working through the
+    /// schema upgrade); multi-volume tasks get the layout-aware key.
+    pub fn key_for_task(cfg: &crate::models::TaskConfig) -> String {
+        let vols = cfg.effective_volumes();
+        match vols.len() {
+            0 => Self::key_for_urls(&cfg.urls),
+            1 => Self::key_for_urls(&vols[0]),
+            _ => Self::key_for_volume_layout(&vols),
+        }
+    }
+
     fn entry_dir(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }

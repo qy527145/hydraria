@@ -7,9 +7,39 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskMode {
+    /// `urls` are interchangeable copies of the same file — load-balanced and
+    /// failed over per request.
+    #[default]
+    Mirrors,
+    /// `urls` are ordered chunks of one logical file; concatenating them in
+    /// order yields the complete file. Each URL must support byte ranges.
+    Volumes,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskConfig {
+    /// Flat de-duplicated URL list (the projection of `volumes`). Always
+    /// re-derived by `normalize()` — clients can omit this field and let the
+    /// server compute it from `volumes`.
+    #[serde(default)]
     pub urls: Vec<String>,
+    /// Structured volume layout. Each inner Vec is one volume's mirror URL
+    /// list (interchangeable copies of that part). The outer Vec is in
+    /// playback/concatenation order.
+    ///
+    /// Always normalized to non-empty when the task has any URLs:
+    /// * One volume with N mirrors → mirror-mode behavior (the single-file case).
+    /// * N volumes with M mirrors each → volume mode.
+    ///
+    /// `urls` is kept as a flat-deduped projection for search / health
+    /// tracking / counters. `volumes` is the source of truth at stream time.
+    #[serde(default)]
+    pub volumes: Vec<Vec<String>>,
+    #[serde(default)]
+    pub mode: TaskMode,
     #[serde(default = "default_threads")]
     pub max_threads: usize,
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]
@@ -20,6 +50,15 @@ pub struct TaskConfig {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Filename to emit on the proxied response's Content-Disposition. When
+    /// `auto_filename` is true this is treated as a fallback / cached probe
+    /// result; when false it's the authoritative value (None = no header).
+    #[serde(default)]
+    pub output_filename: Option<String>,
+    /// If true, overwrite the served filename with whatever the upstream
+    /// probe detects at stream time. If false, use `output_filename` verbatim.
+    #[serde(default = "default_auto_filename")]
+    pub auto_filename: bool,
     /// Per-task rate limit in bytes/sec. 0 = unlimited.
     #[serde(default, deserialize_with = "deserialize_opt_size_default_zero")]
     pub rate_limit_bps: u64,
@@ -33,6 +72,10 @@ pub struct TaskConfig {
 
 fn default_threads() -> usize {
     8
+}
+
+fn default_auto_filename() -> bool {
+    true
 }
 
 fn default_split() -> u64 {
@@ -102,12 +145,16 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TaskUpdate {
     pub urls: Option<Vec<String>>,
+    pub volumes: Option<Vec<Vec<String>>>,
+    pub mode: Option<TaskMode>,
     pub max_threads: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub max_split: Option<u64>,
     pub cache: Option<bool>,
     pub headers: Option<HashMap<String, String>>,
     pub name: Option<Option<String>>,
+    pub output_filename: Option<Option<String>>,
+    pub auto_filename: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub rate_limit_bps: Option<u64>,
     pub rate_limit_algorithm: Option<Algorithm>,
@@ -244,12 +291,60 @@ pub struct TaskEntry {
     pub last_sample: Mutex<Instant>,
 }
 
+impl TaskConfig {
+    /// Resolve the structured volume layout. Falls back from `volumes` to a
+    /// migration of the legacy `urls` shape so old persisted configs keep
+    /// working without rewriting them on disk.
+    pub fn effective_volumes(&self) -> Vec<Vec<String>> {
+        if !self.volumes.is_empty() {
+            return self
+                .volumes
+                .iter()
+                .map(|v| v.iter().filter(|u| !u.trim().is_empty()).cloned().collect())
+                .filter(|v: &Vec<String>| !v.is_empty())
+                .collect();
+        }
+        if self.urls.is_empty() {
+            return Vec::new();
+        }
+        match self.mode {
+            TaskMode::Volumes => self.urls.iter().map(|u| vec![u.clone()]).collect(),
+            TaskMode::Mirrors => vec![self.urls.clone()],
+        }
+    }
+
+    /// Flat de-duplicated URL list across every volume's mirrors, in first-
+    /// seen order. Used to derive `urls` and to size the URL-health array.
+    pub fn flat_unique_urls(volumes: &[Vec<String>]) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for vol in volumes {
+            for u in vol {
+                if seen.insert(u.clone()) {
+                    out.push(u.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Canonicalize the config so `volumes` is the source of truth and `urls`
+    /// is its flat-deduped projection. Migrates legacy shapes (only `urls`
+    /// set) and trims empty entries.
+    pub fn normalize(&mut self) {
+        let vols = self.effective_volumes();
+        self.urls = Self::flat_unique_urls(&vols);
+        self.volumes = vols;
+    }
+}
+
 impl TaskEntry {
-    pub fn new(config: TaskConfig) -> Self {
+    pub fn new(mut config: TaskConfig) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        config.normalize();
         let url_health = config
             .urls
             .iter()
@@ -287,9 +382,31 @@ impl TaskEntry {
 
     pub fn apply_update(&self, upd: TaskUpdate) -> std::result::Result<(), String> {
         let mut cfg = self.config.write();
+
+        // `urls` and `volumes` are tied — `volumes` is the source of truth
+        // and `urls` is its flattened projection. Accept either field, then
+        // normalize so they stay consistent on disk and in memory.
+        let urls_changed = upd.urls.is_some() || upd.volumes.is_some();
+        let volumes_supplied = upd.volumes.is_some();
+        if let Some(volumes) = upd.volumes {
+            cfg.volumes = volumes;
+        }
         if let Some(urls) = upd.urls {
-            if urls.is_empty() {
-                return Err("urls must not be empty".into());
+            if !volumes_supplied {
+                // Only `urls` was sent — discard the structured layout so
+                // `effective_volumes` re-derives from `urls`. Mode (or one
+                // volume) controls the migration shape.
+                cfg.volumes.clear();
+            }
+            cfg.urls = urls;
+        }
+        if let Some(m) = upd.mode {
+            cfg.mode = m;
+        }
+        if urls_changed {
+            cfg.normalize();
+            if cfg.urls.is_empty() {
+                return Err("at least one URL is required".into());
             }
             // Preserve health stats for URLs that survived the edit.
             let mut prev: HashMap<String, Arc<UrlHealthAcc>> = self
@@ -298,7 +415,8 @@ impl TaskEntry {
                 .iter()
                 .map(|h| (h.url.clone(), Arc::clone(h)))
                 .collect();
-            let new_health: Vec<Arc<UrlHealthAcc>> = urls
+            let new_health: Vec<Arc<UrlHealthAcc>> = cfg
+                .urls
                 .iter()
                 .map(|u| {
                     prev.remove(u)
@@ -306,7 +424,6 @@ impl TaskEntry {
                 })
                 .collect();
             *self.url_health.write() = new_health;
-            cfg.urls = urls;
         }
         if let Some(t) = upd.max_threads {
             if t == 0 {
@@ -328,6 +445,12 @@ impl TaskEntry {
         }
         if let Some(n) = upd.name {
             cfg.name = n;
+        }
+        if let Some(of) = upd.output_filename {
+            cfg.output_filename = of.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        if let Some(a) = upd.auto_filename {
+            cfg.auto_filename = a;
         }
         if let Some(r) = upd.rate_limit_bps {
             cfg.rate_limit_bps = r;
@@ -445,7 +568,7 @@ impl AppState {
     pub fn task_info(&self, id: &str, entry: &TaskEntry) -> TaskInfo {
         let cfg = entry.config_snapshot();
         let cache = if cfg.cache {
-            let key = crate::cache::CacheStore::key_for_urls(&cfg.urls);
+            let key = crate::cache::CacheStore::key_for_task(&cfg);
             self.cache.stats(&key)
         } else {
             None
@@ -679,12 +802,21 @@ impl AppState {
             }
             id.hash(&mut hasher);
             cfg.urls.hash(&mut hasher);
+            for vol in &cfg.volumes {
+                b"|".hash(&mut hasher);
+                for u in vol {
+                    u.hash(&mut hasher);
+                }
+            }
+            (cfg.mode as u8).hash(&mut hasher);
             cfg.max_threads.hash(&mut hasher);
             cfg.max_split.hash(&mut hasher);
             cfg.cache.hash(&mut hasher);
             cfg.rate_limit_bps.hash(&mut hasher);
             (cfg.rate_limit_algorithm as u8).hash(&mut hasher);
             cfg.name.hash(&mut hasher);
+            cfg.output_filename.hash(&mut hasher);
+            cfg.auto_filename.hash(&mut hasher);
             for (k, v) in &cfg.headers {
                 k.hash(&mut hasher);
                 v.hash(&mut hasher);

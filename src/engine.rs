@@ -10,12 +10,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// One chunk of a multi-volume task: an ordered list of mirror URLs that all
+/// serve this volume's bytes, plus its position in the merged stream. A
+/// single-volume task has exactly one `VolumeMeta` covering the whole file.
+#[derive(Debug, Clone)]
+pub struct VolumeMeta {
+    pub urls: Vec<String>,
+    pub offset: u64,
+    pub size: u64,
+}
+
 pub struct UpstreamProbe {
     pub total_size: Option<u64>,
     pub accepts_ranges: bool,
     pub content_type: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    pub filename: Option<String>,
+    /// In `TaskMode::Volumes`, the per-volume layout. `None` for mirror tasks.
+    pub volumes: Option<Vec<VolumeMeta>>,
 }
 
 pub struct Engine {
@@ -24,6 +37,18 @@ pub struct Engine {
     rr_counter: AtomicUsize,
     cache: Option<Arc<CacheEntry>>,
     health: Vec<Arc<UrlHealthAcc>>,
+    volumes: Option<Arc<Vec<VolumeMeta>>>,
+}
+
+/// Where and what bytes a fetch attempt should request from a concrete URL.
+struct FetchTarget {
+    url: String,
+    /// HTTP `Range` request bounds, in the upstream URL's own coordinate space.
+    local_start: u64,
+    local_end: u64,
+    /// Same start expressed in the merged-stream coordinate space — used for
+    /// cache offsets and chunk-window slicing as bytes stream in.
+    merged_start: u64,
 }
 
 impl Engine {
@@ -43,6 +68,7 @@ impl Engine {
             rr_counter: AtomicUsize::new(0),
             cache: None,
             health: Vec::new(),
+            volumes: None,
         })
     }
 
@@ -53,6 +79,11 @@ impl Engine {
 
     pub fn with_health(mut self, health: Vec<Arc<UrlHealthAcc>>) -> Self {
         self.health = health;
+        self
+    }
+
+    pub fn with_volumes(mut self, volumes: Option<Vec<VolumeMeta>>) -> Self {
+        self.volumes = volumes.map(Arc::new);
         self
     }
 
@@ -124,8 +155,221 @@ impl Engine {
         Ok(&self.config.urls[idx % self.config.urls.len()])
     }
 
+    /// True when the task spans more than one volume — the case where a 200
+    /// OK to a ranged request is unsafe (we can't stitch volumes if the first
+    /// one's mirror dumps an entire file). Single-volume tasks (the historic
+    /// mirror case) tolerate 200 OK by slicing locally.
+    fn is_multi_volume(&self) -> bool {
+        self.volumes.as_ref().map(|v| v.len() > 1).unwrap_or(false)
+    }
+
+    /// Volume containing `merged_offset`. With the unified volume layout this
+    /// always returns `Some(...)` once probing has populated `self.volumes`.
+    fn volume_at(&self, merged_offset: u64) -> Option<&VolumeMeta> {
+        self.volumes.as_ref().and_then(|vols| {
+            vols.iter()
+                .find(|v| merged_offset >= v.offset && merged_offset < v.offset + v.size)
+        })
+    }
+
+    /// Retry budget for a single chunk fetch: rotate through the relevant
+    /// volume's mirrors twice. `locator` is the chunk's start offset, used to
+    /// pick the volume in multi-part tasks; in single-volume tasks every
+    /// chunk lands in the one volume so `locator` doesn't matter.
+    fn fetch_attempts(&self, locator: u64) -> usize {
+        let n = self
+            .volume_at(locator)
+            .map(|v| v.urls.len())
+            .unwrap_or_else(|| self.config.urls.len());
+        n.max(1) * 2
+    }
+
+    /// Translate a merged-stream `[span_start, span_end]` plus an in-volume
+    /// `locator` offset into the concrete URL and local byte range to fetch.
+    /// Block-aligned cache spans may legitimately overshoot a volume boundary
+    /// — clip to the containing volume so each request stays inside one URL.
+    /// Returns `Ok(None)` when the clip results in an empty range (caller can
+    /// treat as zero-byte success).
+    fn resolve_target(
+        &self,
+        idx: usize,
+        attempt: usize,
+        locator: u64,
+        span_start: u64,
+        span_end: u64,
+    ) -> Result<Option<FetchTarget>> {
+        if let Some(vols) = self.volumes.as_ref() {
+            let v = self.volume_at(locator).ok_or(ProxyError::NoUpstream)?;
+            let v_end = v.offset + v.size - 1;
+            let clipped_start = span_start.max(v.offset);
+            let clipped_end = span_end.min(v_end);
+            if clipped_end < clipped_start {
+                return Ok(None);
+            }
+            // Rotate through *this volume's* mirror list. `idx` (chunk index)
+            // and `attempt` (retry counter) together produce a deterministic
+            // but well-spread mirror choice.
+            if v.urls.is_empty() {
+                return Err(ProxyError::NoUpstream);
+            }
+            let pick = (idx + attempt) % v.urls.len();
+            let url = v.urls[pick].clone();
+            let _ = vols; // borrow held only for `v`
+            Ok(Some(FetchTarget {
+                url,
+                local_start: clipped_start - v.offset,
+                local_end: clipped_end - v.offset,
+                merged_start: clipped_start,
+            }))
+        } else {
+            // No probe yet — fall back to the flat config URL list.
+            let url = self.pick_url_for(idx + attempt)?.to_string();
+            Ok(Some(FetchTarget {
+                url,
+                local_start: span_start,
+                local_end: span_end,
+                merged_start: span_start,
+            }))
+        }
+    }
+
     pub async fn probe(&self) -> Result<UpstreamProbe> {
-        let url = self.pick_url()?;
+        let layout = self.config.effective_volumes();
+        if layout.is_empty() {
+            return Err(ProxyError::NoUpstream);
+        }
+        // Single-volume tasks (the common "mirror copies of one file" case)
+        // and multi-volume tasks share the same probing path: each volume
+        // tries its mirrors until one answers, and we stitch the results.
+        // `rr_counter` is bumped so downstream chunk fetchers don't always
+        // start their rotation at the same mirror as the probe did.
+        self.rr_counter.fetch_add(1, Ordering::Relaxed);
+        self.probe_layout(&layout).await
+    }
+
+    /// Probe every volume in order. Each volume's mirrors are tried in turn
+    /// until one returns a usable answer. For single-volume tasks this
+    /// degenerates to "try each mirror until one works" — the historical
+    /// mirror-mode behavior.
+    async fn probe_layout(&self, layout: &[Vec<String>]) -> Result<UpstreamProbe> {
+        let multi_volume = layout.len() > 1;
+        let mut volumes: Vec<VolumeMeta> = Vec::with_capacity(layout.len());
+        let mut content_type: Option<String> = None;
+        let mut filename: Option<String> = None;
+        let mut etag_first: Option<String> = None;
+        let mut last_modified_first: Option<String> = None;
+        let mut composite_etag_parts: Vec<String> = Vec::with_capacity(layout.len());
+        let mut composite_lm_parts: Vec<String> = Vec::with_capacity(layout.len());
+        let mut accepts_ranges_all = true;
+        let mut total_size: u64 = 0;
+        let mut size_known_all = true;
+        let mut offset: u64 = 0;
+
+        for (vi, mirrors) in layout.iter().enumerate() {
+            // Try mirrors in order until one yields a probe. The ordering is
+            // the user-supplied one — they decide which mirror is preferred.
+            let n = mirrors.len();
+            let start = self.rr_counter.load(Ordering::Relaxed);
+            let mut last_err: Option<ProxyError> = None;
+            let mut probe_result: Option<(String, UpstreamProbe)> = None;
+            for off in 0..n {
+                let url = &mirrors[(start + off) % n];
+                match self.probe_one(url).await {
+                    Ok(p) => {
+                        probe_result = Some((url.clone(), p));
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let (working_url, p) = match probe_result {
+                Some(v) => v,
+                None => {
+                    let base = last_err.unwrap_or(ProxyError::NoUpstream);
+                    return Err(ProxyError::Internal(format!(
+                        "volume {} probe failed across all {} mirror(s): {}",
+                        vi + 1,
+                        n,
+                        base
+                    )));
+                }
+            };
+
+            if multi_volume && !p.accepts_ranges {
+                return Err(ProxyError::Internal(format!(
+                    "volume {} ({}) does not support byte ranges; multi-volume tasks require Range support on every part",
+                    vi + 1,
+                    working_url
+                )));
+            }
+            if !p.accepts_ranges {
+                accepts_ranges_all = false;
+            }
+
+            let size_opt = p.total_size;
+            if multi_volume && size_opt.is_none() {
+                return Err(ProxyError::Internal(format!(
+                    "volume {} ({}) did not report a Content-Length; cannot stitch volumes without known sizes",
+                    vi + 1,
+                    working_url
+                )));
+            }
+            let size = size_opt.unwrap_or(0);
+            if size_opt.is_none() {
+                size_known_all = false;
+            }
+
+            if vi == 0 {
+                content_type = p.content_type.clone();
+                filename = p.filename.clone();
+                etag_first = p.etag.clone();
+                last_modified_first = p.last_modified.clone();
+            }
+            composite_etag_parts.push(p.etag.clone().unwrap_or_default());
+            composite_lm_parts.push(p.last_modified.clone().unwrap_or_default());
+
+            volumes.push(VolumeMeta {
+                urls: mirrors.clone(),
+                offset,
+                size,
+            });
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| ProxyError::Internal("volume sizes overflow u64".into()))?;
+            offset = total_size;
+        }
+
+        // Single-volume tasks keep the upstream's identity headers verbatim
+        // (so ETag/If-None-Match flows continue to work). Multi-volume tasks
+        // collapse per-part identity into a composite so any change in any
+        // part flips the cache key.
+        let etag = if multi_volume {
+            let any = composite_etag_parts.iter().any(|s| !s.is_empty());
+            any.then(|| format!("\"vols-{}\"", short_digest(&composite_etag_parts)))
+        } else {
+            etag_first
+        };
+        let last_modified = if multi_volume {
+            let any = composite_lm_parts.iter().any(|s| !s.is_empty());
+            any.then(|| last_modified_first.clone().unwrap_or_default())
+                .filter(|s| !s.is_empty())
+        } else {
+            last_modified_first
+        };
+
+        let total = if size_known_all { Some(total_size) } else { None };
+        Ok(UpstreamProbe {
+            total_size: total,
+            accepts_ranges: accepts_ranges_all,
+            content_type,
+            etag,
+            last_modified,
+            filename,
+            volumes: Some(volumes),
+        })
+    }
+
+    async fn probe_one(&self, url: &str) -> Result<UpstreamProbe> {
         let base_headers = self.build_headers(None)?;
 
         // Step 1: HEAD for cheap metadata (content-type, content-length, etag, ...).
@@ -150,6 +394,7 @@ impl Engine {
         let mut content_type: Option<String> = None;
         let mut etag: Option<String> = None;
         let mut last_modified: Option<String> = None;
+        let mut filename: Option<String> = None;
         let mut head_accept_ranges = false;
 
         if let Some(resp) = &head {
@@ -175,6 +420,7 @@ impl Engine {
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
+            filename = extract_filename(h);
         }
 
         // Step 2: actively probe range support with a 1-byte ranged GET.
@@ -221,6 +467,9 @@ impl Engine {
                     .and_then(|v| v.to_str().ok())
                     .map(String::from);
             }
+            if filename.is_none() {
+                filename = extract_filename(h);
+            }
             if total_size.is_none() && status == StatusCode::OK {
                 // Server ignored our Range and sent the whole file: CL is the total.
                 total_size = h
@@ -234,12 +483,18 @@ impl Engine {
             return Err(ProxyError::NoUpstream);
         }
 
+        if filename.is_none() {
+            filename = filename_from_url(url);
+        }
+
         Ok(UpstreamProbe {
             total_size,
             accepts_ranges,
             content_type,
             etag,
             last_modified,
+            filename,
+            volumes: None,
         })
     }
 
@@ -276,14 +531,10 @@ impl Engine {
         let split = self.config.max_split.max(64 * 1024);
         let max_threads = self.config.max_threads.max(1);
 
-        // Build chunk plan
-        let mut plan: Vec<(u64, u64)> = Vec::new();
-        let mut cur = start;
-        while cur <= end {
-            let stop = (cur + split - 1).min(end);
-            plan.push((cur, stop));
-            cur = stop + 1;
-        }
+        // Build chunk plan. In volume mode every chunk must live inside one
+        // volume so the fetcher only ever talks to a single URL — split first
+        // along volume boundaries, then along `max_split`.
+        let plan = plan_chunks(start, end, split, self.volumes.as_deref().map(|v| v.as_slice()));
         let total_chunks = plan.len();
 
         // Per-chunk channels so fetchers can run concurrently while the
@@ -449,17 +700,24 @@ impl Engine {
         cache: Option<&CacheEntry>,
         tx: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<()> {
-        let attempts = self.config.urls.len().max(1) * 2;
+        let attempts = self.fetch_attempts(chunk_start);
         let mut last_err: Option<ProxyError> = None;
         for attempt in 0..attempts {
-            let url = self.pick_url_for(idx + attempt)?.to_string();
-            let headers = self.build_headers(Some((span_start, span_end)))?;
+            // `chunk_start` is the locator — the chunk planner guarantees it
+            // lives inside a single volume, so it pins which volume to query.
+            let target = match self.resolve_target(idx, attempt, chunk_start, span_start, span_end)? {
+                Some(t) => t,
+                // Clipped to zero bytes (block-aligned span fell entirely
+                // outside the chunk's volume). Nothing to fetch.
+                None => return Ok(()),
+            };
+            let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             let req_start = Instant::now();
-            let resp = match self.client.get(&url).headers(headers).send().await {
+            let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
-                    self.record_failure(&url, None, &msg);
+                    self.record_failure(&target.url, None, &msg);
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
@@ -473,16 +731,19 @@ impl Engine {
                 // block-aligned cache (offsets would be off). Retry on next
                 // URL; if none oblige, surface the error.
                 self.record_failure(
-                    &url,
+                    &target.url,
                     Some(status_code),
                     &format!("expected 206, got {status_code}"),
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
             }
-            self.record_success(&url, status_code, latency_ms);
+            self.record_success(&target.url, status_code, latency_ms);
 
-            let mut cursor = span_start;
+            // Cursor tracks merged-space offsets so cache writes and the
+            // [chunk_start, chunk_end] slice are always correct, even when
+            // the request was issued in a volume's local coordinates.
+            let mut cursor = target.merged_start;
             let mut stream = resp.bytes_stream();
             let mut had_err = false;
             while let Some(item) = stream.next().await {
@@ -505,7 +766,7 @@ impl Engine {
                             }
                         }
 
-                        self.record_bytes(&url, b.len() as u64);
+                        self.record_bytes(&target.url, b.len() as u64);
 
                         if piece_end < chunk_start || piece_start > chunk_end {
                             continue;
@@ -524,7 +785,7 @@ impl Engine {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        self.record_failure(&url, Some(status_code), &msg);
+                        self.record_failure(&target.url, Some(status_code), &msg);
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
@@ -546,16 +807,22 @@ impl Engine {
         tx: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<()> {
         let mut last_err: Option<ProxyError> = None;
-        let attempts = self.config.urls.len().max(1) * 2;
+        let attempts = self.fetch_attempts(start);
         for attempt in 0..attempts {
-            let url = self.pick_url_for(idx + attempt)?.to_string();
-            let headers = self.build_headers(Some((start, end)))?;
+            // Chunk planner guarantees [start, end] lives in one volume in
+            // volume mode, so `start` pins the URL and `[start, end]` maps
+            // cleanly to its local range.
+            let target = match self.resolve_target(idx, attempt, start, start, end)? {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             let req_start = Instant::now();
-            let resp = match self.client.get(&url).headers(headers).send().await {
+            let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
-                    self.record_failure(&url, None, &msg);
+                    self.record_failure(&target.url, None, &msg);
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
                 }
@@ -564,17 +831,36 @@ impl Engine {
             let status_code = resp.status().as_u16();
             let status = resp.status();
             if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
-                self.record_failure(&url, Some(status_code), &format!("status {status_code}"));
+                self.record_failure(
+                    &target.url,
+                    Some(status_code),
+                    &format!("status {status_code}"),
+                );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
             }
-            self.record_success(&url, status_code, latency_ms);
+            // Multi-volume tasks require Range support per the probe
+            // contract; a 200 here means the origin lied. Treat as failure
+            // and retry. Single-volume tasks tolerate it (slice locally).
+            if status == StatusCode::OK && self.is_multi_volume() {
+                self.record_failure(
+                    &target.url,
+                    Some(status_code),
+                    "volume returned 200 OK to a ranged request",
+                );
+                last_err = Some(ProxyError::BadStatus(status.as_u16()));
+                continue;
+            }
+            self.record_success(&target.url, status_code, latency_ms);
 
             // If server ignored Range and returned 200 OK, we got the whole
-            // file. Slice the [start, end] window out as we read, so the
-            // serializer still gets exactly the bytes for this chunk.
+            // file. Slice the [local_start, local_end] window out as we read,
+            // so the serializer still gets exactly the bytes for this chunk.
+            // (Mirror mode only — guarded above for volumes.)
             let needs_slice = status == StatusCode::OK;
-            let chunk_len = end - start + 1;
+            let local_start = target.local_start;
+            let local_end = target.local_end;
+            let chunk_len = local_end - local_start + 1;
             let mut cursor: u64 = 0;
             let mut emitted: u64 = 0;
 
@@ -587,14 +873,14 @@ impl Engine {
                             let b_start = cursor;
                             let b_end = cursor + b.len() as u64;
                             cursor = b_end;
-                            if b_end <= start || b_start > end {
-                                if b_start > end {
+                            if b_end <= local_start || b_start > local_end {
+                                if b_start > local_end {
                                     break;
                                 }
                                 continue;
                             }
-                            let lo = start.saturating_sub(b_start) as usize;
-                            let hi = (end + 1 - b_start).min(b.len() as u64) as usize;
+                            let lo = local_start.saturating_sub(b_start) as usize;
+                            let hi = (local_end + 1 - b_start).min(b.len() as u64) as usize;
                             b.slice(lo..hi)
                         } else {
                             b
@@ -602,7 +888,7 @@ impl Engine {
                         if to_send.is_empty() {
                             continue;
                         }
-                        self.record_bytes(&url, to_send.len() as u64);
+                        self.record_bytes(&target.url, to_send.len() as u64);
                         emitted += to_send.len() as u64;
                         if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
@@ -613,7 +899,7 @@ impl Engine {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        self.record_failure(&url, Some(status_code), &msg);
+                        self.record_failure(&target.url, Some(status_code), &msg);
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
@@ -669,5 +955,486 @@ pub fn parse_range_header(value: &str, total: Option<u64>) -> Result<(u64, Optio
             return Err(ProxyError::InvalidRange(value.into()));
         }
         Ok((start, Some(end)))
+    }
+}
+
+/// Extract a clean filename from a response's Content-Disposition header.
+///
+/// Handles both RFC 6266 `filename="..."` and RFC 5987 `filename*=UTF-8''...`
+/// forms. Falls back through a few common encoding mistakes (servers that
+/// stuff UTF-8 bytes into a header technically scoped to ISO-8859-1, etc.).
+fn extract_filename(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let v = headers.get(reqwest::header::CONTENT_DISPOSITION)?;
+    let bytes = v.as_bytes();
+    // `to_str()` rejects non-ASCII even though many real servers send UTF-8
+    // bytes in this header. Take the raw bytes and try UTF-8, fall back to
+    // latin-1 (byte == codepoint) so we never lose the value.
+    let raw = match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    };
+    parse_content_disposition_filename(&raw)
+}
+
+fn parse_content_disposition_filename(value: &str) -> Option<String> {
+    let mut filename_star: Option<String> = None;
+    let mut filename_plain: Option<String> = None;
+
+    for part in value.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            let rest = rest.trim().trim_matches('"');
+            let (charset, encoded) = match rest.split_once("''") {
+                Some((cl, enc)) => (
+                    cl.split('\'').next().unwrap_or("").to_ascii_uppercase(),
+                    enc,
+                ),
+                None => (String::new(), rest),
+            };
+            let decoded = percent_decode(encoded);
+            let s = if charset == "ISO-8859-1" {
+                decoded.iter().map(|&b| b as char).collect::<String>()
+            } else {
+                String::from_utf8(decoded.clone())
+                    .unwrap_or_else(|_| decoded.iter().map(|&b| b as char).collect())
+            };
+            if !s.is_empty() {
+                filename_star = Some(s);
+            }
+        } else if let Some(rest) = part.strip_prefix("filename=") {
+            let v = rest.trim().trim_matches('"');
+            if v.is_empty() {
+                continue;
+            }
+            // Some servers send UTF-8 bytes that arrived in this string via a
+            // latin-1 round-trip; try to recover by treating chars as bytes.
+            let latin1_bytes: Vec<u8> = v.chars().map(|c| c as u8).collect();
+            let recovered = String::from_utf8(latin1_bytes).ok();
+            filename_plain = recovered.or_else(|| Some(v.to_string()));
+        }
+    }
+
+    filename_star
+        .or(filename_plain)
+        .map(sanitize_filename)
+        .filter(|s| !s.is_empty())
+}
+
+/// Derive a filename from the URL's last path segment as a final fallback.
+fn filename_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next()?.split('#').next()?;
+    let last = path.rsplit('/').next()?;
+    if last.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode(last);
+    let s = String::from_utf8(decoded).ok()?;
+    let s = sanitize_filename(s);
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Public entry point: given a volume task's URL list, derive a sensible
+/// merged filename. Strategy:
+///   1. Extract each volume's filename (last path segment, percent-decoded).
+///   2. Take the longest common *byte* prefix.
+///   3. Trim trailing junk (dots, separators, partial " part" / " 卷" words).
+///   4. If trimming wipes everything, fall back to the first volume's name.
+pub fn suggest_volume_filename(urls: &[String]) -> Option<String> {
+    let names: Vec<String> = urls.iter().filter_map(|u| filename_from_url(u)).collect();
+    if names.is_empty() {
+        return None;
+    }
+    if names.len() == 1 {
+        return Some(names.into_iter().next().unwrap());
+    }
+    let prefix = longest_common_prefix(&names);
+    let trimmed = trim_filename_tail(&prefix);
+    if trimmed.is_empty() {
+        // Common prefix was all junk — better to surface the first filename
+        // than nothing.
+        names.into_iter().next()
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Longest shared leading substring of a slice of strings, sliced on UTF-8
+/// boundaries so the result is always a valid string.
+fn longest_common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let mut prefix = strings[0].as_str();
+    for s in &strings[1..] {
+        let mut end = 0;
+        for (a, b) in prefix.char_indices().zip(s.chars()) {
+            if a.1 != b {
+                break;
+            }
+            // `a.0 + a.1.len_utf8()` is the byte index just past this char.
+            end = a.0 + a.1.len_utf8();
+        }
+        prefix = &prefix[..end];
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.to_string()
+}
+
+/// Strip trailing characters that are almost certainly part of the per-volume
+/// suffix that the LCP cut off mid-word: dots, dashes, spaces, partial digit
+/// runs, and the trailing word "part" / "vol" / "卷" if it's clearly dangling.
+fn trim_filename_tail(s: &str) -> String {
+    let mut out = s.trim_end_matches(|c: char| {
+        c.is_ascii_digit()
+            || c == '.'
+            || c == '-'
+            || c == '_'
+            || c == ' '
+            || c == '('
+            || c == '['
+    });
+    // Strip a trailing "part" / "vol" / "卷" / "第" word so the suggestion
+    // doesn't end in "movie.part" or "movie 第".
+    for token in ["part", "Part", "PART", "vol", "Vol", "VOL", "卷", "第"] {
+        if let Some(stripped) = out.strip_suffix(token) {
+            out = stripped;
+            break;
+        }
+    }
+    out.trim_end_matches(|c: char| {
+        c == '.' || c == '-' || c == '_' || c == ' ' || c == '(' || c == '['
+    })
+    .to_string()
+}
+
+fn sanitize_filename(s: String) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    cleaned.trim().to_string()
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Short hex digest used to fold a list of per-volume identity strings into
+/// a single composite ETag-like value (so the cache invalidates if any part
+/// changes underneath us).
+fn short_digest(parts: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update(b"\n");
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
+/// Build the per-chunk fetch plan for a merged range. In volume mode, every
+/// chunk is clipped to live in exactly one volume (so a single HTTP request
+/// can serve it); within each volume, chunks are further capped to `split`
+/// bytes. In mirror mode (volumes == None), the merged range is just split
+/// by `split` directly.
+fn plan_chunks(
+    start: u64,
+    end: u64,
+    split: u64,
+    volumes: Option<&[VolumeMeta]>,
+) -> Vec<(u64, u64)> {
+    let split = split.max(1);
+    let mut plan: Vec<(u64, u64)> = Vec::new();
+    match volumes {
+        Some(vols) => {
+            for v in vols {
+                if v.size == 0 {
+                    continue;
+                }
+                let v_end = v.offset + v.size - 1;
+                if v_end < start || v.offset > end {
+                    continue;
+                }
+                let clip_start = v.offset.max(start);
+                let clip_end = v_end.min(end);
+                let mut cur = clip_start;
+                while cur <= clip_end {
+                    let stop = (cur + split - 1).min(clip_end);
+                    plan.push((cur, stop));
+                    cur = stop + 1;
+                }
+            }
+        }
+        None => {
+            let mut cur = start;
+            while cur <= end {
+                let stop = (cur + split - 1).min(end);
+                plan.push((cur, stop));
+                cur = stop + 1;
+            }
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_plain_filename() {
+        let s = parse_content_disposition_filename("attachment; filename=\"hello.bin\"");
+        assert_eq!(s.as_deref(), Some("hello.bin"));
+    }
+
+    #[test]
+    fn parses_rfc5987_utf8_filename() {
+        let s = parse_content_disposition_filename(
+            "attachment; filename=\"file.bin\"; filename*=UTF-8''%E4%B8%AD%E6%96%87.mp4",
+        );
+        assert_eq!(s.as_deref(), Some("中文.mp4"));
+    }
+
+    #[test]
+    fn rfc5987_overrides_plain() {
+        let s = parse_content_disposition_filename(
+            "attachment; filename=\"ascii.bin\"; filename*=UTF-8''real%2Ename.bin",
+        );
+        assert_eq!(s.as_deref(), Some("real.name.bin"));
+    }
+
+    #[test]
+    fn falls_back_to_url_path() {
+        assert_eq!(
+            filename_from_url("https://cdn.example.com/path/to/movie.mp4?token=abc"),
+            Some("movie.mp4".to_string())
+        );
+        assert_eq!(
+            filename_from_url("https://cdn.example.com/%E4%B8%AD%E6%96%87.mp4"),
+            Some("中文.mp4".to_string())
+        );
+        assert_eq!(filename_from_url("https://cdn.example.com/"), None);
+    }
+
+    #[test]
+    fn sanitize_strips_path_separators() {
+        assert_eq!(
+            sanitize_filename("../etc/passwd".to_string()),
+            "..etcpasswd"
+        );
+    }
+
+    fn vol(url: &str, offset: u64, size: u64) -> VolumeMeta {
+        VolumeMeta {
+            urls: vec![url.to_string()],
+            offset,
+            size,
+        }
+    }
+
+    #[test]
+    fn plan_mirror_mode_splits_by_size() {
+        let plan = plan_chunks(0, 99, 30, None);
+        assert_eq!(
+            plan,
+            vec![(0, 29), (30, 59), (60, 89), (90, 99)]
+        );
+    }
+
+    #[test]
+    fn plan_volume_mode_breaks_at_boundaries() {
+        // Two volumes: [0..100), [100..250). split=80 forces a sub-chunk split
+        // inside each volume *and* a boundary split between them, so the same
+        // chunk never spans two URLs.
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
+        let plan = plan_chunks(0, 249, 80, Some(&vols));
+        assert_eq!(
+            plan,
+            vec![
+                (0, 79),
+                (80, 99),
+                (100, 179),
+                (180, 249),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_volume_mode_partial_range_inside_one_volume() {
+        // Range [120, 180] is entirely inside the second volume [100..250).
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
+        let plan = plan_chunks(120, 180, 200, Some(&vols));
+        assert_eq!(plan, vec![(120, 180)]);
+    }
+
+    #[test]
+    fn plan_volume_mode_range_spans_boundary() {
+        // Range [80, 160] crosses the boundary at 100.
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
+        let plan = plan_chunks(80, 160, 200, Some(&vols));
+        assert_eq!(plan, vec![(80, 99), (100, 160)]);
+    }
+
+    #[test]
+    fn plan_volume_mode_skips_empty_volumes() {
+        let vols = vec![vol("a", 0, 50), vol("empty", 50, 0), vol("c", 50, 50)];
+        let plan = plan_chunks(0, 99, 200, Some(&vols));
+        assert_eq!(plan, vec![(0, 49), (50, 99)]);
+    }
+
+    #[test]
+    fn suggest_filename_lcp_trims_part_suffix() {
+        let urls = vec![
+            "https://cdn.example.com/movie.part01.mp4".to_string(),
+            "https://cdn.example.com/movie.part02.mp4".to_string(),
+            "https://cdn.example.com/movie.part03.mp4".to_string(),
+        ];
+        // LCP is "movie.part0" → trim digits → "movie.part" → strip "part" →
+        // "movie." → trim dot → "movie".
+        assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("movie"));
+    }
+
+    #[test]
+    fn suggest_filename_lcp_handles_zip_style() {
+        let urls = vec![
+            "https://cdn.example.com/big.zip.001".to_string(),
+            "https://cdn.example.com/big.zip.002".to_string(),
+        ];
+        // LCP "big.zip.00" → trim digits + dot → "big.zip".
+        assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("big.zip"));
+    }
+
+    #[test]
+    fn suggest_filename_single_url_returns_as_is() {
+        let urls = vec!["https://cdn.example.com/movie.mp4".to_string()];
+        assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("movie.mp4"));
+    }
+
+    #[test]
+    fn suggest_filename_no_common_prefix_falls_back() {
+        let urls = vec![
+            "https://cdn.example.com/alpha.bin".to_string(),
+            "https://cdn.example.com/beta.bin".to_string(),
+        ];
+        // No useful common prefix → fall back to first.
+        assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("alpha.bin"));
+    }
+
+    #[test]
+    fn suggest_filename_handles_utf8_safely() {
+        let urls = vec![
+            "https://cdn.example.com/%E7%94%B5%E5%BD%B1.part1.mp4".to_string(),
+            "https://cdn.example.com/%E7%94%B5%E5%BD%B1.part2.mp4".to_string(),
+        ];
+        // Should not panic on multibyte boundary slicing.
+        assert_eq!(suggest_volume_filename(&urls).as_deref(), Some("电影"));
+    }
+
+    #[test]
+    fn effective_volumes_prefers_explicit_layout() {
+        use crate::models::TaskConfig;
+        let cfg = TaskConfig {
+            urls: vec!["legacy".into()],
+            volumes: vec![
+                vec!["a1".into(), "a2".into()],
+                vec!["b1".into()],
+            ],
+            mode: Default::default(),
+            max_threads: 8,
+            max_split: 5 * 1024 * 1024,
+            cache: false,
+            headers: Default::default(),
+            name: None,
+            output_filename: None,
+            auto_filename: true,
+            rate_limit_bps: 0,
+            rate_limit_algorithm: Default::default(),
+            persist: false,
+        };
+        assert_eq!(
+            cfg.effective_volumes(),
+            vec![vec!["a1".to_string(), "a2".into()], vec!["b1".into()]],
+        );
+    }
+
+    #[test]
+    fn effective_volumes_legacy_mirrors_collapses_to_one_volume() {
+        use crate::models::{TaskConfig, TaskMode};
+        let cfg = TaskConfig {
+            urls: vec!["m1".into(), "m2".into(), "m3".into()],
+            volumes: Vec::new(),
+            mode: TaskMode::Mirrors,
+            max_threads: 8,
+            max_split: 5 * 1024 * 1024,
+            cache: false,
+            headers: Default::default(),
+            name: None,
+            output_filename: None,
+            auto_filename: true,
+            rate_limit_bps: 0,
+            rate_limit_algorithm: Default::default(),
+            persist: false,
+        };
+        // Old mirror config → one volume holding every mirror.
+        assert_eq!(
+            cfg.effective_volumes(),
+            vec![vec!["m1".to_string(), "m2".into(), "m3".into()]],
+        );
+    }
+
+    #[test]
+    fn effective_volumes_legacy_volumes_one_mirror_each() {
+        use crate::models::{TaskConfig, TaskMode};
+        let cfg = TaskConfig {
+            urls: vec!["v1".into(), "v2".into()],
+            volumes: Vec::new(),
+            mode: TaskMode::Volumes,
+            max_threads: 8,
+            max_split: 5 * 1024 * 1024,
+            cache: false,
+            headers: Default::default(),
+            name: None,
+            output_filename: None,
+            auto_filename: true,
+            rate_limit_bps: 0,
+            rate_limit_algorithm: Default::default(),
+            persist: false,
+        };
+        // Old volume config → one volume per URL.
+        assert_eq!(
+            cfg.effective_volumes(),
+            vec![vec!["v1".to_string()], vec!["v2".into()]],
+        );
+    }
+
+    #[test]
+    fn flat_unique_urls_dedupes_preserving_order() {
+        use crate::models::TaskConfig;
+        let layout = vec![
+            vec!["a".to_string(), "b".into()],
+            vec!["b".to_string(), "c".into()],
+        ];
+        assert_eq!(
+            TaskConfig::flat_unique_urls(&layout),
+            vec!["a".to_string(), "b".into(), "c".into()],
+        );
     }
 }
