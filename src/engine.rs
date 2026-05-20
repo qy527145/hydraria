@@ -190,6 +190,11 @@ impl Engine {
     /// — clip to the containing volume so each request stays inside one URL.
     /// Returns `Ok(None)` when the clip results in an empty range (caller can
     /// treat as zero-byte success).
+    ///
+    /// Mirror selection: on first attempt (attempt == 0) we pick the
+    /// healthiest mirror by weighted score (current throughput, error count);
+    /// on retries (attempt > 0) we deterministically rotate so a bad pick on
+    /// attempt 0 doesn't trap us in the same URL forever.
     fn resolve_target(
         &self,
         idx: usize,
@@ -206,13 +211,18 @@ impl Engine {
             if clipped_end < clipped_start {
                 return Ok(None);
             }
-            // Rotate through *this volume's* mirror list. `idx` (chunk index)
-            // and `attempt` (retry counter) together produce a deterministic
-            // but well-spread mirror choice.
             if v.urls.is_empty() {
                 return Err(ProxyError::NoUpstream);
             }
-            let pick = (idx + attempt) % v.urls.len();
+            // Per-mirror weighted picking on first attempt: prefer mirrors
+            // with higher recent throughput and fewer failures. Retries
+            // (attempt > 0) fall back to round-robin so we don't loop on the
+            // same bad mirror.
+            let pick = if attempt == 0 && v.urls.len() > 1 {
+                self.pick_mirror_weighted(&v.urls, idx)
+            } else {
+                (idx + attempt) % v.urls.len()
+            };
             let url = v.urls[pick].clone();
             let _ = vols; // borrow held only for `v`
             Ok(Some(FetchTarget {
@@ -231,6 +241,48 @@ impl Engine {
                 merged_start: span_start,
             }))
         }
+    }
+
+    /// Score-based mirror picker for the first attempt. Weight rises with
+    /// recent throughput and falls with cumulative failures. Returns an
+    /// index into `mirrors`.
+    fn pick_mirror_weighted(&self, mirrors: &[String], idx: usize) -> usize {
+        let weights: Vec<u64> = mirrors
+            .iter()
+            .map(|u| {
+                let h = self.health.iter().find(|h| h.url.as_str() == u.as_str());
+                match h {
+                    Some(h) => mirror_weight(
+                        h.current_speed_bps.load(Ordering::Relaxed),
+                        h.failed_requests.load(Ordering::Relaxed),
+                        h.successful_requests.load(Ordering::Relaxed),
+                    ),
+                    // Mirror has no health entry (shouldn't normally happen)
+                    // — treat as neutral.
+                    None => 100,
+                }
+            })
+            .collect();
+        let total: u64 = weights.iter().sum();
+        if total == 0 {
+            // No mirror has any signal yet — fall back to round-robin so the
+            // initial probe spreads across all of them.
+            return idx % mirrors.len();
+        }
+        // Deterministic pick: use `idx` as a pseudo-random offset modulo
+        // total weight, then walk the cumulative distribution. Picking is
+        // deterministic per-chunk so retries on a different attempt
+        // counter visit a different mirror, but two parallel chunk
+        // fetchers with neighboring `idx` will likely hit different
+        // mirrors — naturally spreading load.
+        let mut pick = (idx as u64) % total;
+        for (i, w) in weights.iter().enumerate() {
+            if pick < *w {
+                return i;
+            }
+            pick -= *w;
+        }
+        mirrors.len() - 1
     }
 
     pub async fn probe(&self) -> Result<UpstreamProbe> {
@@ -292,12 +344,41 @@ impl Engine {
                 Some(v) => v,
                 None => {
                     let base = last_err.unwrap_or(ProxyError::NoUpstream);
-                    return Err(ProxyError::Internal(format!(
-                        "volume {} probe failed across all {} mirror(s): {}",
-                        vi + 1,
-                        n,
+                    if multi_volume {
+                        // Volumes need to be stitched in known sizes; we
+                        // can't recover without metadata.
+                        return Err(ProxyError::Internal(format!(
+                            "volume {} probe failed across all {} mirror(s): {}",
+                            vi + 1,
+                            n,
+                            base
+                        )));
+                    }
+                    // Single-volume / mirror task: probe failed completely
+                    // (e.g. server temporarily blocked HEAD + 1-byte GET,
+                    // but might still serve real GET requests). Return a
+                    // bare-bones probe with no size and no ranges support,
+                    // so `routes::build_stream_response` falls back to
+                    // passthrough mode (one streaming GET to the first
+                    // mirror). At worst the stream still 502s on the real
+                    // GET, but a transient probe glitch no longer kills
+                    // an otherwise-working task.
+                    tracing::warn!(
+                        "all mirrors of single-volume task failed probing ({}); falling back to passthrough",
                         base
-                    )));
+                    );
+                    (
+                        mirrors.first().cloned().unwrap_or_default(),
+                        UpstreamProbe {
+                            total_size: None,
+                            accepts_ranges: false,
+                            content_type: None,
+                            etag: None,
+                            last_modified: None,
+                            filename: None,
+                            volumes: None,
+                        },
+                    )
                 }
             };
 
@@ -798,6 +879,13 @@ impl Engine {
     ///   * forward the slice within [chunk_start, chunk_end] to `tx`, and
     ///   * if `cache` is Some, persist the full span to the sparse file as it
     ///     streams in (so partial reads still warm the cache).
+    ///
+    /// In multi-volume mode the span may straddle one or more volume
+    /// boundaries (block-aligned cache spans are independent of volume
+    /// boundaries). This function splits the span by volumes and fetches each
+    /// sub-span from its own volume — that's the only way the cache's
+    /// per-block byte counter can ever reach the full block length for blocks
+    /// that span a boundary.
     async fn fetch_span_to_tx(
         &self,
         idx: usize,
@@ -808,21 +896,52 @@ impl Engine {
         cache: Option<&CacheEntry>,
         tx: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<()> {
-        let attempts = self.fetch_attempts(chunk_start);
+        let subs = slice_span_by_volumes(self.volumes.as_deref().map(|v| v.as_slice()), span_start, span_end);
+        for (sub_start, sub_end) in subs {
+            self.fetch_single_volume_subspan(
+                idx, sub_start, sub_end, chunk_start, chunk_end, cache, tx,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fetch [sub_start, sub_end] from a single volume (the one containing
+    /// `sub_start`), retrying on different mirrors as needed. Mid-stream
+    /// disconnects are recovered by resuming the next attempt at the byte
+    /// where the previous attempt failed — so a 90%-complete fetch that
+    /// loses TCP doesn't restart from byte 0.
+    async fn fetch_single_volume_subspan(
+        &self,
+        idx: usize,
+        sub_start: u64,
+        sub_end: u64,
+        chunk_start: u64,
+        chunk_end: u64,
+        cache: Option<&CacheEntry>,
+        tx: &mpsc::Sender<Result<Bytes>>,
+    ) -> Result<()> {
+        let attempts = self.fetch_attempts(sub_start);
         let mut last_err: Option<ProxyError> = None;
+        // Bytes already delivered for this sub-span (relative to sub_start).
+        // On mid-stream failure we resume the next attempt from this offset
+        // instead of restarting at sub_start.
+        let mut delivered: u64 = 0;
         for attempt in 0..attempts {
-            // `chunk_start` is the locator — the chunk planner guarantees it
-            // lives inside a single volume, so it pins which volume to query.
-            let target = match self.resolve_target(idx, attempt, chunk_start, span_start, span_end)? {
+            let resume_at = sub_start + delivered;
+            if resume_at > sub_end {
+                return Ok(());
+            }
+            let target = match self.resolve_target(idx, attempt, sub_start, resume_at, sub_end)? {
                 Some(t) => t,
-                // Clipped to zero bytes (block-aligned span fell entirely
-                // outside the chunk's volume). Nothing to fetch.
+                // Clipped to zero bytes (sub-span entirely outside containing
+                // volume — shouldn't happen given slice_span_by_volumes).
                 None => return Ok(()),
             };
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             tracing::trace!(
-                "fetch span chunk={} attempt={} url={} range={}-{} merged_start={}",
-                idx, attempt, target.url, target.local_start, target.local_end, target.merged_start,
+                "fetch span chunk={} attempt={} url={} range={}-{} merged_start={} resume={}",
+                idx, attempt, target.url, target.local_start, target.local_end, target.merged_start, delivered,
             );
             let req_start = Instant::now();
             let resp = match self.client.get(&target.url).headers(headers).send().await {
@@ -875,6 +994,7 @@ impl Engine {
                         let piece_start = cursor;
                         let piece_end = piece_start + b.len() as u64 - 1;
                         cursor = piece_end + 1;
+                        delivered += b.len() as u64;
 
                         if let Some(c) = cache {
                             if let Err(e) = c.write_range(piece_start, &b) {
@@ -906,6 +1026,10 @@ impl Engine {
                     Err(e) => {
                         let msg = e.to_string();
                         self.record_failure(&target.url, Some(status_code), &msg);
+                        tracing::debug!(
+                            "fetch span chunk={} attempt={} url={} mid-stream error after {} bytes; will resume from offset {}",
+                            idx, attempt, target.url, delivered, sub_start + delivered,
+                        );
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
@@ -928,18 +1052,26 @@ impl Engine {
     ) -> Result<()> {
         let mut last_err: Option<ProxyError> = None;
         let attempts = self.fetch_attempts(start);
+        // Bytes already delivered (relative to `start`). Used to resume
+        // mid-stream after a TCP break instead of restarting at byte 0.
+        let mut delivered: u64 = 0;
         for attempt in 0..attempts {
             // Chunk planner guarantees [start, end] lives in one volume in
             // volume mode, so `start` pins the URL and `[start, end]` maps
-            // cleanly to its local range.
-            let target = match self.resolve_target(idx, attempt, start, start, end)? {
+            // cleanly to its local range. On retry we resume from where the
+            // previous attempt left off.
+            let resume_at = start + delivered;
+            if resume_at > end {
+                return Ok(());
+            }
+            let target = match self.resolve_target(idx, attempt, start, resume_at, end)? {
                 Some(t) => t,
                 None => return Ok(()),
             };
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             tracing::trace!(
-                "fetch chunk={} attempt={} url={} range={}-{}",
-                idx, attempt, target.url, target.local_start, target.local_end,
+                "fetch chunk={} attempt={} url={} range={}-{} resume={}",
+                idx, attempt, target.url, target.local_start, target.local_end, delivered,
             );
             let req_start = Instant::now();
             let resp = match self.client.get(&target.url).headers(headers).send().await {
@@ -993,6 +1125,12 @@ impl Engine {
             // file. Slice the [local_start, local_end] window out as we read,
             // so the serializer still gets exactly the bytes for this chunk.
             // (Mirror mode only — guarded above for volumes.)
+            //
+            // Resume note: when the previous attempt delivered N bytes the
+            // 206 path requested local_start += N (via resume_at above) and
+            // emits everything; the 200 path however always streams the
+            // whole file from byte 0, so we still slice [local_start..local_end]
+            // out of it. `delivered` here only matters for the 206 path.
             let needs_slice = status == StatusCode::OK;
             let local_start = target.local_start;
             let local_end = target.local_end;
@@ -1024,8 +1162,10 @@ impl Engine {
                         if to_send.is_empty() {
                             continue;
                         }
-                        self.record_bytes(&target.url, to_send.len() as u64);
-                        emitted += to_send.len() as u64;
+                        let sent_len = to_send.len() as u64;
+                        self.record_bytes(&target.url, sent_len);
+                        emitted += sent_len;
+                        delivered += sent_len;
                         if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
                         }
@@ -1036,6 +1176,10 @@ impl Engine {
                     Err(e) => {
                         let msg = e.to_string();
                         self.record_failure(&target.url, Some(status_code), &msg);
+                        tracing::debug!(
+                            "fetch chunk={} attempt={} url={} mid-stream error after {} bytes; will resume from offset {}",
+                            idx, attempt, target.url, delivered, start + delivered,
+                        );
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
@@ -1334,6 +1478,69 @@ fn plan_volume_indices(plan: &[(u64, u64)], volumes: Option<&[VolumeMeta]>) -> V
                     .unwrap_or(0)
             })
             .collect(),
+    }
+}
+
+/// Score function for picking a mirror. Higher = more likely to be chosen.
+///
+/// * Mirrors with zero signal (never tried) get a neutral baseline so they
+///   actually get sampled — otherwise a brand new mirror added to a task
+///   would never receive traffic.
+/// * Recent throughput (KiB/s) is the primary positive signal.
+/// * Cumulative failures sharply discount the weight (mirrors that keep
+///   erroring should drop out, but a single failure shouldn't black-hole
+///   a permanently-good source).
+/// * Successful requests with no recorded speed (e.g. completed instantly
+///   from cache or before sampler ticked) still get a small bump.
+///
+/// Returns a u64 weight; callers normalize by the sum.
+fn mirror_weight(current_speed_bps: u64, failed: u64, succeeded: u64) -> u64 {
+    if current_speed_bps == 0 && failed == 0 && succeeded == 0 {
+        return 100;
+    }
+    let speed_kib = (current_speed_bps / 1024).max(1);
+    let success_bonus = succeeded.min(10);
+    let raw = speed_kib + success_bonus;
+    let denom = 1 + 4 * failed;
+    (raw / denom).max(1)
+}
+
+/// Split `[span_start, span_end]` along volume boundaries so each returned
+/// sub-span lives inside exactly one volume. Mirror mode (`volumes == None`)
+/// returns the span unchanged. Sub-spans entirely outside the volume layout
+/// are skipped. Used by `fetch_span_to_tx` so cache-aligned spans that
+/// straddle a boundary still get every byte written.
+fn slice_span_by_volumes(
+    volumes: Option<&[VolumeMeta]>,
+    span_start: u64,
+    span_end: u64,
+) -> Vec<(u64, u64)> {
+    match volumes {
+        None => vec![(span_start, span_end)],
+        Some(vols) => {
+            let mut out = Vec::new();
+            for v in vols {
+                if v.size == 0 {
+                    continue;
+                }
+                let v_end = v.offset + v.size - 1;
+                if v_end < span_start || v.offset > span_end {
+                    continue;
+                }
+                let s = span_start.max(v.offset);
+                let e = span_end.min(v_end);
+                if s <= e {
+                    out.push((s, e));
+                }
+            }
+            if out.is_empty() {
+                // Span entirely outside any volume — shouldn't happen but
+                // returning the original span preserves the old single-call
+                // behaviour (caller will then error cleanly via resolve_target).
+                out.push((span_start, span_end));
+            }
+            out
+        }
     }
 }
 
@@ -1797,5 +2004,83 @@ mod tests {
         let plan = plan_chunks(0, 99, 200, Some(&vols));
         let mapped = plan_volume_indices(&plan, Some(&vols));
         assert!(!mapped.contains(&1), "empty volume must not appear in mapping");
+    }
+
+    #[test]
+    fn slice_span_single_volume_returns_unchanged() {
+        let vols = vec![vol("a", 0, 1000)];
+        assert_eq!(slice_span_by_volumes(Some(&vols), 100, 500), vec![(100, 500)]);
+    }
+
+    #[test]
+    fn slice_span_mirror_mode_returns_unchanged() {
+        assert_eq!(slice_span_by_volumes(None, 100, 500), vec![(100, 500)]);
+    }
+
+    #[test]
+    fn slice_span_splits_across_two_volumes() {
+        // Volumes: [0..100), [100..250)
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
+        // Span 50..199 crosses the boundary at 100.
+        assert_eq!(
+            slice_span_by_volumes(Some(&vols), 50, 199),
+            vec![(50, 99), (100, 199)],
+        );
+    }
+
+    #[test]
+    fn slice_span_splits_across_three_volumes() {
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 100), vol("c", 200, 100)];
+        // Span spans all three.
+        assert_eq!(
+            slice_span_by_volumes(Some(&vols), 50, 250),
+            vec![(50, 99), (100, 199), (200, 250)],
+        );
+    }
+
+    #[test]
+    fn slice_span_skips_empty_volumes() {
+        let vols = vec![vol("a", 0, 100), vol("empty", 100, 0), vol("c", 100, 100)];
+        assert_eq!(
+            slice_span_by_volumes(Some(&vols), 50, 150),
+            vec![(50, 99), (100, 150)],
+        );
+    }
+
+    #[test]
+    fn slice_span_boundary_exactly_at_volume_edge() {
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 100)];
+        // 99 is last byte of vol a, 100 is first of vol b.
+        assert_eq!(
+            slice_span_by_volumes(Some(&vols), 99, 100),
+            vec![(99, 99), (100, 100)],
+        );
+    }
+
+    #[test]
+    fn mirror_weight_unknown_mirror_is_neutral() {
+        // Brand-new mirror: should get a baseline so it's sampled.
+        assert_eq!(mirror_weight(0, 0, 0), 100);
+    }
+
+    #[test]
+    fn mirror_weight_fast_outweighs_slow() {
+        let fast = mirror_weight(10 * 1024 * 1024, 0, 5);
+        let slow = mirror_weight(100 * 1024, 0, 5);
+        assert!(fast > slow * 10, "fast={} slow={}", fast, slow);
+    }
+
+    #[test]
+    fn mirror_weight_failures_sharply_discount() {
+        let healthy = mirror_weight(1024 * 1024, 0, 10);
+        let flaky = mirror_weight(1024 * 1024, 10, 10);
+        assert!(healthy > flaky * 5, "healthy={} flaky={}", healthy, flaky);
+    }
+
+    #[test]
+    fn mirror_weight_never_returns_zero() {
+        // Even a totally failed mirror gets weight 1 — picker handles total=0
+        // separately by dropping to round-robin.
+        assert!(mirror_weight(0, 1000, 0) >= 1);
     }
 }

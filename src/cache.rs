@@ -87,6 +87,11 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub etag: Option<String>,
+    /// Downsampled view of the block bitmap: each entry is the percentage of
+    /// blocks completed in that segment, 0-100. Segment count is capped at
+    /// ~128 so the payload stays tiny even for multi-GB files. UI renders
+    /// this as a heat-strip progress bar showing which parts are cached.
+    pub bitmap_summary: Vec<u8>,
 }
 
 pub struct CacheEntry {
@@ -214,9 +219,11 @@ impl CacheEntry {
 
     pub fn stats(&self) -> CacheStats {
         let blocks_total = self.block_count();
-        let blocks_cached = {
+        let (blocks_cached, bitmap_summary) = {
             let bm = self.bitmap.lock();
-            bm.iter().map(|b| b.count_ones() as u64).sum::<u64>().min(blocks_total)
+            let cached = bm.iter().map(|b| b.count_ones() as u64).sum::<u64>().min(blocks_total);
+            let summary = downsample_bitmap(&bm, blocks_total, 128);
+            (cached, summary)
         };
         CacheStats {
             key: self.key.clone(),
@@ -227,8 +234,40 @@ impl CacheEntry {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             etag: self.meta.etag.clone(),
+            bitmap_summary,
         }
     }
+}
+
+/// Compress a bitmap into at most `max_buckets` segments, each holding the
+/// percentage (0-100) of blocks completed in that segment. For files smaller
+/// than `max_buckets` blocks each bucket maps to exactly one block.
+fn downsample_bitmap(bm: &[u8], blocks_total: u64, max_buckets: usize) -> Vec<u8> {
+    if blocks_total == 0 {
+        return Vec::new();
+    }
+    let buckets = (blocks_total as usize).min(max_buckets).max(1);
+    let mut out = Vec::with_capacity(buckets);
+    let total = blocks_total as usize;
+    for i in 0..buckets {
+        let lo = (i * total) / buckets;
+        let hi = (((i + 1) * total) / buckets).min(total);
+        if hi <= lo {
+            out.push(0);
+            continue;
+        }
+        let span = (hi - lo) as u64;
+        let mut filled = 0u64;
+        for b in lo..hi {
+            let byte_idx = b / 8;
+            let bit = (b % 8) as u8;
+            if byte_idx < bm.len() && (bm[byte_idx] >> bit) & 1 != 0 {
+                filled += 1;
+            }
+        }
+        out.push(((filled * 100) / span) as u8);
+    }
+    out
 }
 
 pub struct CacheStore {

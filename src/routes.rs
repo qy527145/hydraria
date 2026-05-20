@@ -87,6 +87,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/pause", post(pause_task))
         .route("/api/tasks/{task_id}/resume", post(resume_task))
         .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
+        .route("/api/tasks/{task_id}/export", get(export_task))
         .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/global", get(get_global))
@@ -269,6 +270,29 @@ async fn clear_task_cache(
     let key = crate::cache::CacheStore::key_for_task(&cfg);
     state.cache.clear(&key)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Export a task's config as a downloadable JSON file. The body is a
+/// `TaskConfig` (no runtime stats), so POSTing it back to `/api/tasks` on
+/// any instance recreates the same task — round-trip portable.
+async fn export_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Response, ProxyError> {
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+    let cfg = entry.config_snapshot();
+    let body = serde_json::to_vec_pretty(&cfg).map_err(|e| ProxyError::Internal(e.to_string()))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let disp = format!("attachment; filename=\"hydraria-task-{}.json\"", task_id);
+    if let Ok(v) = HeaderValue::from_str(&disp) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    let mut resp = Response::new(Body::from(body));
+    *resp.headers_mut() = headers;
+    Ok(resp)
 }
 
 async fn stream_task_head(

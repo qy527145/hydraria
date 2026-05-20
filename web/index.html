@@ -346,6 +346,25 @@
     transition: width 0.3s;
   }
 
+  /* Block-bitmap heat-strip: each bucket is one fill percentage 0..100.
+     Rendered as a 1D row of segments — fully cached = accent, empty = bg.
+     Hover shows the underlying byte-range tooltip. */
+  .cache-strip {
+    display: flex;
+    height: 8px;
+    width: 100%;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--bg-2);
+    margin-bottom: 10px;
+    gap: 1px;
+  }
+  .cache-strip .seg {
+    flex: 1;
+    background: var(--panel-3);
+    transition: background 0.2s;
+  }
+
   .task-actions {
     display: flex;
     gap: 6px;
@@ -715,8 +734,16 @@
   <!-- Create modal -->
   <div class="modal-bg" id="create-modal">
     <div class="modal">
-      <h3>新建代理任务</h3>
-      <div class="modal-sub">配置完成后将生成一个可粘进 VLC / 浏览器 / aria2 的短链 URL。</div>
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+        <div>
+          <h3 style="margin-bottom:4px;">新建代理任务</h3>
+          <div class="modal-sub">配置完成后将生成一个可粘进 VLC / 浏览器 / aria2 的短链 URL。</div>
+        </div>
+        <div>
+          <input type="file" id="f-import-file" accept=".json,application/json" style="display:none;" />
+          <button type="button" class="ghost" id="btn-f-import" data-tip="从导出的 JSON 文件预填表单">↥ 导入 JSON</button>
+        </div>
+      </div>
 
       <label class="field">
         分卷 / 源 URL
@@ -930,6 +957,34 @@ function fmtBytes(n) {
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
   return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + units[i];
 }
+// Same as fmtBytes but with a unit suffix the size-string parser accepts —
+// used when round-tripping numeric sizes back into form inputs.
+function fmtBytesPlain(n) {
+  if (!n) return "";
+  const units = [[1024*1024*1024, "G"], [1024*1024, "M"], [1024, "K"]];
+  for (const [u, sfx] of units) {
+    if (n >= u && n % u === 0) return (n / u) + sfx;
+  }
+  return String(n);
+}
+// Block-bitmap heat strip. `bitmap_summary` is 0..128 buckets, each 0-100
+// representing the % of blocks completed in that segment of the file.
+// Renders as a row of small bars whose color saturates from grey → accent
+// as fill grows. Tooltip shows the byte range covered by each segment.
+function cacheStripHtml(cache) {
+  const bs = cache.bitmap_summary;
+  if (!bs || bs.length === 0) return "";
+  const total = cache.total_size || 0;
+  const segs = bs.map((pct, i) => {
+    const lo = Math.floor((i * total) / bs.length);
+    const hi = Math.floor(((i + 1) * total) / bs.length) - 1;
+    // pct 0..100 → alpha 0.08..1.0 of accent color
+    const alpha = (0.08 + (pct / 100) * 0.92).toFixed(2);
+    const color = `rgba(110, 168, 255, ${alpha})`;
+    return `<div class="seg" style="background:${color};" title="${pct}% cached · bytes ${lo}-${hi}"></div>`;
+  }).join("");
+  return `<div class="cache-strip" title="cache map (${bs.length} segments)">${segs}</div>`;
+}
 function fmtBps(n) {
   return fmtBytes(n) + "/s";
 }
@@ -1111,6 +1166,7 @@ function taskCard(t) {
       <div class="progress" title="cached ${cache.blocks_cached}/${cache.blocks_total} blocks (${fmtBytes(cache.bytes_cached)}/${fmtBytes(cache.total_size)})">
         <div class="progress-bar" style="width: ${cachePct}%;"></div>
       </div>
+      ${cacheStripHtml(cache)}
     ` : ''}
 
     <div class="task-meta">
@@ -1151,6 +1207,8 @@ function actionsHtml(t) {
       ? `<button class="good" data-resume="${t.task_id}">▶ 恢复</button>`
       : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
     <button class="ghost" data-edit="${t.task_id}">✎ 编辑</button>
+    <button class="ghost" data-clone="${t.task_id}" data-tip="用此任务配置预填新建表单">⎘ 克隆</button>
+    <button class="ghost" data-export="${t.task_id}" data-tip="导出为 JSON 文件">↧ 导出</button>
     ${t.cache ? `<button class="ghost" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : ''}
     <button class="danger" data-del="${t.task_id}" data-tip="删除任务（保留缓存）">删除</button>
     ${t.cache ? `<button class="danger" data-del-with-cache="${t.task_id}" data-tip="删除任务并清空缓存">删除+清缓存</button>` : ''}
@@ -1228,6 +1286,46 @@ function attachCardEvents(root) {
         refresh();
       } catch (e) { toast("失败：" + e.message, "error"); }
     })();
+  });
+  root.querySelectorAll("[data-clone]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.clone;
+    const t = lastTasks.find(x => x.task_id === id);
+    if (!t) return;
+    // Open create modal pre-filled from the source task's config. Volume
+    // URLs are also copied — user usually wants to keep cookies/headers and
+    // tweak the URLs.
+    openCreate();
+    const c = t.config;
+    if (Array.isArray(c.volumes) && c.volumes.length) {
+      renderVolumesEditor("f", c.volumes);
+    }
+    $("#f-threads").value = c.max_threads;
+    $("#f-split").value = fmtBytesPlain(c.max_split);
+    $("#f-cache").checked = !!c.cache;
+    $("#f-persist").checked = !!c.persist;
+    $("#f-algorithm").value = c.rate_limit_algorithm || "token_bucket";
+    $("#f-name").value = c.name ? c.name + " (副本)" : "";
+    $("#f-rate").value = c.rate_limit_bps ? fmtBytesPlain(c.rate_limit_bps) : "";
+    $("#f-headers").value = c.headers && Object.keys(c.headers).length
+      ? JSON.stringify(c.headers, null, 2) : "";
+    $("#f-auto-filename").checked = c.auto_filename !== false;
+    $("#f-output-filename").value = c.output_filename || "";
+    revalidateCreate();
+    if (typeof saveCreateDraft === "function") saveCreateDraft();
+    toast("已从任务 " + id + " 克隆配置", "ok");
+  });
+  root.querySelectorAll("[data-export]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.export;
+    // Use a hidden <a> with download attr so the browser respects the
+    // server's Content-Disposition filename hint.
+    const a = document.createElement("a");
+    a.href = `/api/tasks/${id}/export`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   });
   root.querySelectorAll("[data-toggle-health]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
@@ -1668,6 +1766,44 @@ $("#create-modal").addEventListener("input", saveCreateDraft, true);
 $("#create-modal").addEventListener("change", saveCreateDraft, true);
 
 $("#btn-open-create").onclick = openCreate;
+
+// Import JSON: pre-fills the create form from an exported TaskConfig file.
+$("#btn-f-import").onclick = () => $("#f-import-file").click();
+$("#f-import-file").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const c = JSON.parse(text);
+    // Tolerate either a bare TaskConfig or { config: ... } wrapping.
+    const cfg = c && typeof c === "object" && c.config && typeof c.config === "object"
+      ? c.config : c;
+    if (Array.isArray(cfg.volumes) && cfg.volumes.length) {
+      renderVolumesEditor("f", cfg.volumes);
+    } else if (Array.isArray(cfg.urls) && cfg.urls.length) {
+      renderVolumesEditor("f", cfg.urls.map(u => [u]));
+    }
+    if (typeof cfg.max_threads === "number") $("#f-threads").value = cfg.max_threads;
+    if (cfg.max_split) $("#f-split").value = fmtBytesPlain(cfg.max_split);
+    $("#f-cache").checked = !!cfg.cache;
+    $("#f-persist").checked = !!cfg.persist;
+    if (cfg.rate_limit_algorithm) $("#f-algorithm").value = cfg.rate_limit_algorithm;
+    if (cfg.name) $("#f-name").value = cfg.name;
+    if (cfg.rate_limit_bps) $("#f-rate").value = fmtBytesPlain(cfg.rate_limit_bps);
+    if (cfg.headers && Object.keys(cfg.headers).length) {
+      $("#f-headers").value = JSON.stringify(cfg.headers, null, 2);
+    }
+    $("#f-auto-filename").checked = cfg.auto_filename !== false;
+    if (cfg.output_filename) $("#f-output-filename").value = cfg.output_filename;
+    revalidateCreate();
+    if (typeof saveCreateDraft === "function") saveCreateDraft();
+    toast("已从 " + file.name + " 导入配置", "ok");
+  } catch (err) {
+    toast("导入失败：" + err.message, "error");
+  } finally {
+    e.target.value = "";
+  }
+});
 $("#btn-create-cancel").onclick = cancelCreate;
 
 $("#btn-create").onclick = async () => {
