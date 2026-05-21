@@ -2,6 +2,8 @@ pub mod assets;
 pub mod cache;
 pub mod engine;
 pub mod error;
+pub mod fs_pick;
 pub mod models;
+pub mod plugins;
 pub mod ratelimit;
 pub mod routes;

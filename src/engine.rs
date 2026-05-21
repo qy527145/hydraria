@@ -1,6 +1,7 @@
 use crate::cache::CacheEntry;
 use crate::error::{ProxyError, Result};
 use crate::models::{TaskConfig, UrlHealthAcc};
+use crate::plugins::TransformPipeline;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
@@ -38,6 +39,10 @@ pub struct Engine {
     cache: Option<Arc<CacheEntry>>,
     health: Vec<Arc<UrlHealthAcc>>,
     volumes: Option<Arc<Vec<VolumeMeta>>>,
+    /// Plugin post-processing pipeline applied to bytes on the way out to
+    /// the client. `None` means "no transform" (the original zero-copy path);
+    /// `Some(empty)` is equivalent and short-circuits to the same fast path.
+    pipeline: Option<Arc<TransformPipeline>>,
 }
 
 /// Where and what bytes a fetch attempt should request from a concrete URL.
@@ -69,6 +74,7 @@ impl Engine {
             cache: None,
             health: Vec::new(),
             volumes: None,
+            pipeline: None,
         })
     }
 
@@ -85,6 +91,48 @@ impl Engine {
     pub fn with_volumes(mut self, volumes: Option<Vec<VolumeMeta>>) -> Self {
         self.volumes = volumes.map(Arc::new);
         self
+    }
+
+    /// Install the per-task plugin pipeline. Bytes flowing to the client are
+    /// passed through every transform (in reverse-of-stored order) before
+    /// being sent. Empty / `None` pipelines skip the work entirely.
+    pub fn with_pipeline(mut self, pipeline: Option<Arc<TransformPipeline>>) -> Self {
+        self.pipeline = pipeline.filter(|p| !p.is_empty());
+        self
+    }
+
+    /// Apply the pipeline to `data` whose first byte sits at `merged_offset`
+    /// in the merged-file coordinate space. When no pipeline is configured
+    /// this is a zero-copy passthrough (returns the original `Bytes`); with
+    /// a pipeline it materializes a writeable copy, transforms in place, and
+    /// returns the frozen result. Net cost: one clone of the slice's bytes
+    /// when transforms are active, zero otherwise.
+    fn transform_outgoing(&self, merged_offset: u64, data: Bytes) -> Bytes {
+        match &self.pipeline {
+            Some(p) if !p.is_empty() => {
+                if data.is_empty() {
+                    return data;
+                }
+                let mut buf = data.to_vec();
+                p.apply_reverse(merged_offset, &mut buf);
+                Bytes::from(buf)
+            }
+            _ => data,
+        }
+    }
+
+    /// Same as `transform_outgoing` but callable from outside the engine —
+    /// used by the passthrough path in `routes::build_stream_response`,
+    /// which lives outside `Engine::stream_range` and so doesn't have a
+    /// direct hook into the chunk fetchers' send-sites.
+    pub fn transform_outgoing_public(&self, merged_offset: u64, data: Bytes) -> Bytes {
+        self.transform_outgoing(merged_offset, data)
+    }
+
+    /// True when a non-empty pipeline is installed. Callers can skip
+    /// per-byte counters / offset bookkeeping when this is false.
+    pub fn has_pipeline(&self) -> bool {
+        matches!(&self.pipeline, Some(p) if !p.is_empty())
     }
 
     fn now_unix() -> u64 {
@@ -839,7 +887,11 @@ impl Engine {
                 match cache.read_range(span_start, span_end) {
                     Ok(bytes) => {
                         cache.hits.fetch_add(j - i + 1, Ordering::Relaxed);
-                        if tx.send(Ok(bytes)).await.is_err() {
+                        // Cache stores raw upstream bytes — for an encrypted
+                        // task that's ciphertext, so the plugin pipeline
+                        // still needs to run on the read-out.
+                        let out = self.transform_outgoing(span_start, bytes);
+                        if tx.send(Ok(out)).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -1019,6 +1071,14 @@ impl Engine {
                             continue;
                         }
                         let to_send = b.slice(lo..hi);
+                        // Merged offset of the first byte of `to_send`: the
+                        // slice's start within `b` (lo) plus where `b`
+                        // started in merged space (piece_start). Cache writes
+                        // above stored the original ciphertext bytes, so
+                        // running the transform here only affects what
+                        // reaches the client.
+                        let merged_offset = piece_start + lo as u64;
+                        let to_send = self.transform_outgoing(merged_offset, to_send);
                         if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
                         }
@@ -1164,8 +1224,14 @@ impl Engine {
                         }
                         let sent_len = to_send.len() as u64;
                         self.record_bytes(&target.url, sent_len);
+                        // Both 206 and 200 paths emit bytes in plan order
+                        // starting at `target.merged_start`. `emitted` is
+                        // the cumulative byte count BEFORE this slice, so
+                        // it doubles as the merged offset for the next emit.
+                        let merged_offset = target.merged_start + emitted;
                         emitted += sent_len;
                         delivered += sent_len;
+                        let to_send = self.transform_outgoing(merged_offset, to_send);
                         if tx.send(Ok(to_send)).await.is_err() {
                             return Ok(());
                         }
@@ -1806,6 +1872,7 @@ mod tests {
             rate_limit_bps: 0,
             rate_limit_algorithm: Default::default(),
             persist: false,
+            plugins: Vec::new(),
         };
         assert_eq!(
             cfg.effective_volumes(),
@@ -1830,6 +1897,7 @@ mod tests {
             rate_limit_bps: 0,
             rate_limit_algorithm: Default::default(),
             persist: false,
+            plugins: Vec::new(),
         };
         // Old mirror config → one volume holding every mirror.
         assert_eq!(
@@ -1855,6 +1923,7 @@ mod tests {
             rate_limit_bps: 0,
             rate_limit_algorithm: Default::default(),
             persist: false,
+            plugins: Vec::new(),
         };
         // Old volume config → one volume per URL.
         assert_eq!(

@@ -194,9 +194,14 @@
     gap: 8px;
   }
   .list .task { padding: 10px 14px; }
+  .list .task .task-head { display: none; }
   .list .task .task-meta { display: none; }
+  .list .task .task-spark { display: none; }
+  .list .task .task-actions { display: none; }
+  .list .task .cache-strip { display: none; }
   .list .task .progress { display: none; }
   .list .task .task-url { display: none; }
+  .list .task.expanded .health-panel { display: block; }
   .list .task .compact-row {
     display: flex; align-items: center; gap: 12px;
     width: 100%; min-width: 0;
@@ -208,7 +213,25 @@
     background: var(--bg-2); padding: 2px 8px; border-radius: 4px;
     flex-shrink: 0;
   }
+  .list .task .compact-row .proxy-url-mini {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: var(--text-dim);
+    background: var(--bg-2); padding: 2px 8px; border-radius: 4px;
+    max-width: 320px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+    flex-shrink: 1;
+  }
+  .list .task .compact-row .proxy-url-mini:hover {
+    color: var(--text); border-color: var(--border-strong);
+  }
+  .list .task .compact-row .proxy-url-mini.copied {
+    color: #0a0c12; background: var(--good); border-color: var(--good);
+  }
   .grid .compact-row { display: none; }
+  .grid .proxy-url-mini { display: none; }
 
   .task {
     background: var(--panel);
@@ -690,6 +713,89 @@
     top: 100%;
     transform: translateX(-50%) translateY(6px);
   }
+
+  /* Plugin cards (per-task plugin slots + tool cards in plugins modal). */
+  .plugin-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    background: var(--panel-2);
+  }
+  .plugin-card.enabled { border-color: var(--accent); }
+  .plugin-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  .plugin-card-head .name { font-weight: 600; color: var(--text); }
+  .plugin-card-head .meta { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  .plugin-card .desc {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+    line-height: 1.5;
+  }
+  .plugin-card .field-grid { display: grid; gap: 8px; }
+  .plugin-card label.field { margin: 6px 0 4px; }
+  .plugin-card input[type="text"],
+  .plugin-card input[type="number"],
+  .plugin-card textarea {
+    background: var(--bg-2);
+    border-color: var(--border-strong);
+  }
+  .plugin-card .tool-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  .plugin-result {
+    margin-top: 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .plugin-result .secret-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 2px 0;
+  }
+  .plugin-result .secret-row .k { color: var(--muted); flex-shrink: 0; }
+  .plugin-result .secret-row .v {
+    flex: 1; min-width: 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  .plugin-result .secret-row .copy-btn { padding: 2px 8px; font-size: 11px; }
+  .plugin-section-divider {
+    border-top: 1px dashed var(--border);
+    margin: 14px 0 10px;
+    padding-top: 10px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  /* Yellow flash when a hex field gets auto-populated before submit, so the
+     user can see the value was just generated. Fades back to normal. */
+  @keyframes hydraria-just-filled {
+    0%   { background: rgba(251, 191, 36, 0.35); }
+    100% { background: transparent; }
+  }
+  input.just-filled {
+    animation: hydraria-just-filled 1.2s ease-out;
+  }
 </style>
 </head>
 <body>
@@ -710,6 +816,7 @@
       <span class="stat-pill" data-tip="当前活跃连接">active <b id="stat-active">0</b></span>
       <span class="stat-pill" data-tip="进程内已服务字节总计">served <b id="stat-served">0 B</b></span>
       <span class="stat-pill" data-tip="所有任务的本地缓存占用">cache <b id="stat-cache">0 B</b></span>
+      <button class="ghost" id="btn-plugins" data-tip="插件 / 工具">🔌 插件</button>
       <button class="ghost" id="btn-settings" data-tip="全局设置">⚙ 设置</button>
       <button id="btn-open-create">+ 新建任务</button>
     </div>
@@ -812,6 +919,16 @@
         </label>
       </div>
 
+      <label class="field">
+        插件 (后处理)
+        <span class="hint-inline" id="f-plugins-status">无</span>
+      </label>
+      <div class="modal-sub" style="margin-top: -2px; margin-bottom: 8px;">
+        若源文件经过插件正向处理 (如加密),勾选对应插件并填入解密参数。
+        多个插件按列表顺序保存,代理路径上按相反顺序还原 (符合先压后加 → 先减后解的语义)。
+      </div>
+      <div id="f-plugins-host"></div>
+
       <div class="modal-actions">
         <button class="ghost" id="btn-create-cancel">取消</button>
         <button id="btn-create" disabled>生成短链 &amp; 启动任务</button>
@@ -888,6 +1005,12 @@
         </label>
       </div>
 
+      <label class="field">
+        插件 (后处理)
+        <span class="hint-inline" id="e-plugins-status">无</span>
+      </label>
+      <div id="e-plugins-host"></div>
+
       <div class="modal-actions">
         <button class="ghost" id="btn-edit-cancel">取消</button>
         <button id="btn-edit-save" disabled>保存</button>
@@ -921,6 +1044,23 @@
       <div class="modal-actions">
         <button class="ghost" id="btn-settings-cancel">关闭</button>
         <button id="btn-settings-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Plugins modal -->
+  <div class="modal-bg" id="plugins-modal">
+    <div class="modal" style="width: 720px;">
+      <h3>插件 &amp; 工具</h3>
+      <div class="modal-sub">
+        每个插件提供"代理路径上的字节后处理"（如解密）和"正向工具"（如加密源文件）。
+        全局配置控制算法参数,任务级配置（密钥/Nonce 等）在新建/编辑任务时填入。
+      </div>
+      <div id="plugins-host">
+        <div class="empty" style="margin-top:16px;">加载中…</div>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost" id="btn-plugins-close">关闭</button>
       </div>
     </div>
   </div>
@@ -1136,9 +1276,11 @@ function taskCard(t) {
     <div class="compact-row">
       <span class="task-id-tag">${t.task_id}</span>
       <span class="name">${escapeHtml(name)}</span>
+      <span class="proxy-url-mini" data-copy="${t.proxy_url}" data-tip="点击复制：${t.proxy_url}" title="${t.proxy_url}">${t.proxy_url}</span>
       <span class="mini">${t.config.urls.length} src · ${fmtBps(t.current_speed_bps)}</span>
       ${badges.join("")}
       ${actionsHtml(t)}
+      <button class="ghost" data-toggle-health="${t.task_id}">${isExpanded ? '收起源看板 ▴' : '源看板 ▾'}</button>
     </div>
 
     <div class="task-head">
@@ -1249,7 +1391,14 @@ function healthClass(h) {
 function attachCardEvents(root) {
   root.querySelectorAll("[data-copy]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
-    copyToClipboard(b.dataset.copy, b);
+    // For a URL span we don't want to overwrite the URL text with "✓ 已复制";
+    // fall back to the toast path by passing no element.
+    const isUrlSpan = b.classList.contains("proxy-url-mini");
+    copyToClipboard(b.dataset.copy, isUrlSpan ? null : b);
+    if (isUrlSpan) {
+      b.classList.add("copied");
+      setTimeout(() => b.classList.remove("copied"), 800);
+    }
   });
   root.querySelectorAll("[data-pause]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
@@ -2003,6 +2152,746 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "/" && !["INPUT","TEXTAREA"].includes(document.activeElement.tagName)) {
     e.preventDefault();
     $("#search").focus();
+  }
+});
+
+/* ---- plugin system ---- */
+
+// Cached list of available plugins (from /api/plugins). Refreshed on every
+// modal open so the user sees globals edits reflected immediately.
+let pluginCatalog = [];
+
+async function refreshPluginCatalog() {
+  try {
+    pluginCatalog = await api("/api/plugins");
+  } catch (e) {
+    pluginCatalog = [];
+    toast("加载插件列表失败：" + e.message, "error");
+  }
+  return pluginCatalog;
+}
+
+// Render the per-task plugin slots for scope="f" or "e". `slots` is the
+// current TaskPluginConfig[] (id, enabled, config). The DOM is rebuilt from
+// scratch each time — we read values back on submit.
+function renderTaskPluginSlots(scope, slots) {
+  const host = $(`#${scope}-plugins-host`);
+  host.innerHTML = "";
+  // Status counter.
+  const enabled = slots.filter(s => s.enabled).length;
+  const status = $(`#${scope}-plugins-status`);
+  if (status) {
+    status.textContent = pluginCatalog.length === 0
+      ? "无可用插件"
+      : (enabled === 0 ? "未启用" : `${enabled} 个已启用`);
+  }
+  if (!pluginCatalog.length) {
+    host.innerHTML = `<div class="hint">尚未注册任何插件。</div>`;
+    return;
+  }
+  pluginCatalog.forEach(plugin => {
+    const slot = slots.find(s => s.id === plugin.id) || {
+      id: plugin.id, enabled: false, config: structuredClone(plugin.default_task),
+    };
+    const card = document.createElement("div");
+    card.className = "plugin-card" + (slot.enabled ? " enabled" : "");
+    card.dataset.pluginId = plugin.id;
+
+    const head = document.createElement("div");
+    head.className = "plugin-card-head";
+    const left = document.createElement("label");
+    left.style.display = "inline-flex";
+    left.style.alignItems = "center";
+    left.style.gap = "8px";
+    left.style.cursor = "pointer";
+    left.innerHTML = `
+      <input type="checkbox" class="plugin-enabled" ${slot.enabled ? "checked" : ""} />
+      <span class="name">${escapeHtml(plugin.name)}</span>
+      <span class="meta">${plugin.id}</span>
+    `;
+    head.appendChild(left);
+    card.appendChild(head);
+
+    const desc = document.createElement("div");
+    desc.className = "desc";
+    desc.textContent = plugin.description;
+    card.appendChild(desc);
+
+    // Body (per-task config fields). Hidden until the plugin is enabled
+    // — keeps the modal compact when most plugins are off.
+    const body = document.createElement("div");
+    body.className = "field-grid";
+    body.style.display = slot.enabled ? "" : "none";
+    plugin.task_fields.forEach(field => {
+      const wrap = document.createElement("div");
+      const lab = document.createElement("label");
+      lab.className = "field";
+      lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+      wrap.appendChild(lab);
+      // suppressGenerate: this is the decryption-key slot — the user must
+      // paste what the sender shared. Rolling a fresh random key here would
+      // silently produce garbage bytes for every byte the engine emits.
+      wrap.appendChild(renderField(field, slot.config && slot.config[field.key], { suppressGenerate: true }));
+      body.appendChild(wrap);
+    });
+    card.appendChild(body);
+
+    const toggle = head.querySelector(".plugin-enabled");
+    toggle.addEventListener("change", () => {
+      body.style.display = toggle.checked ? "" : "none";
+      card.classList.toggle("enabled", toggle.checked);
+      // Update counter status.
+      const all = readTaskPluginSlots(scope);
+      const enabled = all.filter(s => s.enabled).length;
+      if (status) {
+        status.textContent = enabled === 0 ? "未启用" : `${enabled} 个已启用`;
+      }
+    });
+
+    host.appendChild(card);
+  });
+}
+
+// Read back the per-task slots from the DOM. Returns TaskPluginConfig[].
+function readTaskPluginSlots(scope) {
+  const host = $(`#${scope}-plugins-host`);
+  const cards = host.querySelectorAll(".plugin-card");
+  const out = [];
+  cards.forEach(card => {
+    const id = card.dataset.pluginId;
+    const enabled = card.querySelector(".plugin-enabled").checked;
+    const plugin = pluginCatalog.find(p => p.id === id);
+    if (!plugin) return;
+    const config = {};
+    plugin.task_fields.forEach(field => {
+      config[field.key] = readField(card, field);
+    });
+    out.push({ id, enabled, config });
+  });
+  return out;
+}
+
+// Render a single field input. `value` is the existing value (may be null).
+// Path/DirPath fields get an inline picker button when the server reports
+// native picker support; Hex fields with `generate_random_bytes` get a
+// 🎲 button that fills client-side random bytes via crypto.getRandomValues.
+// Set `opts.suppressGenerate = true` to drop the 🎲 affordance — used in
+// the per-task plugin slot where the user must paste the receiver-side key,
+// not roll a new one. All affordances are wrapped in a single composite
+// element so the read-back path (`readField`) stays simple.
+function renderField(field, value, opts) {
+  opts = opts || {};
+  const wrap = document.createElement('div');
+  wrap.style.display = 'flex';
+  wrap.style.gap = '6px';
+  wrap.style.alignItems = 'stretch';
+
+  let el;
+  if (field.kind === "boolean") {
+    el = Object.assign(document.createElement("input"), { type: "checkbox" });
+  } else if (field.kind === "number") {
+    el = Object.assign(document.createElement("input"), { type: "number" });
+  } else if (field.kind === "text_area") {
+    el = document.createElement("textarea");
+  } else if (field.kind === "select") {
+    // Native <select> driven by the field's `options` array (sent from the
+    // plugin's Rust schema). The selected option's `value` is what the
+    // server will receive — labels are display-only.
+    el = document.createElement("select");
+    (field.options || []).forEach(opt => {
+      const o = document.createElement("option");
+      o.value = opt.value;
+      o.textContent = opt.label;
+      el.appendChild(o);
+    });
+  } else {
+    // Path / DirPath / Hex / Size / Text all use the same input shape; the
+    // distinguishing behavior (picker button, hex monospace, size validate)
+    // is layered on below via the wrap-element decorators and readField().
+    el = Object.assign(document.createElement("input"), { type: "text" });
+  }
+  el.dataset.fieldKey = field.key;
+  el.dataset.fieldKind = field.kind;
+  el.style.flex = '1';
+  if (field.kind === "boolean") {
+    el.checked = !!value;
+    el.style.flex = '0';
+    el.style.alignSelf = 'center';
+  } else if (value !== undefined && value !== null) {
+    el.value = String(value);
+  }
+  if (field.kind === "hex" || field.kind === "path" || field.kind === "dir_path") {
+    el.style.fontFamily = "ui-monospace, monospace";
+    el.style.fontSize = "12px";
+  }
+  if (field.kind === "size") {
+    // Validate on input. SPLIT_RE is already defined at the top of the
+    // script and accepts the same grammar the server's parse_size expects.
+    el.placeholder = "如 5M / 512K / 1G,留空 = 0";
+    el.addEventListener('input', () => {
+      const v = (el.value || '').trim();
+      if (!v || SPLIT_RE.test(v)) {
+        el.classList.remove('invalid');
+      } else {
+        el.classList.add('invalid');
+      }
+    });
+  }
+  wrap.appendChild(el);
+
+  // 🎲 random-bytes generator for Hex fields that the plugin opted into.
+  // Skipped when the caller passed `suppressGenerate: true` — that's the
+  // per-task plugin slot, where the user must paste the receiver-side key
+  // and rolling a fresh one would produce undecryptable bytes.
+  if (field.kind === "hex" && field.generate_random_bytes && !opts.suppressGenerate) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost';
+    btn.style.padding = '6px 10px';
+    btn.textContent = '🎲';
+    btn.title = `随机生成 ${field.generate_random_bytes} 字节并填入`;
+    btn.addEventListener('click', () => {
+      const n = Math.max(1, Math.min(1024, field.generate_random_bytes | 0));
+      const buf = new Uint8Array(n);
+      crypto.getRandomValues(buf);
+      el.value = Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    wrap.appendChild(btn);
+  }
+
+  // 📁 / 📂 native picker for path-typed fields. Only rendered when the
+  // server told us at boot that this platform supports a native dialog;
+  // otherwise the input degrades gracefully to a plain text field.
+  if ((field.kind === "path" || field.kind === "dir_path") && pickerSupported) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost';
+    btn.style.padding = '6px 10px';
+    const isDir = field.kind === "dir_path";
+    const isSave = field.path_mode === "save";
+    btn.textContent = isDir ? '📂' : '📁';
+    btn.title = isDir ? '选择目录…' : (isSave ? '选择保存位置…' : '选择文件…');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const kind = isDir ? "open_directory" : (isSave ? "save_file" : "open_file");
+        const r = await api('/api/fs/pick', {
+          method: 'POST',
+          body: JSON.stringify({
+            kind,
+            default_name: field.default_filename || null,
+            title: field.label,
+          }),
+        });
+        if (r && r.path) {
+          el.value = r.path;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      } catch (e) {
+        toast('打开选择器失败：' + e.message, 'error');
+      } finally {
+        btn.textContent = orig;
+        btn.disabled = false;
+      }
+    });
+    wrap.appendChild(btn);
+  }
+
+  return wrap;
+}
+
+// Read one field's value from a card. Booleans → bool, numbers → number,
+// sizes → trimmed string (server parses through models::parse_size), blank
+// → null (so we don't store "" where the plugin expected nothing).
+function readField(card, field) {
+  // The renderer wraps the actual <input> inside a flex container; we still
+  // tag the input with `data-field-key`, so this scoped query works for
+  // both legacy plain inputs and the new wrapped layout.
+  const el = card.querySelector(`[data-field-key="${field.key}"]`);
+  if (!el) return null;
+  if (field.kind === "boolean") return !!el.checked;
+  const v = (el.value || "").trim();
+  if (field.kind === "number") {
+    if (!v) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : v;
+  }
+  if (field.kind === "size") {
+    // Empty ⇒ null so the server sees an absent value (which it treats as 0).
+    if (!v) return null;
+    if (!SPLIT_RE.test(v)) {
+      // Surface the invalid state visually; runPluginForward will pick this
+      // up in its catch. Returning the raw string lets the server emit a
+      // descriptive parse error.
+      el.classList.add('invalid');
+    }
+    return v;
+  }
+  return v === "" ? null : v;
+}
+
+// Probe-once at boot. The server tells us whether native picker dialogs work
+// here; the field renderer reads `pickerSupported` to decide whether to
+// render the 📁 button. Falls back to false on probe failure so the UI is
+// always usable.
+let pickerSupported = false;
+(async function probePickerSupport() {
+  try {
+    const info = await api('/api/fs/info');
+    pickerSupported = !!(info && info.picker_supported);
+  } catch {
+    pickerSupported = false;
+  }
+})();
+
+/* ---- plugins modal (tools + global configs) ---- */
+
+async function openPluginsModal() {
+  $("#plugins-modal").classList.add("show");
+  $("#plugins-host").innerHTML = `<div class="empty" style="margin-top:16px;">加载中…</div>`;
+  await refreshPluginCatalog();
+  renderPluginsModal();
+}
+function closePluginsModal() { $("#plugins-modal").classList.remove("show"); }
+$("#btn-plugins").onclick = openPluginsModal;
+$("#btn-plugins-close").onclick = closePluginsModal;
+
+function renderPluginsModal() {
+  const host = $("#plugins-host");
+  if (!pluginCatalog.length) {
+    host.innerHTML = `<div class="empty" style="margin-top:16px;">尚未注册任何插件。</div>`;
+    return;
+  }
+  host.innerHTML = "";
+  pluginCatalog.forEach(plugin => {
+    const card = document.createElement("div");
+    card.className = "plugin-card";
+    card.dataset.pluginId = plugin.id;
+
+    card.innerHTML = `
+      <div class="plugin-card-head">
+        <div>
+          <div class="name">${escapeHtml(plugin.name)}</div>
+          <div class="meta">${plugin.id}</div>
+        </div>
+      </div>
+      <div class="desc">${escapeHtml(plugin.description)}</div>
+    `;
+
+    // Global config section.
+    if (plugin.global_fields && plugin.global_fields.length) {
+      const div = document.createElement("div");
+      div.className = "plugin-section-divider";
+      div.textContent = "全局配置";
+      card.appendChild(div);
+      const grid = document.createElement("div");
+      grid.className = "field-grid";
+      grid.dataset.section = "global";
+      plugin.global_fields.forEach(field => {
+        const wrap = document.createElement("div");
+        const lab = document.createElement("label");
+        lab.className = "field";
+        lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+        wrap.appendChild(lab);
+        const value = plugin.global && plugin.global[field.key];
+        wrap.appendChild(renderField(field, value));
+        grid.appendChild(wrap);
+      });
+      card.appendChild(grid);
+      const saveRow = document.createElement("div");
+      saveRow.className = "tool-actions";
+      const saveBtn = document.createElement("button");
+      saveBtn.className = "ghost";
+      saveBtn.textContent = "保存全局配置";
+      saveBtn.addEventListener("click", () => savePluginGlobal(plugin, card));
+      saveRow.appendChild(saveBtn);
+      card.appendChild(saveRow);
+    }
+
+    // Forward tool section.
+    if (plugin.has_forward) {
+      const div = document.createElement("div");
+      div.className = "plugin-section-divider";
+      div.textContent = "正向工具";
+      card.appendChild(div);
+
+      // Task-fields section (key/nonce). For ChaCha20 these are the
+      // secrets the receiver also enters; for other plugins they may
+      // describe something else. We wrap them in a host so the
+      // `encrypt`/equivalent toggle below can hide them when the user
+      // opts into pure-split / no-secrets mode.
+      let taskSection = null;
+      let taskNote = null;
+      if (plugin.task_fields && plugin.task_fields.length) {
+        taskNote = document.createElement("div");
+        taskNote.className = "hint";
+        taskNote.style.marginBottom = "8px";
+        taskNote.textContent = '下面是“接收方”端要填入的同一对密钥/Nonce — 留空且勾选了下方“自动生成”时,执行前会随机生成并回填到这里。';
+        taskNote.dataset.role = "task-note";
+        card.appendChild(taskNote);
+
+        taskSection = document.createElement("div");
+        taskSection.className = "field-grid";
+        taskSection.dataset.section = "task";
+        plugin.task_fields.forEach(field => {
+          const wrap = document.createElement("div");
+          const lab = document.createElement("label");
+          lab.className = "field";
+          lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+          wrap.appendChild(lab);
+          const value = plugin.default_task && plugin.default_task[field.key];
+          // Don't pre-fill default empty strings — better to leave the field
+          // visibly empty so users notice they need to fill or generate.
+          wrap.appendChild(renderField(field, value || null));
+          taskSection.appendChild(wrap);
+        });
+        card.appendChild(taskSection);
+      }
+
+      const paramGrid = document.createElement("div");
+      paramGrid.className = "field-grid";
+      paramGrid.dataset.section = "params";
+      plugin.forward_fields.forEach(field => {
+        const wrap = document.createElement("div");
+        const lab = document.createElement("label");
+        lab.className = "field";
+        lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+        wrap.appendChild(lab);
+        // Booleans default to true; selects start at their first option;
+        // size fields stay blank so they default to 0 server-side.
+        let initialValue = null;
+        if (field.kind === "boolean") initialValue = true;
+        if (field.kind === "select" && Array.isArray(field.options) && field.options.length) {
+          initialValue = field.options[0].value;
+        }
+        wrap.appendChild(renderField(field, initialValue));
+        paramGrid.appendChild(wrap);
+      });
+      card.appendChild(paramGrid);
+
+      // Wire the `encrypt` boolean (if the plugin exposes one) to show/hide
+      // the task-fields section. Plugins without an `encrypt` toggle keep
+      // their task fields always visible — they don't have a notion of
+      // "skip the secrets".
+      const encryptInput = paramGrid.querySelector('[data-field-key="encrypt"]');
+      const syncEncryptVisibility = () => {
+        if (!encryptInput || !taskSection) return;
+        const on = !!encryptInput.checked;
+        taskSection.style.display = on ? "" : "none";
+        if (taskNote) taskNote.style.display = on ? "" : "none";
+      };
+      if (encryptInput) {
+        encryptInput.addEventListener("change", syncEncryptVisibility);
+        syncEncryptVisibility();
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "tool-actions";
+      const runBtn = document.createElement("button");
+      runBtn.textContent = "▶ 执行";
+      runBtn.addEventListener("click", () => runPluginForward(plugin, card));
+      actions.appendChild(runBtn);
+      const resultBox = document.createElement("div");
+      resultBox.className = "plugin-result";
+      resultBox.style.display = "none";
+      resultBox.dataset.role = "result";
+      card.appendChild(actions);
+      card.appendChild(resultBox);
+    }
+
+    host.appendChild(card);
+  });
+}
+
+async function savePluginGlobal(plugin, card) {
+  const grid = card.querySelector('[data-section="global"]');
+  if (!grid) return;
+  const payload = {};
+  plugin.global_fields.forEach(field => {
+    payload[field.key] = readField(card, field);
+  });
+  try {
+    await api(`/api/plugins/${plugin.id}/global`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    toast(`已保存 "${plugin.name}" 全局配置`, "ok");
+    // Refresh local snapshot so subsequent operations use the new value.
+    await refreshPluginCatalog();
+  } catch (e) {
+    toast("保存失败：" + e.message, "error");
+  }
+}
+
+async function runPluginForward(plugin, card) {
+  const taskGrid = card.querySelector('[data-section="task"]');
+  const paramGrid = card.querySelector('[data-section="params"]');
+  // Read params first — we need `generate_missing` and (for the ChaCha20
+  // tool) `encrypt` BEFORE deciding whether to pre-fill the key/nonce fields.
+  const params = {};
+  plugin.forward_fields.forEach(field => {
+    params[field.key] = readField(card, field);
+  });
+
+  // Pre-fill empty `generate_random_bytes` task fields BEFORE submitting,
+  // so the user sees the generated values in the form. The user explicitly
+  // asked for this: it makes the secrets visible (and copyable) at the same
+  // instant the operation runs, rather than only after success.
+  //
+  // We only auto-fill when:
+  //   * the plugin has an `encrypt` toggle that's currently ON (or no such
+  //     toggle exists — then we assume encryption is always on), AND
+  //   * `generate_missing` is true (the param exists and is checked), AND
+  //   * the field is empty.
+  const encryptOn = params.encrypt === undefined ? true : !!params.encrypt;
+  const genMissing = !!params.generate_missing;
+  if (encryptOn && genMissing && taskGrid) {
+    plugin.task_fields.forEach(field => {
+      if (field.kind !== "hex" || !field.generate_random_bytes) return;
+      const input = card.querySelector(`[data-field-key="${field.key}"]`);
+      if (!input || (input.value || "").trim() !== "") return;
+      const n = Math.max(1, Math.min(1024, field.generate_random_bytes | 0));
+      const buf = new Uint8Array(n);
+      crypto.getRandomValues(buf);
+      input.value = Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+      // Briefly flash the field so the user sees it was auto-filled. The
+      // CSS animation handle is just a class — feel free to drop it if it
+      // becomes noisy.
+      input.classList.add('just-filled');
+      setTimeout(() => input.classList.remove('just-filled'), 1200);
+    });
+  }
+
+  // Re-collect task config AFTER any pre-fill. When encrypt is off we send
+  // empty values; the server's `forward()` ignores the task config in that
+  // case.
+  const taskCfg = {};
+  if (taskGrid && encryptOn) {
+    plugin.task_fields.forEach(field => {
+      taskCfg[field.key] = readField(card, field);
+    });
+  }
+
+  // Drop nulls so plugin defaults can kick in for unset fields.
+  for (const k of Object.keys(taskCfg)) {
+    if (taskCfg[k] === null) delete taskCfg[k];
+  }
+  for (const k of Object.keys(params)) {
+    if (params[k] === null) delete params[k];
+  }
+  const resultBox = card.querySelector('[data-role="result"]');
+  resultBox.style.display = "";
+  resultBox.textContent = "执行中…";
+  try {
+    const r = await api(`/api/plugins/${plugin.id}/forward`, {
+      method: "POST",
+      body: JSON.stringify({ task: taskCfg, params }),
+    });
+    renderForwardResult(resultBox, r);
+    toast("执行成功", "ok");
+  } catch (e) {
+    resultBox.textContent = "失败：" + e.message;
+    resultBox.style.color = "var(--bad)";
+    toast("执行失败：" + e.message, "error");
+  }
+}
+
+function renderForwardResult(box, r) {
+  box.style.color = "";
+  box.innerHTML = "";
+  if (r.message) {
+    const msg = document.createElement("div");
+    msg.style.color = "var(--good)";
+    msg.style.marginBottom = "6px";
+    msg.textContent = r.message;
+    box.appendChild(msg);
+  }
+  const meta = document.createElement("div");
+  meta.style.fontSize = "11px";
+  meta.style.color = "var(--muted)";
+  meta.style.marginBottom = "6px";
+  meta.textContent = `输入 ${fmtBytes(r.bytes_in)} → 输出 ${fmtBytes(r.bytes_out)}`;
+  box.appendChild(meta);
+
+  // Volume list: rendered separately from the secrets so the user can copy
+  // each output path independently. ChaCha20's forward returns
+  // `info.volumes = [{ path, size }, ...]` for both single- and multi-volume
+  // modes; we surface them as a column of clickable rows.
+  if (Array.isArray(r.info && r.info.volumes) && r.info.volumes.length) {
+    const wrap = document.createElement('div');
+    wrap.style.marginBottom = '8px';
+    const title = document.createElement('div');
+    title.style.fontSize = '11px';
+    title.style.color = 'var(--muted)';
+    title.style.marginBottom = '4px';
+    title.textContent = `输出文件 (${r.info.volumes.length})`;
+    wrap.appendChild(title);
+    r.info.volumes.forEach((vol, i) => {
+      const row = document.createElement('div');
+      row.className = 'secret-row';
+      const k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = `卷${String(i + 1).padStart(2, '0')}`;
+      const v = document.createElement('span');
+      v.className = 'v';
+      v.textContent = `${vol.path} (${fmtBytes(vol.size)})`;
+      const btn = document.createElement('button');
+      btn.className = 'copy-btn';
+      btn.textContent = '复制路径';
+      btn.addEventListener('click', () => copyToClipboard(vol.path, btn));
+      row.appendChild(k);
+      row.appendChild(v);
+      row.appendChild(btn);
+      wrap.appendChild(row);
+    });
+    box.appendChild(wrap);
+  }
+
+  // Show every other key in `info` with a copy button for the value. We
+  // skip `volumes` (rendered above), `total_size`/`volume_count` (already
+  // visible via the meta line and the volume list), and the boolean
+  // `generated_*` flags (low signal once the user can see the secrets).
+  const skip = new Set(['volumes', 'total_size', 'volume_count',
+                         'generated_key', 'generated_nonce']);
+  Object.entries(r.info || {}).forEach(([k, v]) => {
+    if (skip.has(k)) return;
+    const row = document.createElement("div");
+    row.className = "secret-row";
+    const kspan = document.createElement("span");
+    kspan.className = "k";
+    kspan.textContent = k + ":";
+    const vspan = document.createElement("span");
+    vspan.className = "v";
+    const strv = typeof v === "string" ? v : JSON.stringify(v);
+    vspan.textContent = strv;
+    row.appendChild(kspan);
+    row.appendChild(vspan);
+    if (typeof v === "string" && v.length > 0) {
+      const btn = document.createElement("button");
+      btn.className = "copy-btn";
+      btn.textContent = "复制";
+      btn.addEventListener("click", () => copyToClipboard(strv, btn));
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+  });
+}
+
+/* Hook the per-task plugin slots into the existing create/edit lifecycle.
+ * The hooks live after the original code, so they patch in rather than
+ * replacing anything — keeps the diff localized. */
+const _originalOpenCreate = openCreate;
+openCreate = async function() {
+  _originalOpenCreate.call(this);
+  await refreshPluginCatalog();
+  const draft = loadCreateDraft();
+  const slots = (draft && Array.isArray(draft.plugins)) ? draft.plugins : [];
+  renderTaskPluginSlots("f", slots);
+};
+// IMPORTANT: rebind. `$("#btn-open-create").onclick = openCreate;` ran
+// earlier in the script with the *original* function value, so without this
+// the button still calls the un-patched openCreate (no plugin section).
+$("#btn-open-create").onclick = openCreate;
+
+const _originalOpenEdit = openEdit;
+openEdit = async function(id) {
+  _originalOpenEdit.call(this, id);
+  const t = lastTasks.find(x => x.task_id === id);
+  await refreshPluginCatalog();
+  renderTaskPluginSlots("e", (t && Array.isArray(t.config.plugins)) ? t.config.plugins : []);
+};
+
+// Patch saveCreateDraft to also persist plugin slots.
+const _originalSaveCreateDraft = saveCreateDraft;
+saveCreateDraft = function() {
+  _originalSaveCreateDraft.call(this);
+  if (!$("#create-modal").classList.contains("show")) return;
+  try {
+    const raw = localStorage.getItem(CREATE_DRAFT_KEY);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    d.plugins = readTaskPluginSlots("f");
+    localStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(d));
+  } catch {}
+};
+
+// Hook into the create-submit payload via DOM intercept on the button. The
+// existing handler reads form fields synchronously, so we wrap by adding our
+// plugin slots into the payload before fetch fires. Simplest path: replace
+// the button's onclick.
+const _origCreateClick = $("#btn-create").onclick;
+$("#btn-create").onclick = async () => {
+  const u = validateVolumes("f", $("#urls-count"));
+  const s = validateSplit($("#f-split"), $("#f-split-hint"));
+  const h = validateHeaders($("#f-headers"), $("#headers-status"));
+  const r = validateRate($("#f-rate"));
+  if (!(u.valid && s.valid && h.valid && r.valid)) return;
+  const slots = readTaskPluginSlots("f").filter(s => s.enabled || (s.config && Object.values(s.config).some(v => v !== null && v !== "")));
+  const payload = {
+    volumes: u.volumes,
+    max_threads: parseInt($("#f-threads").value, 10) || 8,
+    max_split: s.value,
+    cache: $("#f-cache").checked,
+    persist: $("#f-persist").checked,
+    headers: h.headers,
+    name: $("#f-name").value.trim() || null,
+    output_filename: $("#f-output-filename").value.trim() || null,
+    auto_filename: $("#f-auto-filename").checked,
+    rate_limit_bps: r.value || 0,
+    rate_limit_algorithm: $("#f-algorithm").value,
+    plugins: slots,
+  };
+  try {
+    const res = await api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
+    toast("已创建：" + res.proxy_url, "ok");
+    closeCreate();
+    clearCreateDraft();
+    refresh();
+  } catch (e) {
+    toast("创建失败：" + e.message, "error");
+  }
+};
+
+// Same for the edit-save button.
+$("#btn-edit-save").onclick = async () => {
+  if (!editingId) return;
+  const u = validateVolumes("e", $("#e-urls-count"));
+  const s = validateSplit($("#e-split"), $("#e-split-hint"));
+  const h = validateHeaders($("#e-headers"), $("#e-headers-status"));
+  const r = validateRate($("#e-rate"));
+  if (!(u.valid && s.valid && h.valid && r.valid)) return;
+  const slots = readTaskPluginSlots("e");
+  const payload = {
+    volumes: u.volumes,
+    max_threads: parseInt($("#e-threads").value, 10) || 8,
+    max_split: s.value,
+    headers: h.headers,
+    name: $("#e-name").value.trim() || null,
+    output_filename: $("#e-output-filename").value.trim() || null,
+    auto_filename: $("#e-auto-filename").checked,
+    cache: $("#e-cache").checked,
+    persist: $("#e-persist").checked,
+    rate_limit_bps: r.value || 0,
+    rate_limit_algorithm: $("#e-algorithm").value,
+    plugins: slots,
+  };
+  try {
+    await api(`/api/tasks/${editingId}`, { method: "PATCH", body: JSON.stringify(payload) });
+    toast("配置已保存", "ok");
+    closeEdit();
+    refresh();
+  } catch (e) {
+    toast("保存失败：" + e.message, "error");
+  }
+};
+
+// Esc inside plugins modal closes it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("#plugins-modal").classList.contains("show")) {
+    closePluginsModal();
   }
 });
 

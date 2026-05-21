@@ -100,11 +100,24 @@ pub struct CacheEntry {
     pub meta: CacheMeta,
     file: Mutex<std::fs::File>,
     bitmap: Mutex<Vec<u8>>,
-    /// In-memory only: bytes written so far per block. Used to detect when a
-    /// block becomes fully cached across many small writes from
-    /// `reqwest::bytes_stream`. Not persisted — on restart, partial blocks
-    /// just need to be refetched, which is correct fallback behaviour.
-    partial: Mutex<Vec<u32>>,
+    /// In-memory only: **per-block set of covered byte intervals (relative to
+    /// the block start)**. A block is marked complete only when the merged
+    /// union of its intervals covers `[0, block_len)`.
+    ///
+    /// Why intervals and not a simple byte-counter? Two concurrent fetchers
+    /// can each contribute bytes to the same block (e.g. a browser opens
+    /// parallel HTTP connections, or the engine warms up multiple chunks
+    /// that fall in the same block). A counter would happily mark a block
+    /// "complete" the moment `sum(contributed) >= block_len`, even when
+    /// those contributions overlap on disk — leaving holes that read back
+    /// as zeros, which then XOR with the keystream to produce garbage in
+    /// transformed (encrypted) tasks.
+    ///
+    /// Stored as `(u32, u32)` `[lo, hi]` exclusive-end pairs. Block size is
+    /// capped at 1 MiB elsewhere so u32 is comfortable; intervals are kept
+    /// sorted + merged on every write so the inner Vec stays tiny in the
+    /// common (sequential-write) case.
+    partial: Mutex<Vec<Vec<(u32, u32)>>>,
     pub bytes_cached: AtomicU64,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -140,10 +153,10 @@ impl CacheEntry {
         Ok(Bytes::from(buf))
     }
 
-    /// Write `data` at absolute offset `start`. Each call tracks how many
-    /// bytes of each touched block are now on disk; when the cumulative
-    /// total for a block reaches its full length, the bit is flipped and
-    /// `bytes_cached` increments by the block's true length.
+    /// Write `data` at absolute offset `start`. Each call updates the
+    /// per-block interval set with the slice it contributed; a block is
+    /// marked complete only when the merged union covers `[0, block_len)`.
+    /// See the field doc on `partial` for why this isn't a byte counter.
     pub fn write_range(&self, start: u64, data: &[u8]) -> std::io::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -172,16 +185,14 @@ impl CacheEntry {
 
                 let in_start = start.max(block_start);
                 let in_end = end.min(block_end);
-                let contributed = in_end - in_start + 1;
+                let lo = (in_start - block_start) as u32;
+                let hi = (in_end - block_start + 1) as u32;
 
-                let slot = partial.get_mut(b as usize);
-                let cur = slot.as_ref().map(|s| **s as u64).unwrap_or(0);
-                let new_total = (cur + contributed).min(bl);
-                if let Some(s) = slot {
-                    *s = new_total as u32;
-                }
-                if new_total >= bl {
-                    newly_complete.push(b);
+                if let Some(slot) = partial.get_mut(b as usize) {
+                    merge_interval(slot, lo, hi);
+                    if interval_set_covers(slot, bl as u32) {
+                        newly_complete.push(b);
+                    }
                 }
             }
         }
@@ -190,12 +201,21 @@ impl CacheEntry {
             let mut total_bytes_marked: u64 = 0;
             {
                 let mut bm = self.bitmap.lock();
+                let mut partial = self.partial.lock();
                 for b in &newly_complete {
                     let byte_idx = (b / 8) as usize;
                     let bit = (b % 8) as u8;
                     if byte_idx < bm.len() && (bm[byte_idx] >> bit) & 1 == 0 {
                         bm[byte_idx] |= 1 << bit;
                         total_bytes_marked += self.block_len(*b);
+                        // Block is now permanently in the bitmap — we don't
+                        // need the interval set any more. Reclaim the Vec
+                        // capacity (a long-running task with many blocks
+                        // would otherwise hold onto megabytes of stale
+                        // interval buffers).
+                        if let Some(slot) = partial.get_mut(*b as usize) {
+                            *slot = Vec::new();
+                        }
                     }
                 }
             }
@@ -422,7 +442,7 @@ impl CacheStore {
             root: dir,
             file: Mutex::new(f),
             bitmap: Mutex::new(bm),
-            partial: Mutex::new(vec![0u32; block_count as usize]),
+            partial: Mutex::new(vec![Vec::new(); block_count as usize]),
             bytes_cached: AtomicU64::new(bytes_cached),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -476,5 +496,141 @@ fn cache_meta_compatible(stored: &CacheMeta, desired: &CacheMeta) -> bool {
         // Asymmetric: treat as a mismatch — safer to refetch than to serve
         // possibly-stale bytes.
         _ => false,
+    }
+}
+
+/// Insert `[lo, hi)` into a sorted, non-overlapping interval list. Merges
+/// any neighbours it touches so the list stays minimal — in steady state
+/// (a single sequential writer per block) `set` collapses to one entry.
+///
+/// Pure data, no I/O. Called under the `partial` mutex.
+fn merge_interval(set: &mut Vec<(u32, u32)>, lo: u32, hi: u32) {
+    if hi <= lo {
+        return;
+    }
+    // Find the first interval whose `end >= lo`. Everything before it ends
+    // strictly to the left of `lo` and is unaffected.
+    let i = match set.iter().position(|&(_, e)| e >= lo) {
+        Some(i) => i,
+        None => {
+            // New interval extends past every existing one — append.
+            set.push((lo, hi));
+            return;
+        }
+    };
+    // If interval i starts after hi, the new interval is fully to the left
+    // of it; insert and return.
+    if set[i].0 > hi {
+        set.insert(i, (lo, hi));
+        return;
+    }
+    // Overlap (or touches): swallow interval i into the merged window.
+    let mut merged_lo = set[i].0.min(lo);
+    let mut merged_hi = set[i].1.max(hi);
+    // Keep swallowing subsequent intervals while they overlap with the
+    // growing window.
+    let mut j = i + 1;
+    while j < set.len() && set[j].0 <= merged_hi {
+        merged_hi = merged_hi.max(set[j].1);
+        merged_lo = merged_lo.min(set[j].0);
+        j += 1;
+    }
+    set.drain(i + 1..j);
+    set[i] = (merged_lo, merged_hi);
+}
+
+/// True iff the merged interval list covers `[0, block_len)` exactly — i.e.
+/// every byte of the block has been written. With `merge_interval` keeping
+/// the set sorted + minimal, full coverage = exactly one entry `(0, block_len)`.
+fn interval_set_covers(set: &[(u32, u32)], block_len: u32) -> bool {
+    set.len() == 1 && set[0].0 == 0 && set[0].1 >= block_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_interval_appends_disjoint_right() {
+        let mut s = vec![(0u32, 10u32)];
+        merge_interval(&mut s, 20, 30);
+        assert_eq!(s, vec![(0, 10), (20, 30)]);
+    }
+
+    #[test]
+    fn merge_interval_inserts_disjoint_left() {
+        let mut s = vec![(20u32, 30u32)];
+        merge_interval(&mut s, 0, 10);
+        assert_eq!(s, vec![(0, 10), (20, 30)]);
+    }
+
+    #[test]
+    fn merge_interval_fuses_touching_intervals() {
+        // Touch on the right edge: [0,10) + [10,20) → [0,20)
+        let mut s = vec![(0u32, 10u32)];
+        merge_interval(&mut s, 10, 20);
+        assert_eq!(s, vec![(0, 20)]);
+    }
+
+    #[test]
+    fn merge_interval_subsumes_overlapping_chain() {
+        // Existing: [0,5), [10,15), [20,25)
+        // Insert [3,22) → swallows all three into [0,25)
+        let mut s = vec![(0u32, 5u32), (10, 15), (20, 25)];
+        merge_interval(&mut s, 3, 22);
+        assert_eq!(s, vec![(0, 25)]);
+    }
+
+    #[test]
+    fn merge_interval_ignores_duplicate_writes() {
+        let mut s = vec![(0u32, 100u32)];
+        merge_interval(&mut s, 0, 100);
+        assert_eq!(s, vec![(0, 100)]);
+        merge_interval(&mut s, 40, 60);
+        assert_eq!(s, vec![(0, 100)]);
+    }
+
+    #[test]
+    fn interval_set_covers_requires_single_full_span() {
+        assert!(interval_set_covers(&[(0, 100)], 100));
+        // Holes — must not be considered complete.
+        assert!(!interval_set_covers(&[(0, 50), (60, 100)], 100));
+        // Coverage with a gap at the start.
+        assert!(!interval_set_covers(&[(1, 100)], 100));
+        // Coverage that exceeds is still OK (callers cap to block_len).
+        assert!(interval_set_covers(&[(0, 150)], 100));
+    }
+
+    /// **The regression test for the playback-tearing bug.** Two concurrent
+    /// writers contribute byte ranges that overlap inside one block. A
+    /// byte-counter implementation would mark the block complete the moment
+    /// `sum(contributed) >= block_len`, leaving a hole that reads back as
+    /// zeros. The interval set must require true coverage.
+    #[test]
+    fn overlapping_writes_do_not_falsely_complete_block() {
+        let mut s: Vec<(u32, u32)> = Vec::new();
+        let block_len = 1024u32;
+        // Writer A: contributes [0, 600) — 600 bytes.
+        merge_interval(&mut s, 0, 600);
+        // Writer B: contributes [400, 1024) — 624 bytes.
+        merge_interval(&mut s, 400, 1024);
+        // Total bytes "contributed" = 600 + 624 = 1224 > 1024,
+        // but the union [0, 1024) does cover the block — so this is
+        // legitimately complete. The interesting case is when they overlap
+        // BUT leave a hole:
+        assert!(interval_set_covers(&s, block_len));
+
+        let mut s2: Vec<(u32, u32)> = Vec::new();
+        // Writer A: [0, 700)
+        merge_interval(&mut s2, 0, 700);
+        // Writer B: [300, 1000) — overlaps A but leaves [1000, 1024) untouched.
+        merge_interval(&mut s2, 300, 1000);
+        // Counter-based logic: contributed = 700 + 700 = 1400, hits 1024 →
+        // **falsely** marks complete. Interval logic correctly refuses.
+        assert!(!interval_set_covers(&s2, block_len));
+
+        // Filling the tail finally completes it.
+        merge_interval(&mut s2, 1000, 1024);
+        assert!(interval_set_covers(&s2, block_len));
     }
 }

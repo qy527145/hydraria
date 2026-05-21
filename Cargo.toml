@@ -1,6 +1,6 @@
 [package]
 name = "hydraria"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "High-performance multi-threaded HTTP streaming proxy with web dashboard"
 license = "Apache-2.0"
@@ -30,6 +30,9 @@ async-stream = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 dirs = "5.0"
+chacha20 = "0.9"
+rand = "0.8"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

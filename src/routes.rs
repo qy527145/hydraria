@@ -1,10 +1,12 @@
 use crate::cache::{CacheEntry, CacheMeta};
 use crate::engine::{Engine, UpstreamProbe, parse_range_header, suggest_volume_filename};
 use crate::error::ProxyError;
+use crate::fs_pick::{self, PickRequest, PickResponse};
 use crate::models::{
     AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskMode,
     TaskUpdate, short_id,
 };
+use crate::plugins::{ForwardResult, PluginInfo};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -91,6 +93,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/global", get(get_global))
+        .route("/api/plugins", get(list_plugins))
+        .route(
+            "/api/plugins/{plugin_id}/global",
+            get(get_plugin_global).put(put_plugin_global),
+        )
+        .route("/api/plugins/{plugin_id}/forward", post(plugin_forward))
+        .route("/api/fs/pick", post(fs_pick_handler))
+        .route("/api/fs/info", get(fs_info))
         .route("/stream/{task_id}", get(stream_task).head(stream_task_head))
         .route("/", get(crate::assets::serve_index))
         .route("/healthz", get(|| async { "ok" }))
@@ -174,6 +184,7 @@ async fn probe_urls(
         rate_limit_bps: 0,
         rate_limit_algorithm: Default::default(),
         persist: false,
+        plugins: Vec::new(),
     };
     cfg.normalize();
     let layout = cfg.effective_volumes();
@@ -358,6 +369,27 @@ async fn handle_stream(
     //   auto_filename=false → output_filename (None ⇒ no Content-Disposition)
     probe.filename = resolve_served_filename(&cfg, probe.filename.take());
 
+    // Plugin pipeline active? Then the upstream's Content-Type describes
+    // CIPHERTEXT (typically `application/octet-stream` from a CDN), not the
+    // payload we're about to serve. Override using the served filename's
+    // extension when that produces something more specific — otherwise
+    // <video>/<audio> tags happily download but refuse to render.
+    if cfg.plugins.iter().any(|p| p.enabled) {
+        if let Some(name) = &probe.filename {
+            let guessed = mime_guess::from_path(name).first_or_octet_stream();
+            let g = guessed.essence_str();
+            if g != "application/octet-stream"
+                && probe.content_type.as_deref() != Some(g)
+            {
+                tracing::debug!(
+                    "task={} plugin pipeline active; overriding Content-Type from upstream {:?} → {} (from filename '{}')",
+                    task_id, probe.content_type, g, name,
+                );
+                probe.content_type = Some(g.to_string());
+            }
+        }
+    }
+
     // Resolve cache entry up-front when (a) the task wants caching, (b) the
     // upstream supports ranges, and (c) we know a real total size. Any
     // mismatch with previously-stored meta wipes the on-disk cache and
@@ -378,11 +410,28 @@ async fn handle_stream(
     );
 
     let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
+    // Build the plugin transform pipeline from the task's enabled plugins
+    // plus the global per-plugin config. A build failure here (e.g. wrong
+    // key length) becomes a 5xx so the user notices immediately rather
+    // than getting silently garbled bytes.
+    let pipeline = {
+        let globals = state.settings.read().plugin_globals.clone();
+        state
+            .plugins
+            .build_pipeline(&cfg.plugins, &globals)
+            .map_err(ProxyError::Internal)?
+    };
+    let pipeline = if pipeline.is_empty() {
+        None
+    } else {
+        Some(Arc::new(pipeline))
+    };
     let engine = Arc::new(
         engine
             .with_cache(cache_entry.clone())
             .with_health(health)
-            .with_volumes(probe.volumes.clone()),
+            .with_volumes(probe.volumes.clone())
+            .with_pipeline(pipeline),
     );
 
     build_stream_response(state, task_id, entry, engine, probe, range_header, head_only)
@@ -517,19 +566,39 @@ async fn build_stream_response(
         let state_for_count = state.clone();
         let task_limiter = Arc::clone(&entry.limiter);
         let global_limiter = Arc::clone(&state.global_limiter);
+        let engine_for_transform = Arc::clone(&engine);
+        // Passthrough = single linear stream from upstream byte 0. Track the
+        // running merged offset across chunks so the plugin pipeline (if any)
+        // sees each byte's true position in the file. `Mutex<u64>` rather
+        // than atomic because we read+write atomically per chunk and the
+        // mutex is uncontended (chunks process strictly in order here).
+        let merged_cursor = Arc::new(parking_lot::Mutex::new(0u64));
         let stream = upstream.bytes_stream().then(move |item| {
             let entry_for_count = Arc::clone(&entry_for_count);
             let state_for_count = state_for_count.clone();
             let task_limiter = Arc::clone(&task_limiter);
             let global_limiter = Arc::clone(&global_limiter);
+            let engine_for_transform = Arc::clone(&engine_for_transform);
+            let merged_cursor = Arc::clone(&merged_cursor);
             async move {
-                if let Ok(ref b) = item {
-                    let n = b.len() as u64;
-                    global_limiter.acquire(n).await;
-                    task_limiter.acquire(n).await;
-                    entry_for_count.count_bytes(n);
-                    state_for_count.count_bytes_global(n);
-                }
+                let item = match item {
+                    Ok(b) => {
+                        let n = b.len() as u64;
+                        let merged_offset = {
+                            let mut c = merged_cursor.lock();
+                            let off = *c;
+                            *c += n;
+                            off
+                        };
+                        let b = engine_for_transform.transform_outgoing_public(merged_offset, b);
+                        global_limiter.acquire(n).await;
+                        task_limiter.acquire(n).await;
+                        entry_for_count.count_bytes(n);
+                        state_for_count.count_bytes_global(n);
+                        Ok(b)
+                    }
+                    Err(e) => Err(e),
+                };
                 item
             }
         });
@@ -662,4 +731,148 @@ fn percent_encode_rfc5987(s: &str) -> String {
         }
     }
     out
+}
+
+/// Aggregated metadata for one plugin: registry-defined fields + the
+/// **current** global config in effect. `global` is always populated — when
+/// the user hasn't customized anything, it's the plugin's defaults.
+#[derive(Serialize)]
+struct PluginEntry {
+    #[serde(flatten)]
+    info: PluginInfo,
+    global: serde_json::Value,
+}
+
+/// `GET /api/plugins` — list every registered plugin with metadata + current
+/// global config. The dashboard uses this to render config forms and decide
+/// whether to expose a forward (tool) panel.
+async fn list_plugins(State(state): State<AppState>) -> Json<Vec<PluginEntry>> {
+    let globals = state.settings.read().plugin_globals.clone();
+    let mut out: Vec<PluginEntry> = Vec::new();
+    for info in state.plugins.info_list(&globals) {
+        let global = globals
+            .get(&info.id)
+            .cloned()
+            .unwrap_or_else(|| info.default_global.clone());
+        out.push(PluginEntry { info, global });
+    }
+    Json(out)
+}
+
+/// `GET /api/plugins/:plugin_id/global` — single-plugin variant of the
+/// listing endpoint, handy for refreshing one config block without
+/// re-fetching the whole catalog.
+async fn get_plugin_global(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    state
+        .plugins
+        .get(&plugin_id)
+        .ok_or_else(|| ProxyError::Internal(format!("unknown plugin: {plugin_id}")))?;
+    let g = state
+        .settings
+        .read()
+        .plugin_globals
+        .get(&plugin_id)
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    Ok(Json(g))
+}
+
+/// `PUT /api/plugins/:plugin_id/global` — overwrite the global config for
+/// one plugin. Validated against the plugin's own schema before being
+/// committed; bad values surface as 400-ish errors back to the form.
+async fn put_plugin_global(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(value): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    let plugin = state
+        .plugins
+        .get(&plugin_id)
+        .ok_or_else(|| ProxyError::Internal(format!("unknown plugin: {plugin_id}")))?;
+    plugin
+        .validate_global_config(&value)
+        .map_err(|e| ProxyError::Internal(format!("invalid global config: {e}")))?;
+    {
+        let mut s = state.settings.write();
+        s.plugin_globals.insert(plugin_id.clone(), value.clone());
+    }
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct ForwardReq {
+    /// Per-task config — same shape that would go in `TaskConfig.plugins[i].config`.
+    /// Optional: when omitted, the plugin's defaults are used (and if
+    /// `generate_missing` is enabled, fresh secrets are generated).
+    #[serde(default)]
+    task: serde_json::Value,
+    /// Forward-only parameters (input/output paths, etc.).
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// `POST /api/plugins/:plugin_id/forward` — run the plugin's sender-side
+/// operation. For ChaCha20 this reads a local plaintext file and writes its
+/// ciphertext to another local path, returning the (possibly auto-generated)
+/// key+nonce for the user to paste into the matching task config.
+///
+/// File IO runs on a blocking pool so it doesn't stall the tokio runtime —
+/// the operation can be multi-GB on a fast disk.
+async fn plugin_forward(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(req): Json<ForwardReq>,
+) -> Result<Json<ForwardResult>, ProxyError> {
+    let plugin = state
+        .plugins
+        .get(&plugin_id)
+        .ok_or_else(|| ProxyError::Internal(format!("unknown plugin: {plugin_id}")))?;
+    if !plugin.has_forward() {
+        return Err(ProxyError::Internal(format!(
+            "plugin '{plugin_id}' does not expose a forward tool"
+        )));
+    }
+    let global = state
+        .settings
+        .read()
+        .plugin_globals
+        .get(&plugin_id)
+        .cloned()
+        .unwrap_or_else(|| plugin.default_global_config());
+
+    let plugin_for_blocking = Arc::clone(&plugin);
+    let result = tokio::task::spawn_blocking(move || {
+        plugin_for_blocking.forward(&global, &req.task, &req.params)
+    })
+    .await
+    .map_err(|e| ProxyError::Internal(format!("forward task join: {e}")))?
+    .map_err(ProxyError::Internal)?;
+    Ok(Json(result))
+}
+
+/// `GET /api/fs/info` — small capability probe so the UI knows whether to
+/// render "Browse..." buttons. Avoids having the UI guess from `navigator.userAgent`.
+async fn fs_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "picker_supported": fs_pick::is_supported(),
+        "platform": std::env::consts::OS,
+    }))
+}
+
+/// `POST /api/fs/pick` — pop a native open-file / open-dir / save-as dialog
+/// and return the user's selection. Runs on the blocking pool because the
+/// OS dialog is synchronous (and may sit for minutes if the user takes
+/// their time).
+async fn fs_pick_handler(
+    State(_state): State<AppState>,
+    Json(req): Json<PickRequest>,
+) -> Result<Json<PickResponse>, ProxyError> {
+    let resp = tokio::task::spawn_blocking(move || fs_pick::pick(req))
+        .await
+        .map_err(|e| ProxyError::Internal(format!("fs/pick task join: {e}")))?
+        .map_err(ProxyError::Internal)?;
+    Ok(Json(resp))
 }

@@ -114,11 +114,13 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         .unwrap_or_else(|| home_subdir("tasks.json"));
 
     let addr: SocketAddr = cli.bind.parse()?;
+    let plugins = hydraria::plugins::default_registry();
     let state = AppState::new(
         cli.bind.clone(),
         cache,
         state_file.clone(),
         GlobalSettings::default(),
+        plugins,
     );
     let state = Arc::new(state);
 

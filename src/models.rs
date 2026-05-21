@@ -1,4 +1,5 @@
 use crate::cache::CacheStats;
+use crate::plugins::{PluginRegistry, TaskPluginConfig};
 use crate::ratelimit::{Algorithm, Limiter};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,12 @@ pub struct TaskConfig {
     /// Persist this task across restarts.
     #[serde(default)]
     pub persist: bool,
+    /// Post-processing plugins applied to bytes on the proxy → client path.
+    /// Stored in **forward order** (sender's pre-distribution application
+    /// order); the engine applies them in reverse on the receive path so
+    /// chained transforms like compress→encrypt undo correctly.
+    #[serde(default)]
+    pub plugins: Vec<TaskPluginConfig>,
 }
 
 fn default_threads() -> usize {
@@ -159,6 +166,7 @@ pub struct TaskUpdate {
     pub rate_limit_bps: Option<u64>,
     pub rate_limit_algorithm: Option<Algorithm>,
     pub persist: Option<bool>,
+    pub plugins: Option<Vec<TaskPluginConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -463,6 +471,9 @@ impl TaskEntry {
         if let Some(p) = upd.persist {
             cfg.persist = p;
         }
+        if let Some(pl) = upd.plugins {
+            cfg.plugins = pl;
+        }
         Ok(())
     }
 
@@ -498,6 +509,10 @@ pub struct GlobalSettings {
     pub global_rate_limit_bps: u64,
     #[serde(default)]
     pub global_rate_limit_algorithm: Algorithm,
+    /// Per-plugin global config blob, keyed by plugin id. The plugin
+    /// interprets its own value (e.g. ChaCha20 stores I/O buffer size here).
+    #[serde(default)]
+    pub plugin_globals: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -505,6 +520,7 @@ pub struct GlobalSettingsUpdate {
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub global_rate_limit_bps: Option<u64>,
     pub global_rate_limit_algorithm: Option<Algorithm>,
+    pub plugin_globals: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -528,6 +544,7 @@ pub struct AppState {
     pub global_throughput: Arc<ThroughputSampler>,
     pub global_window_bytes: Arc<AtomicU64>,
     pub persist_path: Arc<std::path::PathBuf>,
+    pub plugins: Arc<PluginRegistry>,
 }
 
 impl AppState {
@@ -536,6 +553,7 @@ impl AppState {
         cache: Arc<crate::cache::CacheStore>,
         persist_path: std::path::PathBuf,
         settings: GlobalSettings,
+        plugins: Arc<PluginRegistry>,
     ) -> Self {
         let limiter = Arc::new(Limiter::new(
             settings.global_rate_limit_bps,
@@ -550,6 +568,7 @@ impl AppState {
             global_throughput: Arc::new(ThroughputSampler::new(60)),
             global_window_bytes: Arc::new(AtomicU64::new(0)),
             persist_path: Arc::new(persist_path),
+            plugins,
         }
     }
 
@@ -644,6 +663,21 @@ impl AppState {
         if let Some(a) = upd.global_rate_limit_algorithm {
             s.global_rate_limit_algorithm = a;
             self.global_limiter.set_algorithm(a);
+        }
+        if let Some(pg) = upd.plugin_globals {
+            // Validate each plugin's new config against its own schema before
+            // committing — a bad value here would otherwise only surface
+            // when a task next streams (annoying to debug).
+            for (id, value) in &pg {
+                if let Some(plugin) = self.plugins.get(id) {
+                    plugin
+                        .validate_global_config(value)
+                        .map_err(|e| format!("plugin '{}' global config: {}", id, e))?;
+                }
+                // Unknown plugin ids are accepted but logged — keeps
+                // forward-compat with plugins added in a future build.
+            }
+            s.plugin_globals = pg;
         }
         Ok(s.clone())
     }
@@ -794,6 +828,16 @@ impl AppState {
         let s = self.settings.read();
         s.global_rate_limit_bps.hash(&mut hasher);
         (s.global_rate_limit_algorithm as u8).hash(&mut hasher);
+        // Plugin globals: hash the (id, serialized-config) pairs in stable
+        // key order so reorderings don't appear as a change.
+        let mut pg_keys: Vec<&String> = s.plugin_globals.keys().collect();
+        pg_keys.sort();
+        for k in pg_keys {
+            k.hash(&mut hasher);
+            if let Some(v) = s.plugin_globals.get(k) {
+                serde_json::to_string(v).unwrap_or_default().hash(&mut hasher);
+            }
+        }
         drop(s);
         for (id, e) in self.tasks.read().iter() {
             let cfg = e.config.read();
@@ -820,6 +864,16 @@ impl AppState {
             for (k, v) in &cfg.headers {
                 k.hash(&mut hasher);
                 v.hash(&mut hasher);
+            }
+            // Plugin slots: id + enabled + serialized config. Same plugin
+            // listed twice (legal but unusual) hashes correctly because each
+            // slot contributes independently.
+            for pc in &cfg.plugins {
+                pc.id.hash(&mut hasher);
+                pc.enabled.hash(&mut hasher);
+                serde_json::to_string(&pc.config)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
             }
             e.paused.load(Ordering::Relaxed).hash(&mut hasher);
         }
