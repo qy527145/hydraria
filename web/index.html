@@ -321,6 +321,18 @@
     background: var(--good);
     border-color: var(--good);
   }
+  /* Generic "just copied" flash for ANY button (overflow-menu items,
+     ghost actions, etc.). The class is toggled for 1.5s after a clipboard
+     write succeeds; we deliberately keep the button's text label intact so
+     the surrounding row doesn't reflow mid-click. The keyframe pulses the
+     background green and back to transparent. */
+  @keyframes hydraria-btn-copied {
+    0%   { background: rgba(74, 222, 128, 0.55); color: #0a0c12; }
+    100% { background: transparent; }
+  }
+  button.copied:not(.copy-btn) {
+    animation: hydraria-btn-copied 1.5s ease-out;
+  }
 
   .task-meta {
     display: grid;
@@ -394,6 +406,44 @@
     flex-wrap: wrap;
   }
   .task-actions .spacer { flex: 1; }
+
+  /* Overflow menu for secondary task actions. Sits inside `.menu-wrap`
+     (which is positioned relative) so the absolute-positioned dropdown
+     anchors to the trigger button. Hidden by default; the `.show` class
+     toggles display. */
+  .menu-wrap { position: relative; display: inline-flex; }
+  .menu {
+    position: absolute;
+    top: 100%; right: 0;
+    margin-top: 4px;
+    display: none;
+    flex-direction: column;
+    min-width: 180px;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    padding: 4px;
+    z-index: 30;
+  }
+  .menu.show { display: flex; }
+  .menu .menu-item {
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    text-align: left;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    box-shadow: none;
+    transform: none;
+    transition: background 0.1s;
+  }
+  .menu .menu-item:hover { background: var(--panel-3); transform: none; box-shadow: none; }
+  .menu .menu-item.danger { color: var(--bad); }
+  .menu .menu-item.danger:hover { background: rgba(248, 113, 113, 0.1); }
 
   /* Source health panel */
   .health-panel {
@@ -1101,6 +1151,12 @@ let viewMode = localStorage.getItem("hydraria.view") || "grid";
 let searchQuery = "";
 let expandedTaskId = null;
 let editingId = null;
+// Which task's overflow ("⋯ 更多") menu is currently open, if any. Persists
+// across the 1.5s refresh tick so the menu doesn't blink shut every time we
+// re-render the task container. Set by the ⋯ click handler, restored by
+// `attachCardEvents`, cleared by document-level outside-click + by the menu
+// items themselves after they fire.
+let openMenuTaskId = null;
 
 const SPLIT_RE = /^\s*[0-9]+(\.[0-9]+)?\s*([kKmMgG][bB]?|[bB])?\s*$/;
 
@@ -1381,18 +1437,33 @@ function taskCard(t) {
   </div>`;
 }
 
+// Primary actions stay inline; everything else folds into a "⋯ 更多"
+// dropdown so the action row doesn't push 5-7 buttons in a wrap. The menu
+// is rebuilt every render — fine because it's tiny — and shows on the
+// button's click. A single document-level handler closes any open menu
+// when you click anywhere else (`closeAllMenus`, wired below).
 function actionsHtml(t) {
+  const cache = !!t.cache;
+  // Each menu item gets the same `data-*` attributes the existing
+  // `attachCardEvents` handlers already look for, so we don't need a
+  // second wiring path — moving a button into the menu is just markup.
+  const menuItems = [
+    `<button class="menu-item" data-clone="${t.task_id}">⎘ 克隆配置</button>`,
+    `<button class="menu-item" data-export="${t.task_id}">↧ 导出 JSON 文件</button>`,
+    `<button class="menu-item" data-copy-json="${t.task_id}">⎘ 复制 JSON 到剪贴板</button>`,
+    cache ? `<button class="menu-item" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : '',
+    cache ? `<button class="menu-item danger" data-del-with-cache="${t.task_id}">⌫ 删除并清缓存</button>` : '',
+  ].filter(Boolean).join('');
   return `
     ${t.paused
       ? `<button class="good" data-resume="${t.task_id}">▶ 恢复</button>`
       : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
     <button class="ghost" data-edit="${t.task_id}">✎ 编辑</button>
-    <button class="ghost" data-clone="${t.task_id}" data-tip="用此任务配置预填新建表单">⎘ 克隆</button>
-    <button class="ghost" data-export="${t.task_id}" data-tip="下载为 JSON 文件">↧ 导出</button>
-    <button class="ghost" data-copy-json="${t.task_id}" data-tip="复制配置 JSON 到剪贴板">⎘ 复制 JSON</button>
-    ${t.cache ? `<button class="ghost" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : ''}
+    <span class="menu-wrap">
+      <button class="ghost menu-trigger" data-menu="${t.task_id}" data-tip="更多操作">⋯ 更多</button>
+      <div class="menu" data-menu-for="${t.task_id}">${menuItems}</div>
+    </span>
     <button class="danger" data-del="${t.task_id}" data-tip="删除任务（保留缓存）">删除</button>
-    ${t.cache ? `<button class="danger" data-del-with-cache="${t.task_id}" data-tip="删除任务并清空缓存">删除+清缓存</button>` : ''}
   `;
 }
 
@@ -1428,6 +1499,54 @@ function healthClass(h) {
 }
 
 function attachCardEvents(root) {
+  // Overflow-menu triggers. The 1.5s refresh tick re-renders the task
+  // container via `innerHTML = …`, which destroys any in-DOM `.show`
+  // class. To keep the menu visibly open between ticks we track which
+  // task's menu is open in `openMenuTaskId` (module-level), restore it on
+  // every attach pass below, and let outside-clicks / menu-item clicks
+  // clear it.
+  //
+  // Note: each card renders `actionsHtml(t)` TWICE (compact-row for list
+  // view, task-actions for grid view). Both copies share the
+  // `data-menu-for` attribute. We resolve via `closest('.menu-wrap')` so
+  // each ⋯ only drives the menu sitting next to it; the state-restore
+  // step opens every matching menu across the document, which is fine
+  // because the hidden view's menu is `display: none` anyway.
+  root.querySelectorAll(".menu-trigger").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const taskId = b.dataset.menu;
+    const wrap = b.closest(".menu-wrap");
+    const menu = wrap && wrap.querySelector(".menu");
+    if (!menu) return;
+    const wasOpen = openMenuTaskId === taskId;
+    closeAllMenus();
+    if (!wasOpen) {
+      openMenuTaskId = taskId;
+      menu.classList.add("show");
+    }
+  });
+  // Restore menu visibility for the task whose menu was open before the
+  // last refresh. Runs every attach pass — idempotent.
+  if (openMenuTaskId) {
+    const menus = root.querySelectorAll(`.menu[data-menu-for="${openMenuTaskId}"]`);
+    if (menus.length === 0) {
+      // The task was deleted while its menu was open; forget the state.
+      openMenuTaskId = null;
+    } else {
+      menus.forEach(m => m.classList.add("show"));
+    }
+  }
+  // Clicks inside any menu close it after the action's own handler runs.
+  // `onclick =` (single slot) instead of addEventListener so re-renders
+  // don't stack handlers tick-after-tick. Clearing `openMenuTaskId` here
+  // is what makes "click an item → menu closes" survive the next refresh.
+  root.querySelectorAll(".menu").forEach(m => m.onclick = () => {
+    setTimeout(() => {
+      openMenuTaskId = null;
+      m.classList.remove("show");
+    }, 0);
+  });
+
   root.querySelectorAll("[data-copy]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
     // For a URL span we don't want to overwrite the URL text with "✓ 已复制";
@@ -1526,10 +1645,10 @@ function attachCardEvents(root) {
       if (!res.ok) throw new Error(res.statusText);
       const text = await res.text();
       await navigator.clipboard.writeText(text);
-      const orig = b.textContent;
+      // Same no-text-swap rule as copyToClipboard — the menu item width
+      // would jump if we replaced the label.
       b.classList.add("copied");
-      b.textContent = "✓ 已复制";
-      setTimeout(() => { b.classList.remove("copied"); b.textContent = orig; }, 1500);
+      setTimeout(() => b.classList.remove("copied"), 1500);
     } catch (err) {
       toast("复制失败：" + err.message, "error");
     }
@@ -1546,13 +1665,12 @@ async function copyToClipboard(text, btn) {
   try {
     await navigator.clipboard.writeText(text);
     if (btn) {
-      const orig = btn.textContent;
+      // Don't swap textContent — the wider "✓ 已复制" string would reflow
+      // the action row mid-click. The `.copied` class is the visual cue
+      // instead (green flash via CSS animation, or the static green pill
+      // shape on `.copy-btn`).
       btn.classList.add("copied");
-      btn.textContent = "✓ 已复制";
-      setTimeout(() => {
-        btn.classList.remove("copied");
-        btn.textContent = orig;
-      }, 1500);
+      setTimeout(() => btn.classList.remove("copied"), 1500);
     } else {
       toast("已复制：" + text, "ok");
     }
@@ -1560,6 +1678,22 @@ async function copyToClipboard(text, btn) {
     toast("复制失败：" + e.message, "error");
   }
 }
+
+// Close every open task-card overflow menu — both the DOM `.show` class
+// and the persisted `openMenuTaskId` so the next refresh tick doesn't
+// silently re-open it.
+function closeAllMenus() {
+  openMenuTaskId = null;
+  document.querySelectorAll(".menu.show").forEach(m => m.classList.remove("show"));
+}
+// One global handler covers all task cards' menus — cheaper than wiring
+// per-card listeners on every refresh tick. Bound once at script load.
+document.addEventListener("click", (e) => {
+  // Clicks on a trigger or inside a menu manage their own state; only
+  // outside-clicks need this catch-all.
+  if (e.target.closest(".menu-wrap")) return;
+  closeAllMenus();
+});
 
 async function doAction(path, method, okMsg) {
   try {
@@ -2363,10 +2497,14 @@ function renderTaskPluginSlots(scope, slots) {
     body.style.display = slot.enabled ? "" : "none";
     plugin.task_fields.forEach(field => {
       const wrap = document.createElement("div");
-      const lab = document.createElement("label");
-      lab.className = "field";
-      lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
-      wrap.appendChild(lab);
+      // Boolean fields use the `.check` card style (label inside the card)
+      // — skip the outer field label to avoid double-rendering the title.
+      if (field.kind !== "boolean") {
+        const lab = document.createElement("label");
+        lab.className = "field";
+        lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+        wrap.appendChild(lab);
+      }
       // suppressGenerate: this is the decryption-key slot — the user must
       // paste what the sender shared. Rolling a fresh random key here would
       // silently produce garbage bytes for every byte the engine emits.
@@ -2420,15 +2558,43 @@ function readTaskPluginSlots(scope) {
 // element so the read-back path (`readField`) stays simple.
 function renderField(field, value, opts) {
   opts = opts || {};
+
+  // Boolean fields get the project-wide "check card" treatment: a single
+  // tappable pill with the checkbox on the left, label + hint stacked on
+  // the right (matching the cache/persist toggles in the create modal).
+  // Callers detect `kind === "boolean"` and skip the outer `<label
+  // class="field">` they normally prepend, so we don't end up with two
+  // labels rendering the same text.
+  if (field.kind === "boolean") {
+    const card = document.createElement("label");
+    card.className = "check";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!value;
+    cb.dataset.fieldKey = field.key;
+    cb.dataset.fieldKind = field.kind;
+    card.appendChild(cb);
+    const body = document.createElement("span");
+    const title = document.createElement("span");
+    title.textContent = field.label;
+    body.appendChild(title);
+    if (field.hint) {
+      const hint = document.createElement("span");
+      hint.className = "desc";
+      hint.textContent = field.hint;
+      body.appendChild(hint);
+    }
+    card.appendChild(body);
+    return card;
+  }
+
   const wrap = document.createElement('div');
   wrap.style.display = 'flex';
   wrap.style.gap = '6px';
   wrap.style.alignItems = 'stretch';
 
   let el;
-  if (field.kind === "boolean") {
-    el = Object.assign(document.createElement("input"), { type: "checkbox" });
-  } else if (field.kind === "number") {
+  if (field.kind === "number") {
     el = Object.assign(document.createElement("input"), { type: "number" });
   } else if (field.kind === "text_area") {
     el = document.createElement("textarea");
@@ -2452,11 +2618,7 @@ function renderField(field, value, opts) {
   el.dataset.fieldKey = field.key;
   el.dataset.fieldKind = field.kind;
   el.style.flex = '1';
-  if (field.kind === "boolean") {
-    el.checked = !!value;
-    el.style.flex = '0';
-    el.style.alignSelf = 'center';
-  } else if (value !== undefined && value !== null) {
+  if (value !== undefined && value !== null) {
     el.value = String(value);
   }
   if (field.kind === "hex" || field.kind === "path" || field.kind === "dir_path") {
@@ -2631,10 +2793,12 @@ function renderPluginsModal() {
       grid.dataset.section = "global";
       plugin.global_fields.forEach(field => {
         const wrap = document.createElement("div");
-        const lab = document.createElement("label");
-        lab.className = "field";
-        lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
-        wrap.appendChild(lab);
+        if (field.kind !== "boolean") {
+          const lab = document.createElement("label");
+          lab.className = "field";
+          lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+          wrap.appendChild(lab);
+        }
         const value = plugin.global && plugin.global[field.key];
         wrap.appendChild(renderField(field, value));
         grid.appendChild(wrap);
@@ -2677,10 +2841,12 @@ function renderPluginsModal() {
         taskSection.dataset.section = "task";
         plugin.task_fields.forEach(field => {
           const wrap = document.createElement("div");
-          const lab = document.createElement("label");
-          lab.className = "field";
-          lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
-          wrap.appendChild(lab);
+          if (field.kind !== "boolean") {
+            const lab = document.createElement("label");
+            lab.className = "field";
+            lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+            wrap.appendChild(lab);
+          }
           const value = plugin.default_task && plugin.default_task[field.key];
           // Don't pre-fill default empty strings — better to leave the field
           // visibly empty so users notice they need to fill or generate.
@@ -2695,10 +2861,12 @@ function renderPluginsModal() {
       paramGrid.dataset.section = "params";
       plugin.forward_fields.forEach(field => {
         const wrap = document.createElement("div");
-        const lab = document.createElement("label");
-        lab.className = "field";
-        lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
-        wrap.appendChild(lab);
+        if (field.kind !== "boolean") {
+          const lab = document.createElement("label");
+          lab.className = "field";
+          lab.innerHTML = `${escapeHtml(field.label)}${field.hint ? ` <span class="hint-inline">${escapeHtml(field.hint)}</span>` : ""}`;
+          wrap.appendChild(lab);
+        }
         // Booleans default to true; selects start at their first option;
         // size fields stay blank so they default to 0 server-side.
         let initialValue = null;

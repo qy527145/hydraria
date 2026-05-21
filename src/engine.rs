@@ -376,8 +376,17 @@ impl Engine {
         let mut offset: u64 = 0;
 
         for (vi, mirrors) in layout.iter().enumerate() {
-            // Try mirrors in order until one yields a probe. The ordering is
-            // the user-supplied one — they decide which mirror is preferred.
+            // Try mirrors in order until one yields a probe that the task's
+            // mode can actually use. The ordering is the user-supplied one
+            // — they decide which mirror is preferred.
+            //
+            // Multi-volume tasks need every chunk to come back with the
+            // exact byte range we asked for, so a mirror that returns a
+            // probe but doesn't support Range or doesn't report a size
+            // counts as a per-mirror failure: we record it in url_health
+            // (so the dashboard surfaces it as broken) and fall through to
+            // the next mirror. Only when every mirror of the volume fails
+            // these checks do we surface the fatal error.
             let n = mirrors.len();
             let start = self.rr_counter.load(Ordering::Relaxed);
             let mut last_err: Option<ProxyError> = None;
@@ -386,10 +395,37 @@ impl Engine {
                 let url = &mirrors[(start + off) % n];
                 match self.probe_one(url).await {
                     Ok(p) => {
+                        if multi_volume {
+                            if !p.accepts_ranges {
+                                let msg = "no Range support; skipping for multi-volume task";
+                                self.record_failure(url, None, msg);
+                                tracing::debug!("probe vol {} mirror {} rejected: {}", vi + 1, url, msg);
+                                last_err = Some(ProxyError::Internal(format!(
+                                    "{} ({})", msg, url
+                                )));
+                                continue;
+                            }
+                            if p.total_size.is_none() {
+                                let msg = "no Content-Length; can't stitch volumes without known sizes";
+                                self.record_failure(url, None, msg);
+                                tracing::debug!("probe vol {} mirror {} rejected: {}", vi + 1, url, msg);
+                                last_err = Some(ProxyError::Internal(format!(
+                                    "{} ({})", msg, url
+                                )));
+                                continue;
+                            }
+                        }
                         probe_result = Some((url.clone(), p));
                         break;
                     }
-                    Err(e) => last_err = Some(e),
+                    Err(e) => {
+                        // Network / HTTP error reaching this mirror. probe_one
+                        // already wrote to url_health for the cases it could
+                        // (HEAD success / range_get response); the catch-all
+                        // here covers the truly-unreachable mirror.
+                        self.record_failure(url, None, &e.to_string());
+                        last_err = Some(e);
+                    }
                 }
             }
             let (working_url, p) = match probe_result {
@@ -434,25 +470,16 @@ impl Engine {
                 }
             };
 
-            if multi_volume && !p.accepts_ranges {
-                return Err(ProxyError::Internal(format!(
-                    "volume {} ({}) does not support byte ranges; multi-volume tasks require Range support on every part",
-                    vi + 1,
-                    working_url
-                )));
-            }
+            // In multi-volume mode the per-mirror loop above already rejected
+            // any mirror missing Range / Content-Length, so the chosen
+            // `working_url` is guaranteed acceptable. Single-volume tasks
+            // tolerate a non-Range probe by falling back to passthrough; the
+            // engine just records the lack so the caller can decide.
             if !p.accepts_ranges {
                 accepts_ranges_all = false;
             }
 
             let size_opt = p.total_size;
-            if multi_volume && size_opt.is_none() {
-                return Err(ProxyError::Internal(format!(
-                    "volume {} ({}) did not report a Content-Length; cannot stitch volumes without known sizes",
-                    vi + 1,
-                    working_url
-                )));
-            }
             let size = size_opt.unwrap_or(0);
             if size_opt.is_none() {
                 size_known_all = false;
