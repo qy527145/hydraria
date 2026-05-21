@@ -341,13 +341,15 @@ impl CacheStore {
         hex::encode(&hasher.finalize()[..12])
     }
 
-    /// Pick the right key derivation for a task. Single-volume tasks reuse the
-    /// flat mirror-mode key (so existing caches keep working through the
+    /// Pick the right key derivation for a task. Single-volume tasks reuse
+    /// the flat mirror-mode key (so existing caches keep working through the
     /// schema upgrade); multi-volume tasks get the layout-aware key.
+    /// An empty layout is treated as an empty mirror list — the caller
+    /// won't reach this path because task creation rejects zero-URL tasks.
     pub fn key_for_task(cfg: &crate::models::TaskConfig) -> String {
         let vols = cfg.effective_volumes();
         match vols.len() {
-            0 => Self::key_for_urls(&cfg.urls),
+            0 => Self::key_for_urls(&[]),
             1 => Self::key_for_urls(&vols[0]),
             _ => Self::key_for_volume_layout(&vols),
         }

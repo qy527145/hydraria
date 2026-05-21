@@ -8,39 +8,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskMode {
-    /// `urls` are interchangeable copies of the same file — load-balanced and
-    /// failed over per request.
-    #[default]
-    Mirrors,
-    /// `urls` are ordered chunks of one logical file; concatenating them in
-    /// order yields the complete file. Each URL must support byte ranges.
-    Volumes,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskConfig {
-    /// Flat de-duplicated URL list (the projection of `volumes`). Always
-    /// re-derived by `normalize()` — clients can omit this field and let the
-    /// server compute it from `volumes`.
-    #[serde(default)]
-    pub urls: Vec<String>,
-    /// Structured volume layout. Each inner Vec is one volume's mirror URL
-    /// list (interchangeable copies of that part). The outer Vec is in
+    /// Structured volume layout — the **only** source of truth for the
+    /// task's URL set. Each inner Vec is one volume's mirror URL list
+    /// (interchangeable copies of that part). The outer Vec is in
     /// playback/concatenation order.
     ///
-    /// Always normalized to non-empty when the task has any URLs:
     /// * One volume with N mirrors → mirror-mode behavior (the single-file case).
-    /// * N volumes with M mirrors each → volume mode.
+    /// * N volumes with M mirrors each → ordered volume mode.
     ///
-    /// `urls` is kept as a flat-deduped projection for search / health
-    /// tracking / counters. `volumes` is the source of truth at stream time.
+    /// Empty volumes are dropped by `normalize()` before validation. A task
+    /// with zero non-empty volumes is rejected at create / update time with
+    /// a user-facing error (rather than a serde "missing field" message,
+    /// which the absent-field default below makes friendlier).
     #[serde(default)]
     pub volumes: Vec<Vec<String>>,
-    #[serde(default)]
-    pub mode: TaskMode,
     #[serde(default = "default_threads")]
     pub max_threads: usize,
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]
@@ -151,9 +134,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TaskUpdate {
-    pub urls: Option<Vec<String>>,
     pub volumes: Option<Vec<Vec<String>>>,
-    pub mode: Option<TaskMode>,
     pub max_threads: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub max_split: Option<u64>,
@@ -289,8 +270,9 @@ pub struct TaskEntry {
     pub bytes_served: AtomicU64,
     pub active_connections: AtomicU32,
     pub paused: AtomicBool,
-    /// Per-URL health (slot index matches `config.urls` at creation time;
-    /// `apply_update` rebuilds this list whenever URLs change).
+    /// Per-URL health (one entry per unique URL across every volume's
+    /// mirrors; `apply_update` rebuilds this list whenever the layout
+    /// changes, carrying over stats for URLs that survived the edit).
     pub url_health: RwLock<Vec<Arc<UrlHealthAcc>>>,
     pub limiter: Arc<Limiter>,
     pub throughput: Arc<ThroughputSampler>,
@@ -300,29 +282,20 @@ pub struct TaskEntry {
 }
 
 impl TaskConfig {
-    /// Resolve the structured volume layout. Falls back from `volumes` to a
-    /// migration of the legacy `urls` shape so old persisted configs keep
-    /// working without rewriting them on disk.
+    /// Volume layout with empty entries scrubbed. Identity transform plus
+    /// hygiene — every non-empty mirror string in every non-empty volume,
+    /// preserving order.
     pub fn effective_volumes(&self) -> Vec<Vec<String>> {
-        if !self.volumes.is_empty() {
-            return self
-                .volumes
-                .iter()
-                .map(|v| v.iter().filter(|u| !u.trim().is_empty()).cloned().collect())
-                .filter(|v: &Vec<String>| !v.is_empty())
-                .collect();
-        }
-        if self.urls.is_empty() {
-            return Vec::new();
-        }
-        match self.mode {
-            TaskMode::Volumes => self.urls.iter().map(|u| vec![u.clone()]).collect(),
-            TaskMode::Mirrors => vec![self.urls.clone()],
-        }
+        self.volumes
+            .iter()
+            .map(|v| v.iter().filter(|u| !u.trim().is_empty()).cloned().collect())
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .collect()
     }
 
-    /// Flat de-duplicated URL list across every volume's mirrors, in first-
-    /// seen order. Used to derive `urls` and to size the URL-health array.
+    /// Flat de-duplicated URL list across every volume's mirrors, in
+    /// first-seen order. Used for URL-health bookkeeping and the cache
+    /// key's traceability hint.
     pub fn flat_unique_urls(volumes: &[Vec<String>]) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -336,13 +309,17 @@ impl TaskConfig {
         out
     }
 
-    /// Canonicalize the config so `volumes` is the source of truth and `urls`
-    /// is its flat-deduped projection. Migrates legacy shapes (only `urls`
-    /// set) and trims empty entries.
+    /// Instance-side projection of `flat_unique_urls(&self.volumes)`.
+    /// Convenience for the many call sites that just want "what URLs does
+    /// this task talk to".
+    pub fn urls(&self) -> Vec<String> {
+        Self::flat_unique_urls(&self.volumes)
+    }
+
+    /// Drop empty mirror strings and empty volumes so downstream code can
+    /// assume every entry is non-empty.
     pub fn normalize(&mut self) {
-        let vols = self.effective_volumes();
-        self.urls = Self::flat_unique_urls(&vols);
-        self.volumes = vols;
+        self.volumes = self.effective_volumes();
     }
 }
 
@@ -354,9 +331,9 @@ impl TaskEntry {
             .unwrap_or(0);
         config.normalize();
         let url_health = config
-            .urls
-            .iter()
-            .map(|u| Arc::new(UrlHealthAcc::new(u.clone())))
+            .urls()
+            .into_iter()
+            .map(|u| Arc::new(UrlHealthAcc::new(u)))
             .collect();
         let limiter = Arc::new(Limiter::new(
             config.rate_limit_bps,
@@ -391,30 +368,14 @@ impl TaskEntry {
     pub fn apply_update(&self, upd: TaskUpdate) -> std::result::Result<(), String> {
         let mut cfg = self.config.write();
 
-        // `urls` and `volumes` are tied — `volumes` is the source of truth
-        // and `urls` is its flattened projection. Accept either field, then
-        // normalize so they stay consistent on disk and in memory.
-        let urls_changed = upd.urls.is_some() || upd.volumes.is_some();
-        let volumes_supplied = upd.volumes.is_some();
+        let volumes_changed = upd.volumes.is_some();
         if let Some(volumes) = upd.volumes {
             cfg.volumes = volumes;
         }
-        if let Some(urls) = upd.urls {
-            if !volumes_supplied {
-                // Only `urls` was sent — discard the structured layout so
-                // `effective_volumes` re-derives from `urls`. Mode (or one
-                // volume) controls the migration shape.
-                cfg.volumes.clear();
-            }
-            cfg.urls = urls;
-        }
-        if let Some(m) = upd.mode {
-            cfg.mode = m;
-        }
-        if urls_changed {
+        if volumes_changed {
             cfg.normalize();
-            if cfg.urls.is_empty() {
-                return Err("at least one URL is required".into());
+            if cfg.volumes.is_empty() {
+                return Err("at least one URL is required across all volumes".into());
             }
             // Preserve health stats for URLs that survived the edit.
             let mut prev: HashMap<String, Arc<UrlHealthAcc>> = self
@@ -424,11 +385,11 @@ impl TaskEntry {
                 .map(|h| (h.url.clone(), Arc::clone(h)))
                 .collect();
             let new_health: Vec<Arc<UrlHealthAcc>> = cfg
-                .urls
-                .iter()
+                .urls()
+                .into_iter()
                 .map(|u| {
-                    prev.remove(u)
-                        .unwrap_or_else(|| Arc::new(UrlHealthAcc::new(u.clone())))
+                    prev.remove(&u)
+                        .unwrap_or_else(|| Arc::new(UrlHealthAcc::new(u)))
                 })
                 .collect();
             *self.url_health.write() = new_health;
@@ -845,14 +806,12 @@ impl AppState {
                 continue;
             }
             id.hash(&mut hasher);
-            cfg.urls.hash(&mut hasher);
             for vol in &cfg.volumes {
                 b"|".hash(&mut hasher);
                 for u in vol {
                     u.hash(&mut hasher);
                 }
             }
-            (cfg.mode as u8).hash(&mut hasher);
             cfg.max_threads.hash(&mut hasher);
             cfg.max_split.hash(&mut hasher);
             cfg.cache.hash(&mut hasher);

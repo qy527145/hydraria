@@ -3,8 +3,8 @@ use crate::engine::{Engine, UpstreamProbe, parse_range_header, suggest_volume_fi
 use crate::error::ProxyError;
 use crate::fs_pick::{self, PickRequest, PickResponse};
 use crate::models::{
-    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskMode,
-    TaskUpdate, short_id,
+    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate,
+    short_id,
 };
 use crate::plugins::{ForwardResult, PluginInfo};
 use axum::body::Body;
@@ -33,15 +33,11 @@ struct ApiError {
 
 #[derive(Deserialize)]
 struct ProbeReq {
-    #[serde(default)]
-    urls: Vec<String>,
-    /// Structured volume layout. When supplied, this overrides `urls`.
+    /// Structured volume layout to probe. Each inner Vec is one volume's
+    /// mirror URL list. The probe walks every volume, returning the merged
+    /// size + a suggested stitched filename.
     #[serde(default)]
     volumes: Vec<Vec<String>>,
-    /// Legacy hint — only consulted when `volumes` is empty and we need to
-    /// know whether to wrap each `urls` entry as its own volume.
-    #[serde(default)]
-    mode: Option<TaskMode>,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
 }
@@ -129,7 +125,7 @@ async fn create_task(
     Json(mut cfg): Json<TaskConfig>,
 ) -> Result<Json<CreateResp>, ProxyError> {
     cfg.normalize();
-    if cfg.urls.is_empty() {
+    if cfg.volumes.is_empty() {
         return Err(ProxyError::Internal(
             "at least one URL is required across all volumes".into(),
         ));
@@ -167,13 +163,11 @@ async fn probe_urls(
     State(_state): State<AppState>,
     Json(req): Json<ProbeReq>,
 ) -> Result<Json<ProbeResp>, ProxyError> {
-    if req.urls.is_empty() && req.volumes.iter().all(|v| v.is_empty()) {
-        return Err(ProxyError::Internal("urls must not be empty".into()));
+    if req.volumes.iter().all(|v| v.is_empty()) {
+        return Err(ProxyError::Internal("volumes must not be empty".into()));
     }
     let mut cfg = TaskConfig {
-        urls: req.urls.clone(),
         volumes: req.volumes.clone(),
-        mode: req.mode.unwrap_or_default(),
         max_threads: 1,
         max_split: 5 * 1024 * 1024,
         cache: false,
@@ -485,7 +479,7 @@ fn resolve_cache(
     // Stored URL list is just a traceability hint — we record it sorted and
     // deduped (across all mirrors of all volumes) so it's stable regardless
     // of how the user ordered things.
-    let mut urls = cfg.urls.clone();
+    let mut urls = cfg.urls();
     urls.sort_unstable();
     let meta = CacheMeta {
         etag: probe.etag.clone(),

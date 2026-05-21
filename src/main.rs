@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use hydraria::cache::CacheStore;
 use hydraria::engine::Engine;
-use hydraria::models::{AppState, GlobalSettings, TaskConfig, TaskMode};
+use hydraria::models::{AppState, GlobalSettings, TaskConfig};
 use hydraria::routes::build_router;
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -186,11 +186,18 @@ async fn run_download(
     let headers = parse_header_args(&raw_headers)?;
 
     // Build a one-off TaskConfig and run it through the same engine the
-    // server uses. We use serde to leverage the existing size parser for
-    // `--split` so users get the same `1M`/`512K` syntax as the API.
+    // server uses. We construct `volumes` directly from the CLI URL list:
+    //   * `--volumes` true  → each URL is its own volume (one mirror each)
+    //   * otherwise         → all URLs are mirrors of one volume
+    // Then serde validates the rest of the config (notably parsing the
+    // `--split` size string into a u64).
+    let volumes: Vec<Vec<String>> = if volumes_mode {
+        urls.iter().map(|u| vec![u.clone()]).collect()
+    } else {
+        vec![urls.clone()]
+    };
     let cfg_json = serde_json::json!({
-        "urls": urls,
-        "mode": if volumes_mode { "volumes" } else { "mirrors" },
+        "volumes": volumes,
         "max_threads": threads,
         "max_split": split,
         "cache": use_cache,
@@ -200,10 +207,9 @@ async fn run_download(
     });
     let mut cfg: TaskConfig = serde_json::from_value(cfg_json)?;
     cfg.normalize();
-    let _ = TaskMode::default(); // keep import alive
 
     let engine = Engine::new(Arc::new(cfg.clone()))?;
-    eprintln!("probing {} URL(s)...", cfg.urls.len());
+    eprintln!("probing {} URL(s)...", cfg.urls().len());
     let probe = engine.probe().await?;
 
     let total = probe.total_size;
@@ -223,7 +229,7 @@ async fn run_download(
         if let Some(total) = total {
             let store = CacheStore::new(cache_dir)?;
             let key = hydraria::cache::CacheStore::key_for_task(&cfg);
-            let mut url_list = cfg.urls.clone();
+            let mut url_list = cfg.urls();
             url_list.sort();
             let meta = hydraria::cache::CacheMeta {
                 etag: etag.clone(),

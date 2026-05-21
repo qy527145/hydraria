@@ -847,8 +847,8 @@
           <div class="modal-sub">配置完成后将生成一个可粘进 VLC / 浏览器 / aria2 的短链 URL。</div>
         </div>
         <div>
-          <input type="file" id="f-import-file" accept=".json" style="display:none;" />
-          <button type="button" class="ghost" id="btn-f-import" data-tip="从导出的 JSON 文件预填表单">↥ 导入 JSON</button>
+          <input type="file" id="f-import-file" accept=".json,.txt" style="display:none;" />
+          <button type="button" class="ghost" id="btn-f-import" data-tip="贴入 JSON 或直接贴入 URL 列表">↥ 导入</button>
         </div>
       </div>
 
@@ -1048,6 +1048,30 @@
     </div>
   </div>
 
+  <!-- Import modal: accepts standard JSON or a raw URL list (newline =
+       same volume, blank line = volume separator). File picker is still
+       available for either format. -->
+  <div class="modal-bg" id="import-modal">
+    <div class="modal" style="width: 640px;">
+      <h3>导入配置</h3>
+      <div class="modal-sub">
+        支持两种粘贴格式:
+        <b>标准 JSON</b> (任务导出文件原样粘贴),或
+        <b>URL 列表</b> — 每行一个 URL,同一卷的多个镜像写连续多行,
+        卷之间空一行隔开。URL 列表模式下,其它配置使用默认值。
+      </div>
+      <textarea id="import-text" placeholder="贴入 JSON 或 URL 列表..." style="min-height: 220px;"></textarea>
+      <div class="hint" id="import-hint">等待输入</div>
+      <div class="modal-actions" style="justify-content: space-between;">
+        <button type="button" class="ghost" id="btn-import-file">从文件导入…</button>
+        <div style="display: flex; gap: 8px;">
+          <button class="ghost" id="btn-import-cancel">取消</button>
+          <button id="btn-import-apply" disabled>填入表单</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Plugins modal -->
   <div class="modal-bg" id="plugins-modal">
     <div class="modal" style="width: 720px;">
@@ -1212,8 +1236,22 @@ function filteredTasks() {
   return lastTasks.filter(t =>
     (t.config.name || "").toLowerCase().includes(q) ||
     t.task_id.toLowerCase().includes(q) ||
-    t.config.urls.some(u => u.toLowerCase().includes(q))
+    flatUrls(t.config).some(u => u.toLowerCase().includes(q))
   );
+}
+
+// Flat de-duplicated URL list across every volume's mirrors. The backend
+// computes the same thing in `TaskConfig::urls()`; we don't ship it on the
+// wire so the UI derives it on demand from `volumes`.
+function flatUrls(cfg) {
+  const out = [];
+  const seen = new Set();
+  for (const vol of (cfg.volumes || [])) {
+    for (const u of vol) {
+      if (!seen.has(u)) { seen.add(u); out.push(u); }
+    }
+  }
+  return out;
 }
 
 function render(tasks) {
@@ -1277,7 +1315,7 @@ function taskCard(t) {
       <span class="task-id-tag">${t.task_id}</span>
       <span class="name">${escapeHtml(name)}</span>
       <span class="proxy-url-mini" data-copy="${t.proxy_url}" data-tip="点击复制：${t.proxy_url}" title="${t.proxy_url}">${t.proxy_url}</span>
-      <span class="mini">${t.config.urls.length} src · ${fmtBps(t.current_speed_bps)}</span>
+      <span class="mini">${flatUrls(t.config).length} src · ${fmtBps(t.current_speed_bps)}</span>
       ${badges.join("")}
       ${actionsHtml(t)}
       <button class="ghost" data-toggle-health="${t.task_id}">${isExpanded ? '收起源看板 ▴' : '源看板 ▾'}</button>
@@ -1314,7 +1352,7 @@ function taskCard(t) {
     <div class="task-meta">
       <div class="meta-cell">
         <div class="label">sources</div>
-        <div class="value">${t.config.urls.length} · ${t.config.max_threads} thr</div>
+        <div class="value">${flatUrls(t.config).length} · ${t.config.max_threads} thr</div>
       </div>
       <div class="meta-cell">
         <div class="label">served</div>
@@ -1350,7 +1388,8 @@ function actionsHtml(t) {
       : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
     <button class="ghost" data-edit="${t.task_id}">✎ 编辑</button>
     <button class="ghost" data-clone="${t.task_id}" data-tip="用此任务配置预填新建表单">⎘ 克隆</button>
-    <button class="ghost" data-export="${t.task_id}" data-tip="导出为 JSON 文件">↧ 导出</button>
+    <button class="ghost" data-export="${t.task_id}" data-tip="下载为 JSON 文件">↧ 导出</button>
+    <button class="ghost" data-copy-json="${t.task_id}" data-tip="复制配置 JSON 到剪贴板">⎘ 复制 JSON</button>
     ${t.cache ? `<button class="ghost" data-clear-cache="${t.task_id}">⌫ 清缓存</button>` : ''}
     <button class="danger" data-del="${t.task_id}" data-tip="删除任务（保留缓存）">删除</button>
     ${t.cache ? `<button class="danger" data-del-with-cache="${t.task_id}" data-tip="删除任务并清空缓存">删除+清缓存</button>` : ''}
@@ -1475,6 +1514,25 @@ function attachCardEvents(root) {
     document.body.appendChild(a);
     a.click();
     a.remove();
+  });
+  // Copy-JSON: same payload as the file export, just delivered to the
+  // clipboard so the user can paste it straight into a chat or the import
+  // modal on another machine.
+  root.querySelectorAll("[data-copy-json]").forEach(b => b.onclick = async (e) => {
+    e.stopPropagation();
+    const id = b.dataset.copyJson;
+    try {
+      const res = await fetch(`/api/tasks/${id}/export`);
+      if (!res.ok) throw new Error(res.statusText);
+      const text = await res.text();
+      await navigator.clipboard.writeText(text);
+      const orig = b.textContent;
+      b.classList.add("copied");
+      b.textContent = "✓ 已复制";
+      setTimeout(() => { b.classList.remove("copied"); b.textContent = orig; }, 1500);
+    } catch (err) {
+      toast("复制失败：" + err.message, "error");
+    }
   });
   root.querySelectorAll("[data-toggle-health]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
@@ -1916,39 +1974,126 @@ $("#create-modal").addEventListener("change", saveCreateDraft, true);
 
 $("#btn-open-create").onclick = openCreate;
 
-// Import JSON: pre-fills the create form from an exported TaskConfig file.
-$("#btn-f-import").onclick = () => $("#f-import-file").click();
+/* ---- import: textarea or file, accepting JSON OR a raw URL list ----
+ *
+ * Format detection is content-driven:
+ *   * trimmed text starts with `{` / `[`         → parse as JSON
+ *   * otherwise                                  → parse as URL list
+ *
+ * URL list grammar (mirrors `volumes` semantics):
+ *   one URL per line; consecutive lines are mirrors of the SAME volume;
+ *   a blank line separates volumes. Lines that don't look like http(s)
+ *   are dropped with a warning toast. In list mode, every other config
+ *   field is left at defaults — the user can refine after import.
+ */
+function openImport() {
+  $("#import-text").value = "";
+  $("#import-hint").textContent = "等待输入";
+  $("#import-hint").className = "hint";
+  $("#btn-import-apply").disabled = true;
+  $("#import-modal").classList.add("show");
+  setTimeout(() => $("#import-text").focus(), 80);
+}
+function closeImport() { $("#import-modal").classList.remove("show"); }
+
+// Heuristic: parse `text` into a TaskConfig fragment + a one-line summary.
+// Returns { config, summary } on success, { error } on failure.
+function parseImport(text) {
+  const t = (text || "").trim();
+  if (!t) return { error: "内容为空" };
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try {
+      const j = JSON.parse(t);
+      const cfg = (j && typeof j === "object" && j.config && typeof j.config === "object")
+        ? j.config : j;
+      if (!cfg || typeof cfg !== "object") return { error: "JSON 不是对象" };
+      // Require at least one valid volume in the parsed config.
+      const vols = Array.isArray(cfg.volumes) ? cfg.volumes.filter(v => Array.isArray(v) && v.length) : [];
+      if (vols.length === 0) return { error: "JSON 缺少非空的 volumes 数组" };
+      return {
+        config: cfg,
+        summary: `JSON · ${vols.length} 卷 / ${vols.reduce((a, v) => a + v.length, 0)} 个 URL`,
+      };
+    } catch (e) {
+      return { error: "JSON 解析失败: " + e.message };
+    }
+  }
+  // URL list mode: split into volume groups by blank lines.
+  const groups = t.split(/\r?\n\s*\r?\n/);
+  const volumes = [];
+  let bad = 0;
+  for (const g of groups) {
+    const urls = g.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const good = [];
+    for (const u of urls) {
+      if (/^https?:\/\//i.test(u)) good.push(u);
+      else bad += 1;
+    }
+    if (good.length) volumes.push(good);
+  }
+  if (volumes.length === 0) return { error: "未识别出任何 http(s) URL" };
+  const summary = `URL 列表 · ${volumes.length} 卷 / ${volumes.reduce((a, v) => a + v.length, 0)} 个 URL`
+    + (bad ? ` (忽略 ${bad} 行非 URL)` : "");
+  return { config: { volumes }, summary };
+}
+
+// Apply a parsed config to the create form, taking care to reset every
+// field the import can override so a previous draft doesn't bleed through.
+function applyParsedConfig(cfg, sourceLabel) {
+  renderVolumesEditor("f", Array.isArray(cfg.volumes) ? cfg.volumes : []);
+  $("#f-threads").value = typeof cfg.max_threads === "number" ? cfg.max_threads : 16;
+  $("#f-split").value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "5M";
+  $("#f-cache").checked = !!cfg.cache;
+  $("#f-persist").checked = !!cfg.persist;
+  $("#f-algorithm").value = cfg.rate_limit_algorithm || "token_bucket";
+  $("#f-name").value = cfg.name || "";
+  $("#f-rate").value = cfg.rate_limit_bps ? fmtBytesPlain(cfg.rate_limit_bps) : "";
+  $("#f-headers").value = (cfg.headers && Object.keys(cfg.headers).length)
+    ? JSON.stringify(cfg.headers, null, 2) : "";
+  $("#f-auto-filename").checked = cfg.auto_filename !== false;
+  $("#f-output-filename").value = cfg.output_filename || "";
+  revalidateCreate();
+  if (typeof saveCreateDraft === "function") saveCreateDraft();
+  toast("已从" + sourceLabel + "导入", "ok");
+}
+
+$("#btn-f-import").onclick = () => {
+  // Open the create modal first if it isn't already, so import-apply has a
+  // visible form to fill.
+  if (!$("#create-modal").classList.contains("show")) openCreate();
+  openImport();
+};
+$("#import-text").addEventListener("input", () => {
+  const r = parseImport($("#import-text").value);
+  if (r.error) {
+    $("#import-hint").textContent = r.error;
+    $("#import-hint").className = "err-text";
+    $("#btn-import-apply").disabled = true;
+  } else {
+    $("#import-hint").textContent = "✓ " + r.summary;
+    $("#import-hint").className = "ok-text";
+    $("#btn-import-apply").disabled = false;
+  }
+});
+$("#btn-import-cancel").onclick = closeImport;
+$("#btn-import-apply").onclick = () => {
+  const r = parseImport($("#import-text").value);
+  if (r.error) { toast("导入失败：" + r.error, "error"); return; }
+  applyParsedConfig(r.config, "粘贴内容");
+  closeImport();
+};
+$("#btn-import-file").onclick = () => $("#f-import-file").click();
 $("#f-import-file").addEventListener("change", async (e) => {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
   try {
     const text = await file.text();
-    const c = JSON.parse(text);
-    // Tolerate either a bare TaskConfig or { config: ... } wrapping.
-    const cfg = c && typeof c === "object" && c.config && typeof c.config === "object"
-      ? c.config : c;
-    if (Array.isArray(cfg.volumes) && cfg.volumes.length) {
-      renderVolumesEditor("f", cfg.volumes);
-    } else if (Array.isArray(cfg.urls) && cfg.urls.length) {
-      renderVolumesEditor("f", cfg.urls.map(u => [u]));
-    }
-    if (typeof cfg.max_threads === "number") $("#f-threads").value = cfg.max_threads;
-    if (cfg.max_split) $("#f-split").value = fmtBytesPlain(cfg.max_split);
-    $("#f-cache").checked = !!cfg.cache;
-    $("#f-persist").checked = !!cfg.persist;
-    if (cfg.rate_limit_algorithm) $("#f-algorithm").value = cfg.rate_limit_algorithm;
-    if (cfg.name) $("#f-name").value = cfg.name;
-    if (cfg.rate_limit_bps) $("#f-rate").value = fmtBytesPlain(cfg.rate_limit_bps);
-    if (cfg.headers && Object.keys(cfg.headers).length) {
-      $("#f-headers").value = JSON.stringify(cfg.headers, null, 2);
-    }
-    $("#f-auto-filename").checked = cfg.auto_filename !== false;
-    if (cfg.output_filename) $("#f-output-filename").value = cfg.output_filename;
-    revalidateCreate();
-    if (typeof saveCreateDraft === "function") saveCreateDraft();
-    toast("已从 " + file.name + " 导入配置", "ok");
+    const r = parseImport(text);
+    if (r.error) { toast("导入失败：" + r.error, "error"); return; }
+    applyParsedConfig(r.config, file.name);
+    closeImport();
   } catch (err) {
-    toast("导入失败：" + err.message, "error");
+    toast("读取文件失败：" + err.message, "error");
   } finally {
     e.target.value = "";
   }
@@ -1991,16 +2136,10 @@ function openEdit(id) {
   if (!t) return;
   editingId = id;
   $("#edit-id").textContent = id;
-  // Reconstruct volume layout from config: prefer the structured `volumes`
-  // field; fall back to the flat `urls` shape (which old configs use). The
-  // backend's `effective_volumes` does the same thing — this mirrors that.
-  let layout = Array.isArray(t.config.volumes) ? t.config.volumes.filter(v => v.length) : [];
-  if (layout.length === 0) {
-    const flat = t.config.urls || [];
-    layout = t.config.mode === "volumes"
-      ? flat.map(u => [u])
-      : flat.length ? [flat] : [];
-  }
+  // `volumes` is the only URL container — no legacy fallback needed.
+  const layout = Array.isArray(t.config.volumes)
+    ? t.config.volumes.filter(v => v.length)
+    : [];
   renderVolumesEditor("e", layout);
   $("#e-threads").value = t.config.max_threads;
   $("#e-split").value = (fmtBytes(t.config.max_split)).replace(/ /g, '');
@@ -2888,10 +3027,15 @@ $("#btn-edit-save").onclick = async () => {
   }
 };
 
-// Esc inside plugins modal closes it.
+// Esc inside plugins / import modal closes it. Both handlers stack on top
+// of the main one — they're scoped to the secondary modals and don't
+// conflict with the create/edit/settings esc logic above.
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && $("#plugins-modal").classList.contains("show")) {
+  if (e.key !== "Escape") return;
+  if ($("#plugins-modal").classList.contains("show")) {
     closePluginsModal();
+  } else if ($("#import-modal").classList.contains("show")) {
+    closeImport();
   }
 });
 

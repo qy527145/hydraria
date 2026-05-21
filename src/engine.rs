@@ -28,7 +28,9 @@ pub struct UpstreamProbe {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub filename: Option<String>,
-    /// In `TaskMode::Volumes`, the per-volume layout. `None` for mirror tasks.
+    /// Per-volume layout once the upstream probe has populated it. `None`
+    /// before probing, and never `None` afterwards: even a single-volume
+    /// task gets one `VolumeMeta` covering the whole file.
     pub volumes: Option<Vec<VolumeMeta>>,
 }
 
@@ -188,19 +190,21 @@ impl Engine {
         Ok(headers)
     }
 
-    fn pick_url(&self) -> Result<&str> {
-        if self.config.urls.is_empty() {
+    fn pick_url(&self) -> Result<String> {
+        let urls = self.config.urls();
+        if urls.is_empty() {
             return Err(ProxyError::NoUpstream);
         }
         let i = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-        Ok(&self.config.urls[i % self.config.urls.len()])
+        Ok(urls[i % urls.len()].clone())
     }
 
-    fn pick_url_for(&self, idx: usize) -> Result<&str> {
-        if self.config.urls.is_empty() {
+    fn pick_url_for(&self, idx: usize) -> Result<String> {
+        let urls = self.config.urls();
+        if urls.is_empty() {
             return Err(ProxyError::NoUpstream);
         }
-        Ok(&self.config.urls[idx % self.config.urls.len()])
+        Ok(urls[idx % urls.len()].clone())
     }
 
     /// True when the task spans more than one volume — the case where a 200
@@ -228,7 +232,7 @@ impl Engine {
         let n = self
             .volume_at(locator)
             .map(|v| v.urls.len())
-            .unwrap_or_else(|| self.config.urls.len());
+            .unwrap_or_else(|| self.config.urls().len());
         n.max(1) * 2
     }
 
@@ -281,7 +285,7 @@ impl Engine {
             }))
         } else {
             // No probe yet — fall back to the flat config URL list.
-            let url = self.pick_url_for(idx + attempt)?.to_string();
+            let url = self.pick_url_for(idx + attempt)?;
             Ok(Some(FetchTarget {
                 url,
                 local_start: span_start,
@@ -1853,15 +1857,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_volumes_prefers_explicit_layout() {
+    fn effective_volumes_filters_empties() {
         use crate::models::TaskConfig;
         let cfg = TaskConfig {
-            urls: vec!["legacy".into()],
             volumes: vec![
-                vec!["a1".into(), "a2".into()],
+                vec!["a1".into(), "  ".into(), "a2".into()],
+                vec!["".into()],
                 vec!["b1".into()],
             ],
-            mode: Default::default(),
             max_threads: 8,
             max_split: 5 * 1024 * 1024,
             cache: false,
@@ -1874,61 +1877,11 @@ mod tests {
             persist: false,
             plugins: Vec::new(),
         };
+        // Empty mirror strings and empty volumes are scrubbed; valid order
+        // is preserved.
         assert_eq!(
             cfg.effective_volumes(),
             vec![vec!["a1".to_string(), "a2".into()], vec!["b1".into()]],
-        );
-    }
-
-    #[test]
-    fn effective_volumes_legacy_mirrors_collapses_to_one_volume() {
-        use crate::models::{TaskConfig, TaskMode};
-        let cfg = TaskConfig {
-            urls: vec!["m1".into(), "m2".into(), "m3".into()],
-            volumes: Vec::new(),
-            mode: TaskMode::Mirrors,
-            max_threads: 8,
-            max_split: 5 * 1024 * 1024,
-            cache: false,
-            headers: Default::default(),
-            name: None,
-            output_filename: None,
-            auto_filename: true,
-            rate_limit_bps: 0,
-            rate_limit_algorithm: Default::default(),
-            persist: false,
-            plugins: Vec::new(),
-        };
-        // Old mirror config → one volume holding every mirror.
-        assert_eq!(
-            cfg.effective_volumes(),
-            vec![vec!["m1".to_string(), "m2".into(), "m3".into()]],
-        );
-    }
-
-    #[test]
-    fn effective_volumes_legacy_volumes_one_mirror_each() {
-        use crate::models::{TaskConfig, TaskMode};
-        let cfg = TaskConfig {
-            urls: vec!["v1".into(), "v2".into()],
-            volumes: Vec::new(),
-            mode: TaskMode::Volumes,
-            max_threads: 8,
-            max_split: 5 * 1024 * 1024,
-            cache: false,
-            headers: Default::default(),
-            name: None,
-            output_filename: None,
-            auto_filename: true,
-            rate_limit_bps: 0,
-            rate_limit_algorithm: Default::default(),
-            persist: false,
-            plugins: Vec::new(),
-        };
-        // Old volume config → one volume per URL.
-        assert_eq!(
-            cfg.effective_volumes(),
-            vec![vec!["v1".to_string()], vec!["v2".into()]],
         );
     }
 
