@@ -54,11 +54,28 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 
 ## Build & Run
 
-Requires Rust 1.85+ (edition 2024).
+### Install from crates.io (recommended)
 
 ```bash
+cargo install hydraria
+```
+
+This drops a `hydraria` binary into `~/.cargo/bin/` (make sure it's on your `PATH`). Requires Rust 1.85+.
+
+### Build from source
+
+```bash
+git clone https://github.com/qy527145/hydraria.git
+cd hydraria
 cargo build --release
-./target/release/hydraria \
+```
+
+The binary lands at `./target/release/hydraria`.
+
+### Run
+
+```bash
+hydraria \
   --bind 127.0.0.1:9527 \
   --cache-dir ~/.hydraria/cache \
   --state-file ~/.hydraria/tasks.json
