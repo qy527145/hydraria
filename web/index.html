@@ -565,7 +565,10 @@
     background: var(--panel);
     border: 1px solid var(--border-strong);
     border-radius: 14px;
-    padding: 24px;
+    /* Bottom padding is intentionally 0 — the sticky `.modal-actions` bar
+       below provides its own vertical breathing room and needs to sit flush
+       with the modal's bottom edge. */
+    padding: 24px 24px 0;
     width: 600px;
     max-width: 95vw;
     max-height: 92vh;
@@ -578,10 +581,20 @@
   }
   .modal .modal-sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
   .modal-actions {
+    /* Always-visible save/cancel bar — sticks to the bottom of the modal's
+       scroll area so long forms (many volumes / plugin slots) can be closed
+       without scrolling to the very end. Negative side margins + matching
+       padding let the border-top span the modal's full width. */
     display: flex;
     justify-content: flex-end;
     gap: 8px;
-    margin-top: 20px;
+    position: sticky;
+    bottom: 0;
+    background: var(--panel);
+    margin: 20px -24px 0;
+    padding: 14px 24px;
+    border-top: 1px solid var(--border);
+    z-index: 2;
   }
 
   /* Form */
