@@ -58,6 +58,31 @@ pub struct TaskConfig {
     /// chained transforms like compress→encrypt undo correctly.
     #[serde(default)]
     pub plugins: Vec<TaskPluginConfig>,
+    /// How the proxied response advertises itself via `Content-Disposition`.
+    /// `Auto` reproduces the historic behavior (inline + upstream MIME, so
+    /// the browser picks based on Content-Type — sometimes plays, sometimes
+    /// downloads). `Inline` and `Attachment` are the explicit overrides.
+    #[serde(default)]
+    pub content_disposition: ContentDispositionMode,
+}
+
+/// User-facing knob for the served `Content-Disposition` (and a touch of
+/// Content-Type fix-up). Defaults to `Auto` — matches the pre-existing
+/// behavior so old persisted tasks round-trip identically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentDispositionMode {
+    /// Inline disposition + whatever Content-Type the upstream sent. The
+    /// browser picks: plays for `video/*`, downloads for `application/octet-stream`.
+    #[default]
+    Auto,
+    /// Inline disposition AND coerce a generic upstream Content-Type
+    /// (`application/octet-stream`) into a more specific MIME guessed from
+    /// the served filename — so e.g. a CDN that returns octet-stream for a
+    /// `.mp4` still gets rendered by `<video>`. Use when you want preview.
+    Inline,
+    /// `attachment; filename="…"` — browsers always download, never preview.
+    Attachment,
 }
 
 fn default_threads() -> usize {
@@ -148,6 +173,7 @@ pub struct TaskUpdate {
     pub rate_limit_algorithm: Option<Algorithm>,
     pub persist: Option<bool>,
     pub plugins: Option<Vec<TaskPluginConfig>>,
+    pub content_disposition: Option<ContentDispositionMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -434,6 +460,9 @@ impl TaskEntry {
         }
         if let Some(pl) = upd.plugins {
             cfg.plugins = pl;
+        }
+        if let Some(cd) = upd.content_disposition {
+            cfg.content_disposition = cd;
         }
         Ok(())
     }
@@ -834,6 +863,7 @@ impl AppState {
                     .unwrap_or_default()
                     .hash(&mut hasher);
             }
+            (cfg.content_disposition as u8).hash(&mut hasher);
             e.paused.load(Ordering::Relaxed).hash(&mut hasher);
         }
         hasher.finish()

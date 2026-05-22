@@ -952,6 +952,13 @@
         <span>自动检测<span class="desc">运行时优先使用上游探测结果;手动编辑此输入框会自动关闭</span></span>
       </label>
 
+      <label class="field">浏览器行为 <span class="hint-inline">控制点开代理 URL 时是直接预览还是强制下载</span></label>
+      <select id="f-disposition">
+        <option value="auto">默认 — 由上游 Content-Type 决定（视频通常预览，二进制通常下载）</option>
+        <option value="inline">强制预览 — 修正通用 MIME，浏览器尽量内联渲染</option>
+        <option value="attachment">强制下载 — 永远触发"另存为"</option>
+      </select>
+
       <label class="field">限速算法 <span class="hint-inline" id="f-algo-hint">仅当限速 &gt; 0 时生效</span></label>
       <select id="f-algorithm">
         <option value="token_bucket">令牌桶（默认） — 允许短突发</option>
@@ -989,8 +996,16 @@
   <!-- Edit modal -->
   <div class="modal-bg" id="edit-modal">
     <div class="modal">
-      <h3>编辑任务 <span style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);" id="edit-id"></span></h3>
-      <div class="modal-sub">更改会立刻应用到后续连接（已建立的流不受影响）。</div>
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+        <div>
+          <h3 style="margin-bottom:4px;">编辑任务 <span style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);" id="edit-id"></span></h3>
+          <div class="modal-sub">更改会立刻应用到后续连接（已建立的流不受影响）。</div>
+        </div>
+        <div>
+          <input type="file" id="e-import-file" accept=".json,.txt" style="display:none;" />
+          <button type="button" class="ghost" id="btn-e-import" data-tip="贴入 JSON 或直接贴入 URL 列表">↥ 导入</button>
+        </div>
+      </div>
 
       <label class="field">
         分卷 / 源 URL
@@ -1037,6 +1052,13 @@
         <input type="checkbox" id="e-auto-filename" />
         <span>自动检测<span class="desc">运行时优先使用上游探测结果;手动编辑会自动关闭</span></span>
       </label>
+
+      <label class="field">浏览器行为</label>
+      <select id="e-disposition">
+        <option value="auto">默认 — 由上游 Content-Type 决定</option>
+        <option value="inline">强制预览 — 修正通用 MIME，浏览器内联渲染</option>
+        <option value="attachment">强制下载 — 永远触发"另存为"</option>
+      </select>
 
       <label class="field">限速算法</label>
       <select id="e-algorithm">
@@ -2045,6 +2067,7 @@ const CREATE_DEFAULTS = {
   headers: "", name: "", rate: "", threads: "16", split: "5M",
   cache: false, persist: false, algorithm: "token_bucket",
   volumes: [], autoFilename: true, outputFilename: "",
+  contentDisposition: "auto",
 };
 function loadCreateDraft() {
   try {
@@ -2068,6 +2091,7 @@ function saveCreateDraft() {
     volumes: readVolumes("f"),
     autoFilename: $("#f-auto-filename").checked,
     outputFilename: $("#f-output-filename").value,
+    contentDisposition: $("#f-disposition").value,
   };
   try { localStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(draft)); } catch {}
 }
@@ -2088,6 +2112,7 @@ function openCreate() {
   renderVolumesEditor("f", Array.isArray(d.volumes) ? d.volumes : []);
   $("#f-auto-filename").checked = d.autoFilename !== false;
   $("#f-output-filename").value = d.outputFilename ?? "";
+  $("#f-disposition").value = d.contentDisposition ?? "auto";
   $("#f-output-filename").dataset.detected = "";
   $("#f-fname-status").textContent = "未探测";
   revalidateCreate();
@@ -2119,8 +2144,14 @@ $("#btn-open-create").onclick = openCreate;
  *   a blank line separates volumes. Lines that don't look like http(s)
  *   are dropped with a warning toast. In list mode, every other config
  *   field is left at defaults — the user can refine after import.
+ *
+ * Import target: which form's volumes to write into. "f" = create modal,
+ * "e" = edit modal. Captured when the user clicks ↥ 导入 in either modal.
  */
-function openImport() {
+let importScope = "f";
+
+function openImport(scope) {
+  importScope = scope === "e" ? "e" : "f";
   $("#import-text").value = "";
   $("#import-hint").textContent = "等待输入";
   $("#import-hint").className = "hint";
@@ -2171,23 +2202,45 @@ function parseImport(text) {
   return { config: { volumes }, summary };
 }
 
-// Apply a parsed config to the create form, taking care to reset every
-// field the import can override so a previous draft doesn't bleed through.
-function applyParsedConfig(cfg, sourceLabel) {
-  renderVolumesEditor("f", Array.isArray(cfg.volumes) ? cfg.volumes : []);
-  $("#f-threads").value = typeof cfg.max_threads === "number" ? cfg.max_threads : 16;
-  $("#f-split").value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "5M";
-  $("#f-cache").checked = !!cfg.cache;
-  $("#f-persist").checked = !!cfg.persist;
-  $("#f-algorithm").value = cfg.rate_limit_algorithm || "token_bucket";
-  $("#f-name").value = cfg.name || "";
-  $("#f-rate").value = cfg.rate_limit_bps ? fmtBytesPlain(cfg.rate_limit_bps) : "";
-  $("#f-headers").value = (cfg.headers && Object.keys(cfg.headers).length)
-    ? JSON.stringify(cfg.headers, null, 2) : "";
-  $("#f-auto-filename").checked = cfg.auto_filename !== false;
-  $("#f-output-filename").value = cfg.output_filename || "";
-  revalidateCreate();
-  if (typeof saveCreateDraft === "function") saveCreateDraft();
+// Apply a parsed config to the create or edit form, taking care to reset
+// every field the import can override so a previous draft doesn't bleed
+// through. `scope` selects which form ("f" = create, "e" = edit). Edit mode
+// only touches fields the import explicitly carried, so a URL-only paste
+// doesn't blow away the user's existing threads / cache / headers settings.
+function applyParsedConfig(cfg, sourceLabel, scope) {
+  scope = scope === "e" ? "e" : "f";
+  const merge = scope === "e"; // edit = merge; create = full reset
+  const has = (k) => Object.prototype.hasOwnProperty.call(cfg, k);
+  renderVolumesEditor(scope, Array.isArray(cfg.volumes) ? cfg.volumes : []);
+  if (!merge || has("max_threads"))
+    $(`#${scope}-threads`).value = typeof cfg.max_threads === "number" ? cfg.max_threads : 16;
+  if (!merge || has("max_split"))
+    $(`#${scope}-split`).value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "5M";
+  if (!merge || has("cache"))
+    $(`#${scope}-cache`).checked = !!cfg.cache;
+  if (!merge || has("persist"))
+    $(`#${scope}-persist`).checked = !!cfg.persist;
+  if (!merge || has("rate_limit_algorithm"))
+    $(`#${scope}-algorithm`).value = cfg.rate_limit_algorithm || "token_bucket";
+  if (!merge || has("name"))
+    $(`#${scope}-name`).value = cfg.name || "";
+  if (!merge || has("rate_limit_bps"))
+    $(`#${scope}-rate`).value = cfg.rate_limit_bps ? fmtBytesPlain(cfg.rate_limit_bps) : "";
+  if (!merge || has("headers"))
+    $(`#${scope}-headers`).value = (cfg.headers && Object.keys(cfg.headers).length)
+      ? JSON.stringify(cfg.headers, null, 2) : "";
+  if (!merge || has("auto_filename"))
+    $(`#${scope}-auto-filename`).checked = cfg.auto_filename !== false;
+  if (!merge || has("output_filename"))
+    $(`#${scope}-output-filename`).value = cfg.output_filename || "";
+  if (!merge || has("content_disposition"))
+    $(`#${scope}-disposition`).value = cfg.content_disposition || "auto";
+  if (scope === "f") {
+    revalidateCreate();
+    if (typeof saveCreateDraft === "function") saveCreateDraft();
+  } else {
+    revalidateEdit();
+  }
   toast("已从" + sourceLabel + "导入", "ok");
 }
 
@@ -2195,7 +2248,12 @@ $("#btn-f-import").onclick = () => {
   // Open the create modal first if it isn't already, so import-apply has a
   // visible form to fill.
   if (!$("#create-modal").classList.contains("show")) openCreate();
-  openImport();
+  openImport("f");
+};
+$("#btn-e-import").onclick = () => {
+  // Edit modal must already be open (the button lives inside it); the user
+  // chose this task on purpose, so reuse the current editingId.
+  openImport("e");
 };
 $("#import-text").addEventListener("input", () => {
   const r = parseImport($("#import-text").value);
@@ -2213,10 +2271,13 @@ $("#btn-import-cancel").onclick = closeImport;
 $("#btn-import-apply").onclick = () => {
   const r = parseImport($("#import-text").value);
   if (r.error) { toast("导入失败：" + r.error, "error"); return; }
-  applyParsedConfig(r.config, "粘贴内容");
+  applyParsedConfig(r.config, "粘贴内容", importScope);
   closeImport();
 };
-$("#btn-import-file").onclick = () => $("#f-import-file").click();
+$("#btn-import-file").onclick = () => {
+  const trigger = importScope === "e" ? "#e-import-file" : "#f-import-file";
+  $(trigger).click();
+};
 $("#f-import-file").addEventListener("change", async (e) => {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
@@ -2224,7 +2285,22 @@ $("#f-import-file").addEventListener("change", async (e) => {
     const text = await file.text();
     const r = parseImport(text);
     if (r.error) { toast("导入失败：" + r.error, "error"); return; }
-    applyParsedConfig(r.config, file.name);
+    applyParsedConfig(r.config, file.name, "f");
+    closeImport();
+  } catch (err) {
+    toast("读取文件失败：" + err.message, "error");
+  } finally {
+    e.target.value = "";
+  }
+});
+$("#e-import-file").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const r = parseImport(text);
+    if (r.error) { toast("导入失败：" + r.error, "error"); return; }
+    applyParsedConfig(r.config, file.name, "e");
     closeImport();
   } catch (err) {
     toast("读取文件失败：" + err.message, "error");
@@ -2290,6 +2366,7 @@ function openEdit(id) {
   $("#e-output-filename").value = t.config.output_filename || "";
   $("#e-output-filename").dataset.detected = t.config.output_filename || "";
   $("#e-output-filename").dataset.detected = t.config.output_filename || "";
+  $("#e-disposition").value = t.config.content_disposition || "auto";
   $("#e-fname-status").textContent = t.config.output_filename
     ? `当前：${t.config.output_filename}`
     : "未设置";
@@ -2466,6 +2543,15 @@ function renderTaskPluginSlots(scope, slots) {
     const slot = slots.find(s => s.id === plugin.id) || {
       id: plugin.id, enabled: false, config: structuredClone(plugin.default_task),
     };
+    // Legacy → unified secret. Pre-merge persisted tasks stored ChaCha20
+    // creds as separate `key` + `nonce` strings; the current schema exposes
+    // a single combined `secret`. Synthesize it here so the user sees
+    // their existing config without having to re-paste anything.
+    if (plugin.id === "chacha20" && slot.config && !slot.config.secret) {
+      const k = (slot.config.key || "").trim();
+      const n = (slot.config.nonce || "").trim();
+      if (k && n) slot.config.secret = k + n;
+    }
     const card = document.createElement("div");
     card.className = "plugin-card" + (slot.enabled ? " enabled" : "");
     card.dataset.pluginId = plugin.id;
@@ -3061,8 +3147,11 @@ function renderForwardResult(box, r) {
   // skip `volumes` (rendered above), `total_size`/`volume_count` (already
   // visible via the meta line and the volume list), and the boolean
   // `generated_*` flags (low signal once the user can see the secrets).
+  // `key` / `nonce` are also skipped because they're already contained in
+  // the unified `secret` field — showing all three would just be noise.
   const skip = new Set(['volumes', 'total_size', 'volume_count',
-                         'generated_key', 'generated_nonce']);
+                         'generated_key', 'generated_nonce', 'generated_secret',
+                         'key', 'nonce']);
   Object.entries(r.info || {}).forEach(([k, v]) => {
     if (skip.has(k)) return;
     const row = document.createElement("div");
@@ -3149,6 +3238,7 @@ $("#btn-create").onclick = async () => {
     auto_filename: $("#f-auto-filename").checked,
     rate_limit_bps: r.value || 0,
     rate_limit_algorithm: $("#f-algorithm").value,
+    content_disposition: $("#f-disposition").value,
     plugins: slots,
   };
   try {
@@ -3183,6 +3273,7 @@ $("#btn-edit-save").onclick = async () => {
     persist: $("#e-persist").checked,
     rate_limit_bps: r.value || 0,
     rate_limit_algorithm: $("#e-algorithm").value,
+    content_disposition: $("#e-disposition").value,
     plugins: slots,
   };
   try {

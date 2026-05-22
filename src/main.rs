@@ -268,7 +268,9 @@ async fn run_download(
     };
 
     let to_tty = !stdout_mode;
-    let mut rx = engine.stream_range(0, total - 1);
+    // CLI download mode = "give me the whole file"; treat as bounded — no
+    // need for head-zone shrinking (we want max throughput from byte 0).
+    let mut rx = engine.stream_range(0, total - 1, false);
     let mut written: u64 = 0;
     let start = std::time::Instant::now();
     let mut last_print = std::time::Instant::now();

@@ -68,10 +68,17 @@ struct GlobalCfg {
 
 #[derive(Deserialize, Default)]
 struct TaskCfg {
-    /// 32-byte hex-encoded encryption key.
+    /// Combined 44-byte hex string (`key || nonce`). Preferred form: one
+    /// piece to share, one piece to paste. When set, takes priority over the
+    /// legacy split fields below.
+    #[serde(default)]
+    secret: Option<String>,
+    /// 32-byte hex-encoded encryption key. Legacy field; kept for
+    /// backward-compat with persisted tasks created before the combined
+    /// `secret` field. Ignored when `secret` is present.
     #[serde(default)]
     key: Option<String>,
-    /// 12-byte hex-encoded nonce.
+    /// 12-byte hex-encoded nonce. Legacy companion of `key`.
     #[serde(default)]
     nonce: Option<String>,
 }
@@ -162,30 +169,21 @@ impl ProxyPlugin for ChaCha20Plugin {
     }
 
     fn task_fields(&self) -> Vec<ConfigField> {
-        vec![
-            ConfigField {
-                key: "key".into(),
-                label: "密钥 (32 字节 hex)".into(),
-                kind: FieldKind::Hex,
-                hint: Some("64 个十六进制字符;可点击右侧🎲随机生成".into()),
-                required: true,
-                generate_random_bytes: Some(KEY_LEN as u32),
-                default_filename: None,
-                path_mode: None,
-                options: None,
-            },
-            ConfigField {
-                key: "nonce".into(),
-                label: "Nonce (12 字节 hex)".into(),
-                kind: FieldKind::Hex,
-                hint: Some("24 个十六进制字符;与上面的密钥配套,可🎲随机生成".into()),
-                required: true,
-                generate_random_bytes: Some(NONCE_LEN as u32),
-                default_filename: None,
-                path_mode: None,
-                options: None,
-            },
-        ]
+        vec![ConfigField {
+            key: "secret".into(),
+            label: "解密密钥 (key+nonce 合并)".into(),
+            kind: FieldKind::Hex,
+            hint: Some(
+                "88 个十六进制字符 = 32 字节 key 拼接 12 字节 nonce;\
+                 一次分发一次粘贴,可点击🎲随机生成"
+                    .into(),
+            ),
+            required: true,
+            generate_random_bytes: Some((KEY_LEN + NONCE_LEN) as u32),
+            default_filename: None,
+            path_mode: None,
+            options: None,
+        }]
     }
 
     fn forward_fields(&self) -> Vec<ConfigField> {
@@ -316,7 +314,7 @@ impl ProxyPlugin for ChaCha20Plugin {
     }
 
     fn default_task_config(&self) -> serde_json::Value {
-        serde_json::json!({ "key": "", "nonce": "" })
+        serde_json::json!({ "secret": "" })
     }
 
     fn validate_global_config(&self, config: &serde_json::Value) -> Result<(), String> {
@@ -338,8 +336,7 @@ impl ProxyPlugin for ChaCha20Plugin {
     ) -> Result<(), String> {
         let t: TaskCfg = serde_json::from_value(task.clone())
             .map_err(|e| format!("task config: {e}"))?;
-        let _key = parse_key(t.key.as_deref())?;
-        let _nonce = parse_nonce(t.nonce.as_deref())?;
+        let _ = resolve_secret(&t)?;
         Ok(())
     }
 
@@ -350,8 +347,7 @@ impl ProxyPlugin for ChaCha20Plugin {
     ) -> Result<Arc<dyn ByteTransform>, String> {
         let t: TaskCfg = serde_json::from_value(task.clone())
             .map_err(|e| format!("task config: {e}"))?;
-        let key = parse_key(t.key.as_deref())?;
-        let nonce = parse_nonce(t.nonce.as_deref())?;
+        let (key, nonce) = resolve_secret(&t)?;
         Ok(Arc::new(ChaCha20Transform { key, nonce }))
     }
 
@@ -371,43 +367,31 @@ impl ProxyPlugin for ChaCha20Plugin {
         // Resolve / generate secrets first — fail fast before any disk IO.
         // Only relevant when actually encrypting; pure-split mode skips this
         // block entirely so the user can run the tool without ever touching
-        // a key/nonce field.
-        let mut generated_key = false;
-        let mut generated_nonce = false;
+        // a secret field.
+        let mut generated_secret = false;
         let (key_bytes, nonce_bytes) = if p.encrypt {
-            let key = match parse_key_opt(t.key.as_deref())? {
-                Some(k) => k,
+            match resolve_secret_opt(&t)? {
+                Some((k, n)) => (k, n),
                 None => {
                     if !p.generate_missing {
                         return Err(
-                            "missing task.key (encryption enabled and generate_missing is false)"
+                            "missing task.secret (encryption enabled and generate_missing is false)"
                                 .into(),
                         );
                     }
                     let mut k = [0u8; KEY_LEN];
                     rand::thread_rng().fill_bytes(&mut k);
-                    generated_key = true;
-                    k
-                }
-            };
-            let nonce = match parse_nonce_opt(t.nonce.as_deref())? {
-                Some(n) => n,
-                None => {
-                    if !p.generate_missing {
-                        return Err(
-                            "missing task.nonce (encryption enabled and generate_missing is false)"
-                                .into(),
-                        );
-                    }
                     let mut n = [0u8; NONCE_LEN];
                     rand::thread_rng().fill_bytes(&mut n);
-                    generated_nonce = true;
-                    n
+                    generated_secret = true;
+                    // Mirror into legacy fields too so persisted configs
+                    // remain backwards-compatible with older clients.
+                    t.secret = Some(combine_secret_hex(&k, &n));
+                    t.key = Some(hex::encode(k));
+                    t.nonce = Some(hex::encode(n));
+                    (k, n)
                 }
-            };
-            t.key = Some(hex::encode(key));
-            t.nonce = Some(hex::encode(nonce));
-            (key, nonce)
+            }
         } else {
             // Plain split mode — bytes pass through verbatim. The cipher
             // we'd build below is unused, but we still need *something* in
@@ -545,17 +529,19 @@ impl ProxyPlugin for ChaCha20Plugin {
         }
 
         // The info payload is intentionally different per mode so the UI's
-        // result panel doesn't surface meaningless zeros.
+        // result panel doesn't surface meaningless zeros. Encrypted output
+        // returns the combined `secret` (the single piece the receiver
+        // pastes) and the split key/nonce for backward compat.
         let info = if p.encrypt {
             serde_json::json!({
                 "encrypted": true,
+                "secret": combine_secret_hex(&key_bytes, &nonce_bytes),
                 "key": hex::encode(key_bytes),
                 "nonce": hex::encode(nonce_bytes),
                 "total_size": total_size,
                 "volume_count": written.len(),
                 "volumes": written,
-                "generated_key": generated_key,
-                "generated_nonce": generated_nonce,
+                "generated_secret": generated_secret,
             })
         } else {
             serde_json::json!({
@@ -572,9 +558,9 @@ impl ProxyPlugin for ChaCha20Plugin {
                 "已切分为 {} 个分卷 (未加密)。",
                 written.len()
             ))
-        } else if generated_key || generated_nonce {
+        } else if generated_secret {
             Some(
-                "已加密。新生成的密钥/Nonce 见下方,请立即复制保存,关闭后无法找回。"
+                "已加密。新生成的合并密钥 (secret) 见下方,请立即复制保存,关闭后无法找回。"
                     .to_string(),
             )
         } else {
@@ -747,12 +733,69 @@ impl ByteTransform for ChaCha20Transform {
     }
 }
 
-fn parse_key(s: Option<&str>) -> Result<[u8; KEY_LEN], String> {
-    parse_key_opt(s)?.ok_or_else(|| "task.key is required (32 bytes hex)".into())
+/// Resolve the (key, nonce) pair from a task config, accepting either the
+/// combined `secret` field (preferred) or the legacy split `key`/`nonce` pair.
+/// Errors if neither form is present or valid.
+fn resolve_secret(t: &TaskCfg) -> Result<([u8; KEY_LEN], [u8; NONCE_LEN]), String> {
+    resolve_secret_opt(t)?.ok_or_else(|| {
+        "task.secret is required (88 hex chars = 32-byte key + 12-byte nonce); \
+         the legacy `key` + `nonce` pair is also accepted"
+            .into()
+    })
 }
 
-fn parse_nonce(s: Option<&str>) -> Result<[u8; NONCE_LEN], String> {
-    parse_nonce_opt(s)?.ok_or_else(|| "task.nonce is required (12 bytes hex)".into())
+/// Same as `resolve_secret`, but returns `None` instead of erroring when the
+/// task carries no secret material at all — used by the forward tool, which
+/// can also generate fresh secrets when asked.
+fn resolve_secret_opt(
+    t: &TaskCfg,
+) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
+    if let Some(pair) = parse_secret_opt(t.secret.as_deref())? {
+        return Ok(Some(pair));
+    }
+    // Legacy fall-through: persisted tasks from before the merge still have
+    // separate key+nonce. Accept them as long as both are present.
+    let key = parse_key_opt(t.key.as_deref())?;
+    let nonce = parse_nonce_opt(t.nonce.as_deref())?;
+    match (key, nonce) {
+        (Some(k), Some(n)) => Ok(Some((k, n))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err("task.key set but task.nonce missing".into()),
+        (None, Some(_)) => Err("task.nonce set but task.key missing".into()),
+    }
+}
+
+/// Parse the combined `secret` hex string into a (key, nonce) pair. Empty /
+/// absent → `Ok(None)` (caller decides whether that's an error).
+fn parse_secret_opt(
+    s: Option<&str>,
+) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
+    let trimmed = s.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let s = match trimmed {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let bytes = hex::decode(s).map_err(|e| format!("secret hex decode: {e}"))?;
+    if bytes.len() != KEY_LEN + NONCE_LEN {
+        return Err(format!(
+            "secret must be exactly {} bytes (got {}); expected {} hex chars",
+            KEY_LEN + NONCE_LEN,
+            bytes.len(),
+            (KEY_LEN + NONCE_LEN) * 2
+        ));
+    }
+    let mut key = [0u8; KEY_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    key.copy_from_slice(&bytes[..KEY_LEN]);
+    nonce.copy_from_slice(&bytes[KEY_LEN..]);
+    Ok(Some((key, nonce)))
+}
+
+fn combine_secret_hex(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN]) -> String {
+    let mut all = Vec::with_capacity(KEY_LEN + NONCE_LEN);
+    all.extend_from_slice(key);
+    all.extend_from_slice(nonce);
+    hex::encode(all)
 }
 
 fn parse_key_opt(s: Option<&str>) -> Result<Option<[u8; KEY_LEN]>, String> {
@@ -884,6 +927,59 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("32 bytes"), "got: {}", err);
+    }
+
+    #[test]
+    fn combined_secret_accepted() {
+        // The 88-hex-char combined form (32-byte key + 12-byte nonce) is the
+        // preferred shape; the produced transform must match the legacy
+        // split-fields shape byte-for-byte.
+        let plugin = ChaCha20Plugin;
+        let secret = "0".repeat((KEY_LEN + NONCE_LEN) * 2);
+        let combined = serde_json::json!({ "secret": secret });
+        let legacy = serde_json::json!({ "key": fixed_key(), "nonce": fixed_nonce() });
+        let t1 = plugin.build_transform(&serde_json::Value::Null, &combined).unwrap();
+        let t2 = plugin.build_transform(&serde_json::Value::Null, &legacy).unwrap();
+        let mut a = b"some plaintext payload".to_vec();
+        let mut b = a.clone();
+        t1.transform(0, &mut a);
+        t2.transform(0, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn combined_secret_wrong_length_errors() {
+        let plugin = ChaCha20Plugin;
+        // 80 chars = 40 bytes — clearly not 44.
+        let task = serde_json::json!({ "secret": "a".repeat(80) });
+        let err = plugin
+            .build_transform(&serde_json::Value::Null, &task)
+            .err()
+            .unwrap();
+        assert!(err.contains("44") || err.contains("88"), "got: {}", err);
+    }
+
+    #[test]
+    fn combined_secret_overrides_legacy_fields() {
+        // When both `secret` and `key`/`nonce` are present, `secret` wins —
+        // matches the documented precedence in `resolve_secret_opt`.
+        let plugin = ChaCha20Plugin;
+        let secret = "f".repeat((KEY_LEN + NONCE_LEN) * 2);
+        // Legacy fields are deliberately different (all-zero) so a mistaken
+        // fall-through would produce different ciphertext.
+        let task = serde_json::json!({
+            "secret": secret,
+            "key": fixed_key(),
+            "nonce": fixed_nonce(),
+        });
+        let combined_only = serde_json::json!({ "secret": "f".repeat((KEY_LEN + NONCE_LEN) * 2) });
+        let t1 = plugin.build_transform(&serde_json::Value::Null, &task).unwrap();
+        let t2 = plugin.build_transform(&serde_json::Value::Null, &combined_only).unwrap();
+        let mut a = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut b = a.clone();
+        t1.transform(0, &mut a);
+        t2.transform(0, &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]

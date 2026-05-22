@@ -10,6 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// Adaptive first-chunk sizing for open-ended `Range: X-` requests. The
+/// leading `HEAD_SMALL_COUNT` chunks are capped at `HEAD_SMALL_SPLIT` so a
+/// player that issues `Range: 0-` purely to probe the file (and then seeks
+/// elsewhere) only has a few hundred KB of in-flight work to abandon.
+const HEAD_SMALL_SPLIT: u64 = 512 * 1024;
+const HEAD_SMALL_COUNT: usize = 4;
 
 /// One chunk of a multi-volume task: an ordered list of mirror URLs that all
 /// serve this volume's bytes, plus its position in the merged stream. A
@@ -708,28 +716,58 @@ impl Engine {
 
     /// Multi-threaded ordered streaming for a known byte range [start, end] inclusive.
     /// Returns a receiver that yields ordered Bytes chunks until the range is fully delivered.
+    ///
+    /// `open_ended` is true when the client's Range header had no explicit end
+    /// (i.e. `Range: X-`), or when there was no Range header at all. We use it
+    /// for two seek-related optimizations:
+    ///
+    /// 1. **Adaptive first chunks** — the leading few chunks are intentionally
+    ///    small (`HEAD_SMALL_SPLIT`) so that a player which only fetches a
+    ///    metadata-sized prefix before seeking has very little in-flight work
+    ///    to tear down. After the head zone we ramp up to the full `max_split`.
+    /// 2. **Hard cancellation** — when the client drops the connection the
+    ///    serializer aborts every still-running fetcher task instead of
+    ///    waiting for them to finish their current HTTP request. Without this
+    ///    a seek would compete with up to `max_threads × max_split` bytes of
+    ///    legacy traffic on the way down.
     pub fn stream_range(
         self: Arc<Self>,
         start: u64,
         end: u64,
+        open_ended: bool,
     ) -> mpsc::Receiver<Result<Bytes>> {
         let split = self.config.max_split.max(64 * 1024);
         let max_threads = self.config.max_threads.max(1);
 
         // Build chunk plan. In volume mode every chunk must live inside one
         // volume so the fetcher only ever talks to a single URL — split first
-        // along volume boundaries, then along `max_split`.
-        let plan = plan_chunks(start, end, split, self.volumes.as_deref().map(|v| v.as_slice()));
+        // along volume boundaries, then along `max_split`. When the request
+        // is open-ended (player will likely seek soon), peel a head zone of
+        // smaller chunks off the plan.
+        let head_split: Option<(u64, usize)> = if open_ended && split > HEAD_SMALL_SPLIT {
+            Some((HEAD_SMALL_SPLIT, HEAD_SMALL_COUNT))
+        } else {
+            None
+        };
+        let plan = plan_chunks_with_head(
+            start,
+            end,
+            split,
+            self.volumes.as_deref().map(|v| v.as_slice()),
+            head_split,
+        );
         let total_chunks = plan.len();
 
         tracing::debug!(
-            "stream_range [{}, {}] split={} max_threads={} vol_count={} chunks={}",
+            "stream_range [{}, {}] split={} max_threads={} vol_count={} chunks={} open_ended={} head_split={:?}",
             start,
             end,
             split,
             max_threads,
             self.volumes.as_deref().map(|v| v.len()).unwrap_or(1),
             total_chunks,
+            open_ended,
+            head_split,
         );
 
         // Per-chunk channels so fetchers can run concurrently while the
@@ -775,18 +813,25 @@ impl Engine {
         let engine_arc = Arc::clone(&self);
         let volumes_for_warmup = self.volumes.clone();
         tokio::spawn(async move {
-            let spawn_fetch =
-                |idx: usize, tx: mpsc::Sender<Result<Bytes>>, plan: &[(u64, u64)]| {
-                    let engine = Arc::clone(&engine_arc);
-                    let (cs, ce) = plan[idx];
-                    tokio::spawn(async move {
-                        let result = engine.fetch_chunk_to(idx, cs, ce, &tx).await;
-                        if let Err(e) = result {
-                            let _ = tx.send(Err(e)).await;
-                        }
-                        // `tx` dropped here — receiver for chunk `idx` closes.
-                    });
-                };
+            // Live handles for every fetcher we've spawned. On client
+            // disconnect we walk this list and `.abort()` each one so
+            // tokio cancels their HTTP requests immediately — that's the
+            // bandwidth claw-back that makes seeking responsive.
+            let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
+            let spawn_fetch = |idx: usize,
+                               tx: mpsc::Sender<Result<Bytes>>,
+                               plan: &[(u64, u64)]|
+             -> JoinHandle<()> {
+                let engine = Arc::clone(&engine_arc);
+                let (cs, ce) = plan[idx];
+                tokio::spawn(async move {
+                    let result = engine.fetch_chunk_to(idx, cs, ce, &tx).await;
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                    // `tx` dropped here — receiver for chunk `idx` closes.
+                })
+            };
 
             // Initial window: start the first `max_threads` chunks in plan
             // order. Chunk 0 is always in this set, so the serializer can
@@ -796,7 +841,7 @@ impl Engine {
                 let tx = senders[idx]
                     .take()
                     .expect("sender should be present on first spawn");
-                spawn_fetch(idx, tx, &plan);
+                handles.push(spawn_fetch(idx, tx, &plan));
             }
 
             // Cross-volume warm-up: for every volume *not* represented in the
@@ -823,7 +868,7 @@ impl Engine {
                     }
                     if let Some(idx) = vol_of.iter().position(|&v| v == vi) {
                         if let Some(tx) = senders[idx].take() {
-                            spawn_fetch(idx, tx, &plan);
+                            handles.push(spawn_fetch(idx, tx, &plan));
                             warmed.push(idx);
                         }
                     }
@@ -843,12 +888,29 @@ impl Engine {
                 while let Some(item) = rx.recv().await {
                     let is_err = item.is_err();
                     if out_tx.send(item).await.is_err() {
-                        // Client dropped the connection — abandon the rest.
-                        tracing::debug!("client gone at chunk {}, abandoning stream", i);
+                        // Client dropped the connection — abandon the rest
+                        // AND abort every still-running fetcher so their
+                        // upstream HTTP requests are cancelled immediately.
+                        // Without the explicit abort each in-flight fetcher
+                        // would burn its current chunk to completion before
+                        // noticing the receiver vanished, leaving up to
+                        // `max_threads × max_split` bytes racing the user's
+                        // next seek for bandwidth.
+                        tracing::debug!(
+                            "client gone at chunk {}, aborting {} in-flight fetcher(s)",
+                            i,
+                            handles.len(),
+                        );
+                        for h in &handles {
+                            h.abort();
+                        }
                         return;
                     }
                     if is_err {
                         tracing::debug!("chunk {} produced an error, ending stream", i);
+                        for h in &handles {
+                            h.abort();
+                        }
                         return;
                     }
                 }
@@ -858,7 +920,7 @@ impl Engine {
                     let idx = next_to_spawn;
                     next_to_spawn += 1;
                     if let Some(tx) = senders[idx].take() {
-                        spawn_fetch(idx, tx, &plan);
+                        handles.push(spawn_fetch(idx, tx, &plan));
                         break;
                     }
                 }
@@ -1686,6 +1748,57 @@ fn plan_chunks(
     plan
 }
 
+/// `plan_chunks` plus an optional "head zone" of smaller chunks. The first
+/// `head.1` chunks of the resulting plan are capped at `head.0` bytes; the
+/// rest of the plan is unchanged. Used by `stream_range` to keep open-ended
+/// `Range: X-` requests cheap to cancel.
+fn plan_chunks_with_head(
+    start: u64,
+    end: u64,
+    split: u64,
+    volumes: Option<&[VolumeMeta]>,
+    head: Option<(u64, usize)>,
+) -> Vec<(u64, u64)> {
+    let plan = plan_chunks(start, end, split, volumes);
+    let (small_size, small_count) = match head {
+        Some(h) if h.0 > 0 && h.1 > 0 => h,
+        _ => return plan,
+    };
+    // Walk the plan prefix, splitting any oversized chunk into a small head
+    // piece plus a remainder. We stop once we've emitted `small_count` head
+    // pieces; everything beyond stays at the original split size.
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(plan.len() + small_count);
+    let mut head_emitted: usize = 0;
+    let mut iter = plan.into_iter().peekable();
+    while head_emitted < small_count {
+        let (cs, ce) = match iter.next() {
+            Some(p) => p,
+            None => break,
+        };
+        let len = ce - cs + 1;
+        if len <= small_size {
+            out.push((cs, ce));
+            head_emitted += 1;
+            continue;
+        }
+        // Split this chunk into a small head piece and a remainder.
+        let head_end = cs + small_size - 1;
+        out.push((cs, head_end));
+        head_emitted += 1;
+        // Re-process the remainder: if we still have head budget AND the
+        // remainder is itself > small_size, we'll split it again on the next
+        // loop iteration. Push it back via a small detour through the iter.
+        let remainder = (head_end + 1, ce);
+        // Build a fresh iterator: remainder followed by everything still in `iter`.
+        let mut tail: Vec<(u64, u64)> = Vec::with_capacity(1 + iter.len());
+        tail.push(remainder);
+        tail.extend(iter);
+        iter = tail.into_iter().peekable();
+    }
+    out.extend(iter);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,6 +1861,65 @@ mod tests {
             plan,
             vec![(0, 29), (30, 59), (60, 89), (90, 99)]
         );
+    }
+
+    #[test]
+    fn head_split_is_noop_when_no_head_requested() {
+        let p1 = plan_chunks(0, 99, 30, None);
+        let p2 = plan_chunks_with_head(0, 99, 30, None, None);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn head_split_carves_small_prefix_from_oversize_first_chunk() {
+        // One big virtual chunk (split=10MB, range=10MB). Head config asks
+        // for 4 chunks of 256KB. Result: 4 × 256KB head + the remainder.
+        let split = 10 * 1024 * 1024u64;
+        let small = 256 * 1024u64;
+        let plan = plan_chunks_with_head(0, split - 1, split, None, Some((small, 4)));
+        assert_eq!(plan[0], (0, small - 1));
+        assert_eq!(plan[1], (small, 2 * small - 1));
+        assert_eq!(plan[2], (2 * small, 3 * small - 1));
+        assert_eq!(plan[3], (3 * small, 4 * small - 1));
+        // Remainder is one big chunk that goes back to the original split size.
+        assert_eq!(plan[4], (4 * small, split - 1));
+        assert_eq!(plan.len(), 5);
+    }
+
+    #[test]
+    fn head_split_keeps_natural_small_chunks_intact() {
+        // If the natural plan already produced chunks ≤ small_size, no further
+        // splitting should happen — head_emitted just consumes them in place.
+        let plan = plan_chunks_with_head(0, 99, 30, None, Some((50 * 1024, 4)));
+        // Original plan: (0,29) (30,59) (60,89) (90,99) — all under 50K.
+        assert_eq!(plan, vec![(0, 29), (30, 59), (60, 89), (90, 99)]);
+    }
+
+    #[test]
+    fn head_split_respects_volume_boundaries() {
+        // Two volumes [0..100), [100..250). split = 80. Head config = 2 chunks
+        // of 30 bytes. The first volume's first chunk (0..79) gets split into
+        // (0,29) + (30,59) + remainder (60,79); then we leave normal sizing.
+        let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
+        let plan = plan_chunks_with_head(0, 249, 80, Some(&vols), Some((30, 2)));
+        // Expected: head chunks 0..29 and 30..59 (the two small head pieces),
+        // then the remainder of vol a chunk (60..79), then vol a's second
+        // chunk (80..99), then vol b's two chunks.
+        assert_eq!(plan[0], (0, 29));
+        assert_eq!(plan[1], (30, 59));
+        assert_eq!(plan[2], (60, 79));
+        assert_eq!(plan[3], (80, 99));
+        assert_eq!(plan[4], (100, 179));
+        assert_eq!(plan[5], (180, 249));
+        // No chunk crosses a volume boundary.
+        for (cs, ce) in &plan {
+            for v in &vols {
+                let v_end = v.offset + v.size - 1;
+                if *cs >= v.offset && *cs < v.offset + v.size {
+                    assert!(*ce <= v_end, "chunk ({}..={}) leaks across volume", cs, ce);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1903,6 +2075,7 @@ mod tests {
             rate_limit_algorithm: Default::default(),
             persist: false,
             plugins: Vec::new(),
+            content_disposition: Default::default(),
         };
         // Empty mirror strings and empty volumes are scrubbed; valid order
         // is preserved.

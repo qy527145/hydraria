@@ -3,8 +3,8 @@ use crate::engine::{Engine, UpstreamProbe, parse_range_header, suggest_volume_fi
 use crate::error::ProxyError;
 use crate::fs_pick::{self, PickRequest, PickResponse};
 use crate::models::{
-    AppState, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry, TaskInfo, TaskUpdate,
-    short_id,
+    AppState, ContentDispositionMode, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry,
+    TaskInfo, TaskUpdate, short_id,
 };
 use crate::plugins::{ForwardResult, PluginInfo};
 use axum::body::Body;
@@ -179,6 +179,7 @@ async fn probe_urls(
         rate_limit_algorithm: Default::default(),
         persist: false,
         plugins: Vec::new(),
+        content_disposition: Default::default(),
     };
     cfg.normalize();
     let layout = cfg.effective_volumes();
@@ -367,16 +368,29 @@ async fn handle_stream(
     // CIPHERTEXT (typically `application/octet-stream` from a CDN), not the
     // payload we're about to serve. Override using the served filename's
     // extension when that produces something more specific — otherwise
-    // <video>/<audio> tags happily download but refuse to render.
-    if cfg.plugins.iter().any(|p| p.enabled) {
+    // <video>/<audio> tags happily download but refuse to render. The
+    // `Inline` content-disposition mode applies the same override even when
+    // no plugin is active — user explicitly asked for preview, so we lift
+    // the upstream's generic MIME the same way.
+    let force_mime_from_filename = cfg.plugins.iter().any(|p| p.enabled)
+        || cfg.content_disposition == ContentDispositionMode::Inline;
+    if force_mime_from_filename {
         if let Some(name) = &probe.filename {
             let guessed = mime_guess::from_path(name).first_or_octet_stream();
             let g = guessed.essence_str();
+            // Override only when the upstream's CT was missing or generic —
+            // a real `video/mp4` from the origin should not be clobbered.
+            let upstream_is_generic = probe
+                .content_type
+                .as_deref()
+                .map(|ct| ct.eq_ignore_ascii_case("application/octet-stream"))
+                .unwrap_or(true);
             if g != "application/octet-stream"
+                && upstream_is_generic
                 && probe.content_type.as_deref() != Some(g)
             {
                 tracing::debug!(
-                    "task={} plugin pipeline active; overriding Content-Type from upstream {:?} → {} (from filename '{}')",
+                    "task={} forcing Content-Type from upstream {:?} → {} (from filename '{}')",
                     task_id, probe.content_type, g, name,
                 );
                 probe.content_type = Some(g.to_string());
@@ -428,8 +442,17 @@ async fn handle_stream(
             .with_pipeline(pipeline),
     );
 
-    build_stream_response(state, task_id, entry, engine, probe, range_header, head_only)
-        .await
+    build_stream_response(
+        state,
+        task_id,
+        entry,
+        engine,
+        probe,
+        range_header,
+        head_only,
+        cfg.content_disposition,
+    )
+    .await
 }
 
 /// Decide which filename (if any) to advertise on Content-Disposition.
@@ -505,6 +528,7 @@ async fn build_stream_response(
     probe: UpstreamProbe,
     range_header: Option<String>,
     head_only: bool,
+    disposition: ContentDispositionMode,
 ) -> Result<Response, ProxyError> {
     let _ = state; // reserved for future per-state telemetry
 
@@ -525,7 +549,7 @@ async fn build_stream_response(
         }
     }
     if let Some(name) = &probe.filename {
-        if let Some(cd) = build_content_disposition(name) {
+        if let Some(cd) = build_content_disposition(name, disposition) {
             if let Ok(v) = HeaderValue::from_str(&cd) {
                 resp_headers.insert(header::CONTENT_DISPOSITION, v);
             }
@@ -605,8 +629,16 @@ async fn build_stream_response(
 
     let total = probe.total_size.unwrap();
     let had_range = range_header.is_some();
+    // Open-ended: client either sent no Range header at all or sent
+    // `Range: X-` (no explicit upper bound). These are the requests where a
+    // seek is most likely to come next, so the engine applies its head-zone
+    // + abort-on-disconnect optimizations to keep seek latency low.
+    let mut open_ended = !had_range;
     let (start, end) = if let Some(rh) = range_header {
         let (s, e) = parse_range_header(&rh, Some(total))?;
+        if e.is_none() {
+            open_ended = true;
+        }
         let end = e.unwrap_or(total - 1).min(total - 1);
         if s > end {
             return Err(ProxyError::InvalidRange(rh));
@@ -648,7 +680,7 @@ async fn build_stream_response(
     let task_limiter = Arc::clone(&entry.limiter);
     let global_limiter = Arc::clone(&state.global_limiter);
 
-    let rx = engine.stream_range(start, end);
+    let rx = engine.stream_range(start, end, open_ended);
     let stream = ReceiverStream::new(rx).then(move |item| {
         let entry_for_count = Arc::clone(&entry_for_count);
         let state_for_count = state_for_count.clone();
@@ -679,12 +711,21 @@ async fn build_stream_response(
 /// Build an RFC 6266-compliant Content-Disposition header value for a filename.
 /// Emits both an ASCII `filename=` fallback and an RFC 5987 `filename*=UTF-8''…`
 /// form whenever the name contains anything non-ASCII or quote-unsafe, so old
-/// clients see something readable while modern ones get the exact name.
-fn build_content_disposition(filename: &str) -> Option<String> {
+/// clients see something readable while modern ones get the exact name. The
+/// `disposition` knob picks `inline` (the historic default and the explicit
+/// preview mode) vs `attachment` (force-download).
+fn build_content_disposition(
+    filename: &str,
+    disposition: ContentDispositionMode,
+) -> Option<String> {
     let name = filename.trim();
     if name.is_empty() {
         return None;
     }
+    let disp_token = match disposition {
+        ContentDispositionMode::Attachment => "attachment",
+        ContentDispositionMode::Auto | ContentDispositionMode::Inline => "inline",
+    };
     let needs_encoding = name
         .bytes()
         .any(|b| !b.is_ascii() || b < 0x20 || b == b'"' || b == b'\\');
@@ -699,12 +740,12 @@ fn build_content_disposition(filename: &str) -> Option<String> {
         })
         .collect();
     if !needs_encoding {
-        Some(format!("inline; filename=\"{}\"", ascii_fallback))
+        Some(format!("{}; filename=\"{}\"", disp_token, ascii_fallback))
     } else {
         let encoded = percent_encode_rfc5987(name);
         Some(format!(
-            "inline; filename=\"{}\"; filename*=UTF-8''{}",
-            ascii_fallback, encoded
+            "{}; filename=\"{}\"; filename*=UTF-8''{}",
+            disp_token, ascii_fallback, encoded
         ))
     }
 }
