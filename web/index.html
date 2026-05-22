@@ -2235,13 +2235,38 @@ function applyParsedConfig(cfg, sourceLabel, scope) {
     $(`#${scope}-output-filename`).value = cfg.output_filename || "";
   if (!merge || has("content_disposition"))
     $(`#${scope}-disposition`).value = cfg.content_disposition || "auto";
-  if (scope === "f") {
-    revalidateCreate();
-    if (typeof saveCreateDraft === "function") saveCreateDraft();
-  } else {
-    revalidateEdit();
+
+  // Plugin slots: only touch them when the imported cfg actually carried a
+  // `plugins` array, so a URL-list paste doesn't blow away the user's
+  // existing per-task plugin config. saveCreateDraft (called below for "f")
+  // re-reads the rendered slots, so the imported plugins persist into the
+  // draft and survive a modal close/reopen.
+  const finalize = () => {
+    if (scope === "f") {
+      revalidateCreate();
+      if (typeof saveCreateDraft === "function") saveCreateDraft();
+    } else {
+      revalidateEdit();
+    }
+    toast("已从" + sourceLabel + "导入", "ok");
+  };
+  if (has("plugins") && Array.isArray(cfg.plugins)) {
+    const renderAndFinalize = () => {
+      renderTaskPluginSlots(scope, cfg.plugins);
+      finalize();
+    };
+    // Catalog should already be loaded (the import modal can only be opened
+    // from inside an already-open create/edit modal, which awaits a refresh
+    // on open). Refresh lazily just in case — preserves the import even if
+    // a future refactor pops the import dialog earlier in the lifecycle.
+    if (pluginCatalog.length === 0) {
+      refreshPluginCatalog().then(renderAndFinalize);
+    } else {
+      renderAndFinalize();
+    }
+    return;
   }
-  toast("已从" + sourceLabel + "导入", "ok");
+  finalize();
 }
 
 $("#btn-f-import").onclick = () => {
