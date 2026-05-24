@@ -461,7 +461,7 @@
   }
   .health-row {
     display: grid;
-    grid-template-columns: auto 1fr auto auto auto;
+    grid-template-columns: auto 1fr auto auto auto auto auto;
     gap: 10px;
     align-items: center;
     padding: 8px 10px;
@@ -496,6 +496,11 @@
     font-size: 11px;
   }
   .health-row .src-metric .unit { color: var(--muted); margin-left: 2px; }
+  .health-row .src-metric.src-inflight.active {
+    color: var(--good);
+    font-weight: 600;
+  }
+  .health-row .src-metric.src-vol-idle { opacity: 0.55; }
   .health-row .err { grid-column: 1 / -1; color: var(--bad); font-size: 11px; padding-left: 0; }
 
   /* Buttons */
@@ -661,6 +666,34 @@
     font-size: 11px;
   }
   .vol-card textarea { min-height: 56px; margin: 0; }
+  /* Whole-section collapse: hides every card + insertion gap behind a single
+     summary bar. Single-card collapse was removed — useless when you have
+     43 volumes; you want them all out of the way, not one at a time. */
+  .vol-host-collapsed .vol-card,
+  .vol-host-collapsed .vol-gap { display: none; }
+  .vol-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .vol-summary:hover { background: var(--panel-3); color: var(--text-dim); }
+  .vol-summary .vol-summary-chev {
+    display: inline-block;
+    transition: transform 0.15s ease;
+  }
+  .vol-host-collapsed + * .vol-summary-chev,
+  .vol-host-collapsed .vol-summary-chev { transform: rotate(-90deg); }
 
   /* Drag handle: only this glyph is draggable, so textarea text selection
      and clicks elsewhere on the card stay normal. */
@@ -925,11 +958,16 @@
       </div>
       <div id="f-volumes-host"></div>
       <button type="button" class="ghost" id="btn-f-add-volume" style="margin-top: 8px;">+ 添加分卷</button>
+      <button type="button" class="ghost" id="btn-f-toggle-all" style="margin-top: 8px;" data-tip="折叠/展开所有分卷">⇕ 全部折叠</button>
 
       <div class="row">
         <div>
           <label class="field">最大并发线程</label>
           <input id="f-threads" type="number" value="16" min="1" max="128" />
+        </div>
+        <div>
+          <label class="field">单卷并发上限 <span class="hint-inline">每卷最多同时打开几条连接</span></label>
+          <input id="f-per-volume" type="number" value="4" min="1" max="128" />
         </div>
         <div>
           <label class="field">分片大小 <span class="hint-inline">如 5M / 1M / 512K</span></label>
@@ -1026,11 +1064,16 @@
       </label>
       <div id="e-volumes-host"></div>
       <button type="button" class="ghost" id="btn-e-add-volume" style="margin-top: 8px;">+ 添加分卷</button>
+      <button type="button" class="ghost" id="btn-e-toggle-all" style="margin-top: 8px;" data-tip="折叠/展开所有分卷">⇕ 全部折叠</button>
 
       <div class="row">
         <div>
           <label class="field">线程数</label>
           <input id="e-threads" type="number" min="1" max="128" />
+        </div>
+        <div>
+          <label class="field">单卷并发上限</label>
+          <input id="e-per-volume" type="number" min="1" max="128" />
         </div>
         <div>
           <label class="field">分片大小</label>
@@ -1121,9 +1164,14 @@
       <div class="hint" id="s-algorithm-hint">切换会立刻生效，已累计的预算被清零。</div>
 
       <div style="margin-top: 18px; padding: 14px; background: var(--panel-2); border-radius: 8px; border: 1px solid var(--border);">
-        <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px;">缓存占用 (当前进程)</div>
-        <div style="font-size: 20px; font-weight: 600; margin-top: 4px;" id="s-cache-total">0 B</div>
-        <div style="font-size: 11px; color: var(--muted); margin-top: 4px;" id="s-cache-detail"></div>
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+          <div>
+            <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px;">缓存占用 (当前进程)</div>
+            <div style="font-size: 20px; font-weight: 600; margin-top: 4px;" id="s-cache-total">0 B</div>
+            <div style="font-size: 11px; color: var(--muted); margin-top: 4px;" id="s-cache-detail"></div>
+          </div>
+          <button type="button" class="danger" id="btn-clear-all-cache" data-tip="清空所有任务的磁盘缓存">🗑 清空全部缓存</button>
+        </div>
       </div>
 
       <div class="modal-actions">
@@ -1506,10 +1554,19 @@ function renderHealthPanel(t) {
   const rows = (t.url_health || []).map(h => {
     const cls = healthClass(h);
     const speed = h.current_speed_bps > 0 ? fmtBps(h.current_speed_bps) : '0 B/s';
+    const inFlight = h.in_flight_requests || 0;
+    const inFlightBadge = inFlight > 0
+      ? `<span class="src-metric src-inflight active" data-tip="当前连接数">⇅ ${inFlight}</span>`
+      : `<span class="src-metric src-inflight" data-tip="当前连接数">⇅ ${inFlight}</span>`;
+    const volSize = typeof h.volume_size === "number"
+      ? `<span class="src-metric" data-tip="所属卷大小">📦 ${fmtBytes(h.volume_size)}</span>`
+      : `<span class="src-metric src-vol-idle" data-tip="卷大小未探测">📦 —</span>`;
     return `
       <div class="health-row">
         <span class="src-status ${cls}">${h.last_status || (h.last_error ? 'ERR' : '—')}</span>
         <span class="src-url" title="${escapeHtml(h.url)}">${escapeHtml(h.url)}</span>
+        ${inFlightBadge}
+        ${volSize}
         <span class="src-metric" data-tip="last latency / ping">${fmtMs(h.last_latency_ms)}</span>
         <span class="src-metric" data-tip="current speed">${speed}</span>
         <span class="src-metric" data-tip="bytes contributed">${fmtBytes(h.bytes_contributed)}</span>
@@ -1636,26 +1693,13 @@ function attachCardEvents(root) {
     if (!t) return;
     // Open create modal pre-filled from the source task's config. Volume
     // URLs are also copied — user usually wants to keep cookies/headers and
-    // tweak the URLs.
+    // tweak the URLs. We delegate to applyParsedConfig so every field the
+    // backend persists (plugins, content_disposition, max_per_volume, ...)
+    // is mirrored without re-listing them here.
     openCreate();
-    const c = t.config;
-    if (Array.isArray(c.volumes) && c.volumes.length) {
-      renderVolumesEditor("f", c.volumes);
-    }
-    $("#f-threads").value = c.max_threads;
-    $("#f-split").value = fmtBytesPlain(c.max_split);
-    $("#f-cache").checked = !!c.cache;
-    $("#f-persist").checked = !!c.persist;
-    $("#f-algorithm").value = c.rate_limit_algorithm || "token_bucket";
-    $("#f-name").value = c.name ? c.name + " (副本)" : "";
-    $("#f-rate").value = c.rate_limit_bps ? fmtBytesPlain(c.rate_limit_bps) : "";
-    $("#f-headers").value = c.headers && Object.keys(c.headers).length
-      ? JSON.stringify(c.headers, null, 2) : "";
-    $("#f-auto-filename").checked = c.auto_filename !== false;
-    $("#f-output-filename").value = c.output_filename || "";
-    revalidateCreate();
-    if (typeof saveCreateDraft === "function") saveCreateDraft();
-    toast("已从任务 " + id + " 克隆配置", "ok");
+    const c = { ...t.config };
+    if (c.name) c.name = c.name + " (副本)";
+    applyParsedConfig(c, "任务 " + id, "f");
   });
   root.querySelectorAll("[data-export]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
@@ -1751,8 +1795,34 @@ async function doAction(path, method, okMsg) {
  */
 function renderVolumesEditor(scope, volumes) {
   const host = $(`#${scope}-volumes-host`);
+  // Whole-section collapse: remembered on the host via a single boolean
+  // dataset flag. Default is "collapsed when more than 3 volumes" — once
+  // the user toggles, that decision sticks until the modal is reopened.
+  const realVols = volumes.length === 0 ? [[""]] : volumes;
+  let collapsed;
+  if (host.dataset.collapsed === "1") collapsed = true;
+  else if (host.dataset.collapsed === "0") collapsed = false;
+  else collapsed = realVols.length > 3;
+  host.dataset.collapsed = collapsed ? "1" : "0";
+  host.classList.toggle("vol-host-collapsed", collapsed);
+
   host.innerHTML = "";
-  const list = volumes.length === 0 ? [[""]] : volumes;
+
+  const totalUrls = realVols.reduce((a, v) => a + v.filter(u => u && u.trim()).length, 0);
+  const summary = document.createElement("div");
+  summary.className = "vol-summary";
+  summary.innerHTML = `
+    <span><span class="vol-summary-chev">▾</span>
+      &nbsp;${realVols.length === 1 ? "1 个分卷" : `${realVols.length} 个分卷`} · ${totalUrls} 个 URL</span>
+    <span style="font-size: 11px; opacity: 0.7;">${collapsed ? "点击展开" : "点击折叠"}</span>
+  `;
+  summary.addEventListener("click", () => {
+    host.dataset.collapsed = collapsed ? "0" : "1";
+    renderVolumesEditor(scope, readVolumes(scope));
+  });
+  host.appendChild(summary);
+
+  const list = realVols;
   const revalidate = () => {
     if (scope === "f") {
       revalidateCreate();
@@ -1762,6 +1832,9 @@ function renderVolumesEditor(scope, volumes) {
     }
   };
   const rerender = (next) => {
+    // Indexes after add/remove/reorder no longer line up with the saved
+    // collapse set, so let the next render recompute defaults.
+    delete host.dataset.collapsed;
     renderVolumesEditor(scope, next);
     revalidate();
   };
@@ -1843,7 +1916,10 @@ function renderVolumesEditor(scope, volumes) {
     });
 
     const title = document.createElement("span");
-    title.textContent = list.length > 1 ? `卷 ${idx + 1}` : "唯一卷";
+    const mirrorCount = mirrors.filter(u => u && u.trim()).length;
+    title.textContent = list.length > 1
+      ? `卷 ${idx + 1}${mirrorCount ? ` · ${mirrorCount} 镜像` : ""}`
+      : "唯一卷";
     const stats = document.createElement("span");
     stats.className = "vol-stats";
 
@@ -2000,15 +2076,29 @@ function revalidateEdit() {
 $("#btn-f-add-volume").addEventListener("click", () => {
   const vols = readVolumes("f");
   vols.push([""]);
+  delete $("#f-volumes-host").dataset.collapsed;
   renderVolumesEditor("f", vols);
   revalidateCreate();
 });
 $("#btn-e-add-volume").addEventListener("click", () => {
   const vols = readVolumes("e");
   vols.push([""]);
+  delete $("#e-volumes-host").dataset.collapsed;
   renderVolumesEditor("e", vols);
   revalidateEdit();
 });
+
+// Bulk collapse/expand. Flips the host-level flag; the summary bar shows
+// the same state. Click handler on the summary already does this, but the
+// buttons stay for discoverability.
+function toggleAllVolumes(scope) {
+  const host = $(`#${scope}-volumes-host`);
+  const isCollapsed = host.dataset.collapsed === "1";
+  host.dataset.collapsed = isCollapsed ? "0" : "1";
+  renderVolumesEditor(scope, readVolumes(scope));
+}
+$("#btn-f-toggle-all").addEventListener("click", () => toggleAllVolumes("f"));
+$("#btn-e-toggle-all").addEventListener("click", () => toggleAllVolumes("e"));
 
 /* ---- output filename + probe controls ----
  * `auto` checkbox toggles whether the filename input is the authoritative
@@ -2077,7 +2167,7 @@ bindFilenameControls("e");
 // explicit Cancel (both communicate intent to discard).
 const CREATE_DRAFT_KEY = "hydraria.createDraft.v1";
 const CREATE_DEFAULTS = {
-  headers: "", name: "", rate: "", threads: "16", split: "5M",
+  headers: "", name: "", rate: "", threads: "16", perVolume: "4", split: "5M",
   cache: false, persist: false, algorithm: "token_bucket",
   volumes: [], autoFilename: true, outputFilename: "",
   contentDisposition: "auto",
@@ -2097,6 +2187,7 @@ function saveCreateDraft() {
     name: $("#f-name").value,
     rate: $("#f-rate").value,
     threads: $("#f-threads").value,
+    perVolume: $("#f-per-volume").value,
     split: $("#f-split").value,
     cache: $("#f-cache").checked,
     persist: $("#f-persist").checked,
@@ -2118,10 +2209,12 @@ function openCreate() {
   $("#f-name").value = d.name ?? "";
   $("#f-rate").value = d.rate ?? "";
   $("#f-threads").value = d.threads ?? "16";
+  $("#f-per-volume").value = d.perVolume ?? "4";
   $("#f-split").value = d.split ?? "5M";
   $("#f-cache").checked = !!d.cache;
   $("#f-persist").checked = !!d.persist;
   $("#f-algorithm").value = d.algorithm ?? "token_bucket";
+  delete $("#f-volumes-host").dataset.collapsed;
   renderVolumesEditor("f", Array.isArray(d.volumes) ? d.volumes : []);
   $("#f-auto-filename").checked = d.autoFilename !== false;
   $("#f-output-filename").value = d.outputFilename ?? "";
@@ -2190,6 +2283,7 @@ function parseImport(text) {
       if (vols.length === 0) return { error: "JSON 缺少非空的 volumes 数组" };
       return {
         config: cfg,
+        mode: "json",
         summary: `JSON · ${vols.length} 卷 / ${vols.reduce((a, v) => a + v.length, 0)} 个 URL`,
       };
     } catch (e) {
@@ -2212,7 +2306,7 @@ function parseImport(text) {
   if (volumes.length === 0) return { error: "未识别出任何 http(s) URL" };
   const summary = `URL 列表 · ${volumes.length} 卷 / ${volumes.reduce((a, v) => a + v.length, 0)} 个 URL`
     + (bad ? ` (忽略 ${bad} 行非 URL)` : "");
-  return { config: { volumes }, summary };
+  return { config: { volumes }, mode: "urls", summary };
 }
 
 // Apply a parsed config to the create or edit form, taking care to reset
@@ -2220,13 +2314,33 @@ function parseImport(text) {
 // through. `scope` selects which form ("f" = create, "e" = edit). Edit mode
 // only touches fields the import explicitly carried, so a URL-only paste
 // doesn't blow away the user's existing threads / cache / headers settings.
-function applyParsedConfig(cfg, sourceLabel, scope) {
+function applyParsedConfig(cfg, sourceLabel, scope, mode) {
   scope = scope === "e" ? "e" : "f";
+  const volHost = $(`#${scope}-volumes-host`);
+  // URL-list paste: caller's intent is "overwrite the volumes URLs, leave
+  // everything else (threads, plugins, headers, ...) untouched". Applies
+  // in both create and edit scopes — a clone's pre-filled plugin config
+  // would otherwise be wiped by a follow-up URL-only paste.
+  if (mode === "urls") {
+    delete volHost.dataset.collapsed;
+    renderVolumesEditor(scope, Array.isArray(cfg.volumes) ? cfg.volumes : []);
+    if (scope === "f") {
+      revalidateCreate();
+      if (typeof saveCreateDraft === "function") saveCreateDraft();
+    } else {
+      revalidateEdit();
+    }
+    toast("已从" + sourceLabel + "导入 URL", "ok");
+    return;
+  }
   const merge = scope === "e"; // edit = merge; create = full reset
   const has = (k) => Object.prototype.hasOwnProperty.call(cfg, k);
+  delete volHost.dataset.collapsed;
   renderVolumesEditor(scope, Array.isArray(cfg.volumes) ? cfg.volumes : []);
   if (!merge || has("max_threads"))
     $(`#${scope}-threads`).value = typeof cfg.max_threads === "number" ? cfg.max_threads : 16;
+  if (!merge || has("max_per_volume"))
+    $(`#${scope}-per-volume`).value = typeof cfg.max_per_volume === "number" ? cfg.max_per_volume : 4;
   if (!merge || has("max_split"))
     $(`#${scope}-split`).value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "5M";
   if (!merge || has("cache"))
@@ -2309,7 +2423,7 @@ $("#btn-import-cancel").onclick = closeImport;
 $("#btn-import-apply").onclick = () => {
   const r = parseImport($("#import-text").value);
   if (r.error) { toast("导入失败：" + r.error, "error"); return; }
-  applyParsedConfig(r.config, "粘贴内容", importScope);
+  applyParsedConfig(r.config, "粘贴内容", importScope, r.mode);
   closeImport();
 };
 $("#btn-import-file").onclick = () => {
@@ -2323,7 +2437,7 @@ $("#f-import-file").addEventListener("change", async (e) => {
     const text = await file.text();
     const r = parseImport(text);
     if (r.error) { toast("导入失败：" + r.error, "error"); return; }
-    applyParsedConfig(r.config, file.name, "f");
+    applyParsedConfig(r.config, file.name, "f", r.mode);
     closeImport();
   } catch (err) {
     toast("读取文件失败：" + err.message, "error");
@@ -2338,7 +2452,7 @@ $("#e-import-file").addEventListener("change", async (e) => {
     const text = await file.text();
     const r = parseImport(text);
     if (r.error) { toast("导入失败：" + r.error, "error"); return; }
-    applyParsedConfig(r.config, file.name, "e");
+    applyParsedConfig(r.config, file.name, "e", r.mode);
     closeImport();
   } catch (err) {
     toast("读取文件失败：" + err.message, "error");
@@ -2357,6 +2471,7 @@ $("#btn-create").onclick = async () => {
   const payload = {
     volumes: u.volumes,
     max_threads: parseInt($("#f-threads").value, 10) || 8,
+    max_per_volume: parseInt($("#f-per-volume").value, 10) || 4,
     max_split: s.value,
     cache: $("#f-cache").checked,
     persist: $("#f-persist").checked,
@@ -2388,8 +2503,10 @@ function openEdit(id) {
   const layout = Array.isArray(t.config.volumes)
     ? t.config.volumes.filter(v => v.length)
     : [];
+  delete $("#e-volumes-host").dataset.collapsed;
   renderVolumesEditor("e", layout);
   $("#e-threads").value = t.config.max_threads;
+  $("#e-per-volume").value = typeof t.config.max_per_volume === "number" ? t.config.max_per_volume : 4;
   $("#e-split").value = (fmtBytes(t.config.max_split)).replace(/ /g, '');
   $("#e-headers").value = Object.keys(t.config.headers || {}).length
     ? JSON.stringify(t.config.headers, null, 2)
@@ -2423,6 +2540,7 @@ $("#btn-edit-save").onclick = async () => {
   const payload = {
     volumes: u.volumes,
     max_threads: parseInt($("#e-threads").value, 10) || 8,
+    max_per_volume: parseInt($("#e-per-volume").value, 10) || 4,
     max_split: s.value,
     headers: h.headers,
     name: $("#e-name").value.trim() || null,
@@ -2465,6 +2583,20 @@ async function openSettings() {
 }
 $("#btn-settings").onclick = openSettings;
 $("#btn-settings-cancel").onclick = () => $("#settings-modal").classList.remove("show");
+
+$("#btn-clear-all-cache").onclick = async () => {
+  if (!confirm("清空所有任务的磁盘缓存？\n\n正在播放的任务会重新拉取数据，已下载的字节会全部丢弃。")) return;
+  try {
+    const r = await api("/api/cache", { method: "DELETE" });
+    const freed = (r && typeof r.bytes_freed === "number") ? r.bytes_freed : 0;
+    toast(freed > 0 ? `已清空全部缓存 · 释放 ${fmtBytes(freed)}` : "缓存已为空", "ok");
+    // Refresh the stats card + task list so the freed-bytes effect is visible.
+    openSettings();
+    refresh();
+  } catch (e) {
+    toast("清空失败：" + e.message, "error");
+  }
+};
 
 // Esc closes whichever modal is open. Clicking the backdrop no longer
 // closes — too easy to discard in-progress config by accident.
@@ -3267,6 +3399,7 @@ $("#btn-create").onclick = async () => {
   const payload = {
     volumes: u.volumes,
     max_threads: parseInt($("#f-threads").value, 10) || 8,
+    max_per_volume: parseInt($("#f-per-volume").value, 10) || 4,
     max_split: s.value,
     cache: $("#f-cache").checked,
     persist: $("#f-persist").checked,
@@ -3302,6 +3435,7 @@ $("#btn-edit-save").onclick = async () => {
   const payload = {
     volumes: u.volumes,
     max_threads: parseInt($("#e-threads").value, 10) || 8,
+    max_per_volume: parseInt($("#e-per-volume").value, 10) || 4,
     max_split: s.value,
     headers: h.headers,
     name: $("#e-name").value.trim() || null,

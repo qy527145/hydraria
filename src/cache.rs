@@ -468,6 +468,33 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Wipe every cache entry — both in-memory handles and on-disk blocks.
+    /// Returns the number of bytes that were on disk before clearing, for
+    /// reporting in the UI toast. Active tasks that re-fetch on the next
+    /// stream request will lazily recreate their entries (CacheStore::open).
+    pub fn clear_all(&self) -> Result<u64> {
+        let freed = self.total_bytes_on_disk();
+        self.entries.write().clear();
+        if self.root.exists() {
+            // Walk one level deep — every direct child of `root` is an entry
+            // directory. Skip files (state.json lives elsewhere) and tolerate
+            // partial failures so one stuck entry doesn't block the rest.
+            let read = std::fs::read_dir(&self.root).map_err(ProxyError::Io)?;
+            for ent in read.flatten() {
+                let path = ent.path();
+                if path.is_dir() {
+                    if let Err(e) = std::fs::remove_dir_all(&path) {
+                        tracing::warn!(
+                            "clear_all: failed to remove {}: {}",
+                            path.display(), e,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(freed)
+    }
+
     pub fn stats(&self, key: &str) -> Option<CacheStats> {
         self.entries.read().get(key).map(|e| e.stats())
     }

@@ -26,6 +26,16 @@ pub struct TaskConfig {
     pub volumes: Vec<Vec<String>>,
     #[serde(default = "default_threads")]
     pub max_threads: usize,
+    /// Maximum concurrent fetchers allowed against a single volume's URL
+    /// list. The scheduler enforces this in addition to `max_threads` so a
+    /// long run of plan-adjacent chunks (which all live in the same volume)
+    /// won't pile every fetcher onto one upstream connection — when this
+    /// cap is hit the scheduler skips ahead to the first chunk in another
+    /// volume that still has room. Pick this to match the upstream's
+    /// per-IP / per-URL connection limit (4 is a common default for
+    /// generic nginx / pan-CDN setups).
+    #[serde(default = "default_per_volume")]
+    pub max_per_volume: usize,
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]
     pub max_split: u64,
     #[serde(default)]
@@ -87,6 +97,10 @@ pub enum ContentDispositionMode {
 
 fn default_threads() -> usize {
     8
+}
+
+fn default_per_volume() -> usize {
+    4
 }
 
 fn default_auto_filename() -> bool {
@@ -161,6 +175,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 pub struct TaskUpdate {
     pub volumes: Option<Vec<Vec<String>>>,
     pub max_threads: Option<usize>,
+    pub max_per_volume: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub max_split: Option<u64>,
     pub cache: Option<bool>,
@@ -187,6 +202,13 @@ pub struct UrlHealth {
     pub failed_requests: u64,
     pub current_speed_bps: u64,
     pub last_used_at: Option<u64>,
+    /// Number of HTTP requests currently in flight against this URL. Updated
+    /// by the engine via an RAII guard around the body-streaming loop so it
+    /// reflects both the dial and the long-running download.
+    pub in_flight_requests: u32,
+    /// Size of the volume this URL belongs to, once the upstream probe has
+    /// populated it. `None` until the first probe lands.
+    pub volume_size: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -202,6 +224,7 @@ pub struct UrlHealthAcc {
     /// Recent-window bytes counter consumed by the throughput sampler.
     pub window_bytes: AtomicU64,
     pub current_speed_bps: AtomicU64,
+    pub in_flight_requests: AtomicU32,
 }
 
 impl UrlHealthAcc {
@@ -217,6 +240,7 @@ impl UrlHealthAcc {
             last_used_at: AtomicU64::new(0),
             window_bytes: AtomicU64::new(0),
             current_speed_bps: AtomicU64::new(0),
+            in_flight_requests: AtomicU32::new(0),
         }
     }
 
@@ -237,6 +261,8 @@ impl UrlHealthAcc {
             failed_requests: self.failed_requests.load(Ordering::Relaxed),
             current_speed_bps: self.current_speed_bps.load(Ordering::Relaxed),
             last_used_at: if used_at == 0 { None } else { Some(used_at) },
+            in_flight_requests: self.in_flight_requests.load(Ordering::Relaxed),
+            volume_size: None,
         }
     }
 }
@@ -305,6 +331,25 @@ pub struct TaskEntry {
     /// Bytes counted toward the next sampler tick.
     pub window_bytes: AtomicU64,
     pub last_sample: Mutex<Instant>,
+    /// Cached upstream probe result with insertion timestamp. Reused for
+    /// `PROBE_CACHE_TTL` to avoid re-probing every volume on every Range
+    /// request (a player like PotPlayer opens a fresh connection per seek,
+    /// so without this every seek triggered N × (HEAD + Range-1) round-trips
+    /// before any bytes flowed). Invalidated by `apply_update` whenever the
+    /// volume list or request headers change.
+    pub probe_cache: Mutex<Option<(Arc<crate::engine::UpstreamProbe>, Instant)>>,
+    /// Serializes concurrent first-time probes for this task. Without this,
+    /// PotPlayer's burst of N parallel reconnect attempts during a slow probe
+    /// each kick off their own probe and starve each other on the upstream's
+    /// connection pool — none ever finishes. The async mutex lets the second
+    /// caller wait until the first completes (and populates `probe_cache`),
+    /// then exit through the cache-hit path on the next check.
+    pub probe_inflight: tokio::sync::Mutex<()>,
+    /// URLs that returned non-success (or network error) on a HEAD request at
+    /// least once during this process's lifetime. `probe_one` skips HEAD for
+    /// these and goes straight to the 1-byte Range GET. Cleared whenever the
+    /// task's volume list changes.
+    pub head_unsupported: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
 }
 
 impl TaskConfig {
@@ -376,6 +421,11 @@ impl TaskEntry {
             throughput: Arc::new(ThroughputSampler::new(60)),
             window_bytes: AtomicU64::new(0),
             last_sample: Mutex::new(Instant::now()),
+            probe_cache: Mutex::new(None),
+            probe_inflight: tokio::sync::Mutex::new(()),
+            head_unsupported: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -419,12 +469,23 @@ impl TaskEntry {
                 })
                 .collect();
             *self.url_health.write() = new_health;
+            // URL list changed → cached probe describes a stale layout, and
+            // old HEAD-unsupported markers refer to URLs the user may have
+            // just fixed/replaced. Drop both.
+            *self.probe_cache.lock() = None;
+            self.head_unsupported.write().clear();
         }
         if let Some(t) = upd.max_threads {
             if t == 0 {
                 return Err("max_threads must be >= 1".into());
             }
             cfg.max_threads = t;
+        }
+        if let Some(p) = upd.max_per_volume {
+            if p == 0 {
+                return Err("max_per_volume must be >= 1".into());
+            }
+            cfg.max_per_volume = p;
         }
         if let Some(s) = upd.max_split {
             if s < 64 * 1024 {
@@ -437,6 +498,9 @@ impl TaskEntry {
         }
         if let Some(h) = upd.headers {
             cfg.headers = h;
+            // Probe requests use these headers, so a cached probe is no
+            // longer guaranteed to reflect what the upstream would answer now.
+            *self.probe_cache.lock() = None;
         }
         if let Some(n) = upd.name {
             cfg.name = n;
@@ -582,12 +646,37 @@ impl AppState {
         } else {
             None
         };
-        let url_health = entry
-            .url_health
-            .read()
-            .iter()
-            .map(|h| h.snapshot())
-            .collect();
+        let url_health: Vec<UrlHealth> = {
+            // Look up each URL's volume size from the cached probe (if any),
+            // so the dashboard can show "this URL is for a 1.2 GB volume"
+            // alongside the live in-flight counter.
+            let size_for: std::collections::HashMap<String, u64> = match &*entry.probe_cache.lock() {
+                Some((probe, _)) => probe
+                    .volumes
+                    .as_ref()
+                    .map(|vs| {
+                        let mut m = std::collections::HashMap::new();
+                        for v in vs.iter() {
+                            for u in &v.urls {
+                                m.insert(u.clone(), v.size);
+                            }
+                        }
+                        m
+                    })
+                    .unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
+            entry
+                .url_health
+                .read()
+                .iter()
+                .map(|h| {
+                    let mut snap = h.snapshot();
+                    snap.volume_size = size_for.get(&snap.url).copied();
+                    snap
+                })
+                .collect()
+        };
         TaskInfo {
             task_id: id.to_string(),
             proxy_url: format!("http://{}/stream/{}", self.bind_addr, id),

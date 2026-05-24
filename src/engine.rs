@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 /// leading `HEAD_SMALL_COUNT` chunks are capped at `HEAD_SMALL_SPLIT` so a
 /// player that issues `Range: 0-` purely to probe the file (and then seeks
 /// elsewhere) only has a few hundred KB of in-flight work to abandon.
-const HEAD_SMALL_SPLIT: u64 = 512 * 1024;
+const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
 
 /// One chunk of a multi-volume task: an ordered list of mirror URLs that all
@@ -29,6 +29,7 @@ pub struct VolumeMeta {
     pub size: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct UpstreamProbe {
     pub total_size: Option<u64>,
     pub accepts_ranges: bool,
@@ -53,6 +54,10 @@ pub struct Engine {
     /// the client. `None` means "no transform" (the original zero-copy path);
     /// `Some(empty)` is equivalent and short-circuits to the same fast path.
     pipeline: Option<Arc<TransformPipeline>>,
+    /// Shared (task-scoped) set of URLs that have failed a HEAD request at
+    /// least once. `probe_one` consults this to skip the HEAD round-trip on
+    /// known-bad URLs and go straight to the 1-byte Range GET.
+    head_unsupported: Option<Arc<parking_lot::RwLock<std::collections::HashSet<String>>>>,
 }
 
 /// Where and what bytes a fetch attempt should request from a concrete URL.
@@ -85,6 +90,7 @@ impl Engine {
             health: Vec::new(),
             volumes: None,
             pipeline: None,
+            head_unsupported: None,
         })
     }
 
@@ -100,6 +106,19 @@ impl Engine {
 
     pub fn with_volumes(mut self, volumes: Option<Vec<VolumeMeta>>) -> Self {
         self.volumes = volumes.map(Arc::new);
+        self
+    }
+
+    /// Plug in the task-shared set of URLs known to reject HEAD requests.
+    /// `probe_one` reads this on entry to skip the HEAD round-trip and writes
+    /// to it when a HEAD fails for the first time. Without this set installed
+    /// the engine treats every HEAD failure as a one-shot retry (the old
+    /// behavior).
+    pub fn with_head_unsupported(
+        mut self,
+        set: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.head_unsupported = Some(set);
         self
     }
 
@@ -150,6 +169,16 @@ impl Engine {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// Increments the per-URL in-flight counter and returns a guard that
+    /// decrements on drop. Held across the dial + body stream so the
+    /// dashboard reports both connect and download phases as busy. Returns
+    /// `None` for URLs not in the health table (e.g. one-shot probes).
+    fn in_flight_guard(&self, url: &str) -> Option<InFlightGuard> {
+        let h = self.health.iter().find(|h| h.url == url)?.clone();
+        h.in_flight_requests.fetch_add(1, Ordering::Relaxed);
+        Some(InFlightGuard(h))
     }
 
     fn record_success(&self, url: &str, status: u16, latency_ms: u64) {
@@ -570,18 +599,44 @@ impl Engine {
         // configs, GCS, etc.) omit `Accept-Ranges` from HEAD even when they
         // happily serve byte ranges, so HEAD alone cannot tell us whether ranges
         // are supported.
-        let head_start = Instant::now();
-        let head = self
-            .client
-            .head(url)
-            .headers(base_headers.clone())
-            .send()
-            .await
-            .ok()
-            .filter(|r| r.status().is_success());
-        if let Some(r) = &head {
-            self.record_success(url, r.status().as_u16(), head_start.elapsed().as_millis() as u64);
-        }
+        //
+        // Some upstreams reject HEAD outright (some pan/CDN endpoints only
+        // serve GET). When that happens we record the URL in `head_unsupported`
+        // and skip the HEAD on every subsequent probe for the lifetime of the
+        // process — there's no point paying that round-trip again.
+        let skip_head = self
+            .head_unsupported
+            .as_ref()
+            .map(|s| s.read().contains(url))
+            .unwrap_or(false);
+        let head = if skip_head {
+            tracing::trace!("probe_one skipping HEAD (known-unsupported) url={}", url);
+            None
+        } else {
+            let head_start = Instant::now();
+            let r = self
+                .client
+                .head(url)
+                .headers(base_headers.clone())
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success());
+            if let Some(resp) = &r {
+                self.record_success(
+                    url,
+                    resp.status().as_u16(),
+                    head_start.elapsed().as_millis() as u64,
+                );
+            } else if let Some(s) = &self.head_unsupported {
+                s.write().insert(url.to_string());
+                tracing::debug!(
+                    "probe_one marking url as HEAD-unsupported (won't HEAD again this session): {}",
+                    url
+                );
+            }
+            r
+        };
 
         let mut total_size: Option<u64> = None;
         let mut content_type: Option<String> = None;
@@ -738,6 +793,7 @@ impl Engine {
     ) -> mpsc::Receiver<Result<Bytes>> {
         let split = self.config.max_split.max(64 * 1024);
         let max_threads = self.config.max_threads.max(1);
+        let max_per_volume = self.config.max_per_volume.max(1);
 
         // Build chunk plan. In volume mode every chunk must live inside one
         // volume so the fetcher only ever talks to a single URL — split first
@@ -757,119 +813,190 @@ impl Engine {
             head_split,
         );
         let total_chunks = plan.len();
-
-        tracing::debug!(
-            "stream_range [{}, {}] split={} max_threads={} vol_count={} chunks={} open_ended={} head_split={:?}",
-            start,
-            end,
-            split,
-            max_threads,
-            self.volumes.as_deref().map(|v| v.len()).unwrap_or(1),
-            total_chunks,
-            open_ended,
-            head_split,
-        );
-
-        // Per-chunk channels so fetchers can run concurrently while the
-        // serializer stitches bytes back together in plan order.
-        let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
-            Vec::with_capacity(total_chunks);
-        let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
-            Vec::with_capacity(total_chunks);
-        for _ in 0..total_chunks {
-            let (tx, rx) = mpsc::channel::<Result<Bytes>>(8);
-            senders.push(Some(tx));
-            receivers.push(rx);
-        }
-
-        // Output channel to caller
-        let (out_tx, out_rx) = mpsc::channel::<Result<Bytes>>(16);
-
-        // Driver: spawns chunk fetchers in a sliding window AND drains them
-        // in order. This is the right way to bound concurrency for an
-        // *ordered* stream: a plain Semaphore would deadlock because a
-        // non-zero chunk could win the permit race, fill its bounded channel,
-        // block on `tx.send().await`, and starve chunk 0 forever — the
-        // serializer drains strictly in plan order, so chunks ahead can't
-        // make progress until the one being drained finishes.
-        //
-        // Cross-volume warm-up (multi-volume only): the main scheduler still
-        // spawns the plan-prefix `[0..max_threads)` in order (so the
-        // serializer's drain[i] always finds sender[i] already taken). But on
-        // top of that we also pre-spawn one fetcher per *uncovered* volume —
-        // the volume's first chunk in the plan, which lives at some index
-        // > max_threads. These prefetchers open extra TCP connections to the
-        // other volumes' single URL each, so per-connection rate limits (e.g.
-        // nginx `limit_rate`) can't pin total throughput to volume 0. When
-        // the main scheduler later slides forward past a prefetched index it
-        // sees `senders[idx].take() == None` and just skips ahead.
         let vol_count = self
             .volumes
             .as_deref()
             .map(|v| v.len())
             .unwrap_or(1)
             .max(1);
+        let vol_of: Vec<usize> = plan_volume_indices(
+            &plan,
+            self.volumes.as_deref().map(|v| v.as_slice()),
+        );
+
+        tracing::debug!(
+            "stream_range [{}, {}] split={} max_threads={} max_per_volume={} vol_count={} chunks={} open_ended={} head_split={:?}",
+            start,
+            end,
+            split,
+            max_threads,
+            max_per_volume,
+            vol_count,
+            total_chunks,
+            open_ended,
+            head_split,
+        );
+
+        // Per-chunk channels so fetchers can run concurrently while the
+        // serializer stitches bytes back together in plan order. Buffer of 4
+        // is enough to absorb network jitter without holding many MB of
+        // already-fetched bytes when the client is slower than the upstream.
+        let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
+            Vec::with_capacity(total_chunks);
+        let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
+            Vec::with_capacity(total_chunks);
+        for _ in 0..total_chunks {
+            let (tx, rx) = mpsc::channel::<Result<Bytes>>(4);
+            senders.push(Some(tx));
+            receivers.push(rx);
+        }
+
+        // Output channel to caller
+        let (out_tx, out_rx) = mpsc::channel::<Result<Bytes>>(8);
+
+        // The scheduler and serializer cooperate via a release-permit channel.
+        // Whenever a fetcher exits (success, error, abort) it sends its
+        // volume index here so the scheduler can decrement that volume's
+        // in-flight count and try to spawn the next eligible chunk.
+        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<usize>();
 
         let engine_arc = Arc::clone(&self);
-        let volumes_for_warmup = self.volumes.clone();
         tokio::spawn(async move {
             // Live handles for every fetcher we've spawned. On client
             // disconnect we walk this list and `.abort()` each one so
             // tokio cancels their HTTP requests immediately — that's the
             // bandwidth claw-back that makes seeking responsive.
             let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
+            // Per-volume in-flight fetchers. Enforced together with
+            // `total_in_flight <= max_threads` to honor both the task-wide
+            // concurrency budget and the upstream's per-URL connection limit.
+            let mut per_vol: Vec<usize> = vec![0; vol_count];
+            let mut total_in_flight: usize = 0;
+            // True when the chunk's fetcher has been spawned (or skipped as
+            // a no-op). We can't rely on `senders[idx].is_none()` alone
+            // because the warm-up path also takes senders.
+            let mut spawned: Vec<bool> = vec![false; total_chunks];
+
+            // Spawn one fetcher for chunk `idx`. Caller is responsible for
+            // having taken the sender out of `senders`.
             let spawn_fetch = |idx: usize,
                                tx: mpsc::Sender<Result<Bytes>>,
-                               plan: &[(u64, u64)]|
+                               release: mpsc::UnboundedSender<usize>,
+                               vi: usize,
+                               plan_arc: Arc<Vec<(u64, u64)>>|
              -> JoinHandle<()> {
                 let engine = Arc::clone(&engine_arc);
-                let (cs, ce) = plan[idx];
+                let (cs, ce) = plan_arc[idx];
                 tokio::spawn(async move {
                     let result = engine.fetch_chunk_to(idx, cs, ce, &tx).await;
                     if let Err(e) = result {
                         let _ = tx.send(Err(e)).await;
                     }
                     // `tx` dropped here — receiver for chunk `idx` closes.
+                    let _ = release.send(vi);
                 })
             };
 
-            // Initial window: start the first `max_threads` chunks in plan
-            // order. Chunk 0 is always in this set, so the serializer can
-            // immediately make progress.
-            let initial = max_threads.min(total_chunks);
-            for idx in 0..initial {
-                let tx = senders[idx]
-                    .take()
-                    .expect("sender should be present on first spawn");
-                handles.push(spawn_fetch(idx, tx, &plan));
-            }
+            let plan_arc = Arc::new(plan);
 
-            // Cross-volume warm-up: for every volume *not* represented in the
-            // initial window, additionally spawn its first chunk. These extra
-            // fetchers exceed `max_threads` by at most `vol_count - 1`, which
-            // is the unavoidable cost of opening one connection per volume.
-            if vol_count > 1 {
-                let vol_of = plan_volume_indices(
-                    &plan,
-                    volumes_for_warmup.as_deref().map(|v| v.as_slice()),
-                );
-                let mut covered: Vec<bool> = vec![false; vol_count];
-                for idx in 0..initial {
-                    if let Some(&vi) = vol_of.get(idx) {
-                        if vi < covered.len() {
-                            covered[vi] = true;
+            // Helper: try to spawn the lowest-indexed not-yet-spawned chunk
+            // whose volume still has room. Returns true when at least one
+            // spawn happened. Loops internally so a single call fills every
+            // available slot.
+            let try_spawn_more = |handles: &mut Vec<JoinHandle<()>>,
+                                  per_vol: &mut Vec<usize>,
+                                  total_in_flight: &mut usize,
+                                  spawned: &mut Vec<bool>,
+                                  senders: &mut Vec<Option<mpsc::Sender<Result<Bytes>>>>|
+             -> usize {
+                let mut spawned_count = 0;
+                'outer: while *total_in_flight < max_threads {
+                    for idx in 0..total_chunks {
+                        if spawned[idx] {
+                            continue;
                         }
+                        let vi = vol_of.get(idx).copied().unwrap_or(0);
+                        if per_vol[vi] >= max_per_volume {
+                            continue;
+                        }
+                        let tx = match senders[idx].take() {
+                            Some(t) => t,
+                            None => {
+                                spawned[idx] = true;
+                                continue;
+                            }
+                        };
+                        per_vol[vi] += 1;
+                        *total_in_flight += 1;
+                        spawned[idx] = true;
+                        handles.push(spawn_fetch(
+                            idx,
+                            tx,
+                            release_tx.clone(),
+                            vi,
+                            Arc::clone(&plan_arc),
+                        ));
+                        spawned_count += 1;
+                        continue 'outer;
+                    }
+                    break;
+                }
+                spawned_count
+            };
+
+            // Initial fill: respects both caps. Multi-volume tasks naturally
+            // get cross-volume coverage because once a volume hits its cap
+            // the loop falls through to the next volume's first chunk.
+            let initial = try_spawn_more(
+                &mut handles,
+                &mut per_vol,
+                &mut total_in_flight,
+                &mut spawned,
+                &mut senders,
+            );
+
+            // Cross-volume warm-up: ensure connections are open against the
+            // first uncovered volumes too. With per-volume caps the initial
+            // fill already spreads across volumes when chunks-per-volume is
+            // dense, but for sparse plans (e.g. small Range over many
+            // volumes) we still want to pre-open the next 1-2 volumes so
+            // crossing a boundary doesn't pay TCP setup latency. For
+            // open-ended requests (likely about to seek) we cap to 1 to
+            // avoid wasting bandwidth that will be aborted shortly.
+            let warmup_next_vols: usize = if open_ended { 1 } else { vol_count };
+            if vol_count > 1 && warmup_next_vols > 0 {
+                let mut covered: Vec<bool> = vec![false; vol_count];
+                for (idx, &vi) in vol_of.iter().enumerate() {
+                    if spawned[idx] && vi < covered.len() {
+                        covered[vi] = true;
                     }
                 }
                 let mut warmed: Vec<usize> = Vec::new();
+                let mut budget = warmup_next_vols;
                 for vi in 0..vol_count {
+                    if budget == 0 {
+                        break;
+                    }
                     if covered[vi] {
                         continue;
                     }
                     if let Some(idx) = vol_of.iter().position(|&v| v == vi) {
+                        if spawned[idx] {
+                            continue;
+                        }
                         if let Some(tx) = senders[idx].take() {
-                            handles.push(spawn_fetch(idx, tx, &plan));
+                            spawned[idx] = true;
+                            per_vol[vi] += 1;
+                            total_in_flight += 1;
+                            handles.push(spawn_fetch(
+                                idx,
+                                tx,
+                                release_tx.clone(),
+                                vi,
+                                Arc::clone(&plan_arc),
+                            ));
                             warmed.push(idx);
+                            budget -= 1;
                         }
                     }
                 }
@@ -882,46 +1009,72 @@ impl Engine {
                 }
             }
 
-            let mut next_to_spawn = initial;
+            tracing::debug!(
+                "initial spawn done: in_flight={}, per_vol_nonzero={:?}",
+                total_in_flight,
+                per_vol
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c > 0)
+                    .map(|(i, &c)| (i, c))
+                    .collect::<Vec<_>>(),
+            );
+            let _ = initial;
+
+            // Main loop: serializer drains receivers in plan order while
+            // simultaneously listening for fetcher completion events to
+            // refill the in-flight window.
             for (i, mut rx) in receivers.into_iter().enumerate() {
-                // Drain chunk i in order, forwarding to the client.
-                while let Some(item) = rx.recv().await {
-                    let is_err = item.is_err();
-                    if out_tx.send(item).await.is_err() {
-                        // Client dropped the connection — abandon the rest
-                        // AND abort every still-running fetcher so their
-                        // upstream HTTP requests are cancelled immediately.
-                        // Without the explicit abort each in-flight fetcher
-                        // would burn its current chunk to completion before
-                        // noticing the receiver vanished, leaving up to
-                        // `max_threads × max_split` bytes racing the user's
-                        // next seek for bandwidth.
-                        tracing::debug!(
-                            "client gone at chunk {}, aborting {} in-flight fetcher(s)",
-                            i,
-                            handles.len(),
-                        );
-                        for h in &handles {
-                            h.abort();
+                loop {
+                    tokio::select! {
+                        // Prefer draining the current chunk: bias = client
+                        // throughput. The release-event branch will get its
+                        // turn whenever there's no new data to forward.
+                        biased;
+                        item = rx.recv() => {
+                            match item {
+                                Some(item) => {
+                                    let is_err = item.is_err();
+                                    if out_tx.send(item).await.is_err() {
+                                        tracing::debug!(
+                                            "client gone at chunk {}, aborting {} in-flight fetcher(s)",
+                                            i,
+                                            handles.len(),
+                                        );
+                                        for h in &handles {
+                                            h.abort();
+                                        }
+                                        return;
+                                    }
+                                    if is_err {
+                                        tracing::debug!("chunk {} produced an error, ending stream", i);
+                                        for h in &handles {
+                                            h.abort();
+                                        }
+                                        return;
+                                    }
+                                }
+                                None => {
+                                    // Chunk i fully delivered. Move to next.
+                                    break;
+                                }
+                            }
                         }
-                        return;
-                    }
-                    if is_err {
-                        tracing::debug!("chunk {} produced an error, ending stream", i);
-                        for h in &handles {
-                            h.abort();
+                        Some(vi) = release_rx.recv() => {
+                            if vi < per_vol.len() && per_vol[vi] > 0 {
+                                per_vol[vi] -= 1;
+                            }
+                            if total_in_flight > 0 {
+                                total_in_flight -= 1;
+                            }
+                            try_spawn_more(
+                                &mut handles,
+                                &mut per_vol,
+                                &mut total_in_flight,
+                                &mut spawned,
+                                &mut senders,
+                            );
                         }
-                        return;
-                    }
-                }
-                // Chunk i is fully delivered; slide the window forward. Skip
-                // over any already-prefetched indices (their sender is None).
-                while next_to_spawn < total_chunks {
-                    let idx = next_to_spawn;
-                    next_to_spawn += 1;
-                    if let Some(tx) = senders[idx].take() {
-                        handles.push(spawn_fetch(idx, tx, &plan));
-                        break;
                     }
                 }
                 let _ = i;
@@ -1089,6 +1242,7 @@ impl Engine {
                 idx, attempt, target.url, target.local_start, target.local_end, target.merged_start, delivered,
             );
             let req_start = Instant::now();
+            let _in_flight = self.in_flight_guard(&target.url);
             let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1227,6 +1381,7 @@ impl Engine {
                 idx, attempt, target.url, target.local_start, target.local_end, delivered,
             );
             let req_start = Instant::now();
+            let _in_flight = self.in_flight_guard(&target.url);
             let resp = match self.client.get(&target.url).headers(headers).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1354,6 +1509,17 @@ impl Engine {
             }
         }
         Err(last_err.unwrap_or(ProxyError::NoUpstream))
+    }
+}
+
+/// RAII counter for per-URL in-flight HTTP requests. Held by the engine
+/// across one fetch attempt; decrements on drop, so cancellation paths
+/// (client disconnect → task abort) don't leak the counter.
+struct InFlightGuard(Arc<crate::models::UrlHealthAcc>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight_requests.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

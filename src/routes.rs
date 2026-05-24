@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Serialize)]
@@ -85,6 +86,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/pause", post(pause_task))
         .route("/api/tasks/{task_id}/resume", post(resume_task))
         .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
+        .route("/api/cache", delete(clear_all_cache))
         .route("/api/tasks/{task_id}/export", get(export_task))
         .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -169,6 +171,7 @@ async fn probe_urls(
     let mut cfg = TaskConfig {
         volumes: req.volumes.clone(),
         max_threads: 1,
+        max_per_volume: 1,
         max_split: 5 * 1024 * 1024,
         cache: false,
         headers: req.headers.unwrap_or_default(),
@@ -278,6 +281,13 @@ async fn clear_task_cache(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn clear_all_cache(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    let freed = state.cache.clear_all()?;
+    Ok(Json(serde_json::json!({ "bytes_freed": freed })))
+}
+
 /// Export a task's config as a downloadable JSON file. The body is a
 /// `TaskConfig` (no runtime stats), so POSTing it back to `/api/tasks` on
 /// any instance recreates the same task — round-trip portable.
@@ -346,18 +356,51 @@ async fn handle_stream(
     }
 
     let cfg = Arc::new(entry.config_snapshot());
-    let engine = Engine::new(Arc::clone(&cfg))?;
-    let probe_t0 = std::time::Instant::now();
-    let mut probe = engine.probe().await?;
-    tracing::info!(
-        "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} ({}ms)",
-        task_id,
-        probe.total_size.map(|t| t.to_string()).unwrap_or_else(|| "unknown".into()),
-        probe.volumes.as_ref().map(|v| v.len()).unwrap_or(0),
-        probe.accepts_ranges,
-        probe.etag,
-        probe_t0.elapsed().as_millis(),
-    );
+    let engine = Engine::new(Arc::clone(&cfg))?
+        .with_head_unsupported(Arc::clone(&entry.head_unsupported));
+
+    // Probe is expensive on multi-volume tasks (N × HEAD + N × Range:0-0
+    // round-trips) and players like PotPlayer open a fresh connection for
+    // every seek. Cache the result on the TaskEntry for `PROBE_CACHE_TTL`
+    // so subsequent seeks reuse the layout instead of re-probing every
+    // volume. `apply_update` clears this cache whenever the volumes or
+    // request headers change.
+    const PROBE_CACHE_TTL: Duration = Duration::from_secs(300);
+    let read_cached = || -> Option<Arc<UpstreamProbe>> {
+        let guard = entry.probe_cache.lock();
+        guard
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < PROBE_CACHE_TTL)
+            .map(|(p, _)| Arc::clone(p))
+    };
+    let mut probe = if let Some(p) = read_cached() {
+        tracing::debug!("probe cache HIT task={} (age<{}s)", task_id, PROBE_CACHE_TTL.as_secs());
+        UpstreamProbe::clone(&p)
+    } else {
+        // Singleflight: serialize concurrent first-time probes so they don't
+        // all hammer the upstream in parallel. The second caller will block
+        // here briefly, then re-check the cache and find the freshly stored
+        // result instead of starting its own probe.
+        let _guard = entry.probe_inflight.lock().await;
+        if let Some(p) = read_cached() {
+            tracing::debug!("probe cache HIT task={} (after inflight wait)", task_id);
+            UpstreamProbe::clone(&p)
+        } else {
+            let probe_t0 = Instant::now();
+            let fresh = engine.probe().await?;
+            tracing::info!(
+                "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} ({}ms)",
+                task_id,
+                fresh.total_size.map(|t| t.to_string()).unwrap_or_else(|| "unknown".into()),
+                fresh.volumes.as_ref().map(|v| v.len()).unwrap_or(0),
+                fresh.accepts_ranges,
+                fresh.etag,
+                probe_t0.elapsed().as_millis(),
+            );
+            *entry.probe_cache.lock() = Some((Arc::new(fresh.clone()), Instant::now()));
+            fresh
+        }
+    };
 
     // Resolve which filename to advertise. Precedence:
     //   auto_filename=true  → probe result → output_filename → name → URL guess
