@@ -899,10 +899,25 @@ impl Engine {
 
             let plan_arc = Arc::new(plan);
 
-            // Helper: try to spawn the lowest-indexed not-yet-spawned chunk
-            // whose volume still has room. Returns true when at least one
-            // spawn happened. Loops internally so a single call fills every
-            // available slot.
+            // Helper: spawn fetchers until either every chunk is spawned or
+            // `total_in_flight` hits `max_threads`. Two-pass policy:
+            //
+            //   Pass 1 (strict): honor `max_per_volume` — pick the
+            //     lowest-indexed not-yet-spawned chunk whose volume still has
+            //     room. This spreads work across volumes so no single upstream
+            //     gets piled on.
+            //
+            //   Pass 2 (overflow): if pass 1 ran out of cap-respecting chunks
+            //     but there's still budget, allow `per_vol` to exceed
+            //     `max_per_volume`. This keeps idle threads from sitting on
+            //     their hands when every remaining chunk lives in a volume
+            //     that's already at its per-volume cap — typical when the
+            //     client's Range only touches one volume, or when one
+            //     volume's chunks finish faster than its siblings'.
+            //
+            // The per-volume cap thus behaves as a *soft* limit: we prefer to
+            // spread across volumes when we can, but we won't waste task-wide
+            // concurrency budget when we can't.
             let try_spawn_more = |handles: &mut Vec<JoinHandle<()>>,
                                   per_vol: &mut Vec<usize>,
                                   total_in_flight: &mut usize,
@@ -910,7 +925,9 @@ impl Engine {
                                   senders: &mut Vec<Option<mpsc::Sender<Result<Bytes>>>>|
              -> usize {
                 let mut spawned_count = 0;
-                'outer: while *total_in_flight < max_threads {
+                while *total_in_flight < max_threads {
+                    // Strict pass first.
+                    let mut pick: Option<usize> = None;
                     for idx in 0..total_chunks {
                         if spawned[idx] {
                             continue;
@@ -919,27 +936,42 @@ impl Engine {
                         if per_vol[vi] >= max_per_volume {
                             continue;
                         }
-                        let tx = match senders[idx].take() {
-                            Some(t) => t,
-                            None => {
-                                spawned[idx] = true;
+                        pick = Some(idx);
+                        break;
+                    }
+                    // Overflow pass: any not-yet-spawned chunk will do.
+                    if pick.is_none() {
+                        for idx in 0..total_chunks {
+                            if spawned[idx] {
                                 continue;
                             }
-                        };
-                        per_vol[vi] += 1;
-                        *total_in_flight += 1;
-                        spawned[idx] = true;
-                        handles.push(spawn_fetch(
-                            idx,
-                            tx,
-                            release_tx.clone(),
-                            vi,
-                            Arc::clone(&plan_arc),
-                        ));
-                        spawned_count += 1;
-                        continue 'outer;
+                            pick = Some(idx);
+                            break;
+                        }
                     }
-                    break;
+                    let idx = match pick {
+                        Some(i) => i,
+                        None => break,
+                    };
+                    let vi = vol_of.get(idx).copied().unwrap_or(0);
+                    let tx = match senders[idx].take() {
+                        Some(t) => t,
+                        None => {
+                            spawned[idx] = true;
+                            continue;
+                        }
+                    };
+                    per_vol[vi] += 1;
+                    *total_in_flight += 1;
+                    spawned[idx] = true;
+                    handles.push(spawn_fetch(
+                        idx,
+                        tx,
+                        release_tx.clone(),
+                        vi,
+                        Arc::clone(&plan_arc),
+                    ));
+                    spawned_count += 1;
                 }
                 spawned_count
             };
@@ -2231,6 +2263,7 @@ mod tests {
                 vec!["b1".into()],
             ],
             max_threads: 8,
+            max_per_volume: 4,
             max_split: 5 * 1024 * 1024,
             cache: false,
             headers: Default::default(),
@@ -2361,6 +2394,108 @@ mod tests {
         // Warm-up adds first chunk of v1 (idx=3) and v2 (idx=6).
         assert!(spawned.contains(&3));
         assert!(spawned.contains(&6));
+    }
+
+    /// Pure-data simulation of `try_spawn_more`'s two-pass policy: pick the
+    /// first not-yet-spawned chunk whose volume has room (strict pass), and
+    /// only if no such chunk exists, allow over-cap spawns (overflow pass).
+    fn simulate_spawn_set(
+        vol_of: &[usize],
+        max_threads: usize,
+        max_per_volume: usize,
+        vol_count: usize,
+    ) -> Vec<usize> {
+        let total = vol_of.len();
+        let mut spawned = vec![false; total];
+        let mut per_vol = vec![0usize; vol_count];
+        let mut total_in_flight = 0usize;
+        let mut order: Vec<usize> = Vec::new();
+        loop {
+            if total_in_flight >= max_threads {
+                break;
+            }
+            let mut pick: Option<usize> = None;
+            for idx in 0..total {
+                if spawned[idx] {
+                    continue;
+                }
+                let vi = vol_of[idx];
+                if per_vol[vi] >= max_per_volume {
+                    continue;
+                }
+                pick = Some(idx);
+                break;
+            }
+            if pick.is_none() {
+                for idx in 0..total {
+                    if !spawned[idx] {
+                        pick = Some(idx);
+                        break;
+                    }
+                }
+            }
+            let idx = match pick {
+                Some(i) => i,
+                None => break,
+            };
+            spawned[idx] = true;
+            per_vol[vol_of[idx]] += 1;
+            total_in_flight += 1;
+            order.push(idx);
+        }
+        order
+    }
+
+    #[test]
+    fn overflow_fills_idle_slots_when_only_one_volume_in_plan() {
+        // Single-volume Range (or single-volume task): 10 chunks all in v0.
+        // max_threads=8, max_per_volume=4. Old behavior: only 4 spawn. New
+        // behavior: all 8 slots get filled by overflow.
+        let vol_of: Vec<usize> = vec![0; 10];
+        let spawned = simulate_spawn_set(&vol_of, 8, 4, 1);
+        assert_eq!(spawned.len(), 8, "expected 8 fetchers, got {}", spawned.len());
+        assert_eq!(spawned, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn strict_pass_spreads_across_volumes_before_overflow() {
+        // Two volumes, plenty of chunks each. max_threads=8, cap=4.
+        // Strict pass should give 4 to v0 and 4 to v1 — no overflow needed.
+        let vol_of: Vec<usize> = [0; 10]
+            .into_iter()
+            .chain([1; 10])
+            .collect();
+        let spawned = simulate_spawn_set(&vol_of, 8, 4, 2);
+        assert_eq!(spawned.len(), 8);
+        let v0_count = spawned.iter().filter(|&&i| vol_of[i] == 0).count();
+        let v1_count = spawned.iter().filter(|&&i| vol_of[i] == 1).count();
+        assert_eq!(v0_count, 4, "v0 should hit its cap exactly");
+        assert_eq!(v1_count, 4, "v1 should hit its cap exactly");
+    }
+
+    #[test]
+    fn overflow_kicks_in_only_after_other_volumes_exhausted() {
+        // v0 has 10 chunks, v1 has 2 chunks. max_threads=8, cap=4.
+        // Strict pass: 4 from v0 + 2 from v1 = 6. Overflow needs to push 2
+        // more — and they must come from v0 (v1 is empty).
+        let vol_of: Vec<usize> = [0; 10]
+            .into_iter()
+            .chain([1; 2])
+            .collect();
+        let spawned = simulate_spawn_set(&vol_of, 8, 4, 2);
+        assert_eq!(spawned.len(), 8);
+        let v0_count = spawned.iter().filter(|&&i| vol_of[i] == 0).count();
+        let v1_count = spawned.iter().filter(|&&i| vol_of[i] == 1).count();
+        assert_eq!(v1_count, 2, "v1 contributes its only 2 chunks");
+        assert_eq!(v0_count, 6, "remaining 6 slots overflow into v0");
+    }
+
+    #[test]
+    fn no_overflow_when_total_chunks_below_max_threads() {
+        // Edge case: only 3 chunks total, max_threads=8. Spawn all 3 then stop.
+        let vol_of: Vec<usize> = vec![0, 0, 0];
+        let spawned = simulate_spawn_set(&vol_of, 8, 4, 1);
+        assert_eq!(spawned, vec![0, 1, 2]);
     }
 
     #[test]

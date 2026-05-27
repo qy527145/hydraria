@@ -26,7 +26,7 @@ pub struct TaskConfig {
     pub volumes: Vec<Vec<String>>,
     #[serde(default = "default_threads")]
     pub max_threads: usize,
-    /// Maximum concurrent fetchers allowed against a single volume's URL
+    /// Soft cap on concurrent fetchers allowed against a single volume's URL
     /// list. The scheduler enforces this in addition to `max_threads` so a
     /// long run of plan-adjacent chunks (which all live in the same volume)
     /// won't pile every fetcher onto one upstream connection — when this
@@ -34,6 +34,14 @@ pub struct TaskConfig {
     /// volume that still has room. Pick this to match the upstream's
     /// per-IP / per-URL connection limit (4 is a common default for
     /// generic nginx / pan-CDN setups).
+    ///
+    /// Soft, not hard: when no other volume has work available (e.g. the
+    /// client's Range only touches one volume), idle slots in the
+    /// `max_threads` budget overflow back into already-capped volumes
+    /// rather than sitting unused. This keeps total throughput at the
+    /// task-wide limit even when work is unevenly distributed across
+    /// volumes; trade-off is that a single upstream may briefly exceed
+    /// its per-URL connection limit when there's no alternative.
     #[serde(default = "default_per_volume")]
     pub max_per_volume: usize,
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]
