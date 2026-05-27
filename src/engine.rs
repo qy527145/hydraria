@@ -838,15 +838,31 @@ impl Engine {
         );
 
         // Per-chunk channels so fetchers can run concurrently while the
-        // serializer stitches bytes back together in plan order. Buffer of 4
-        // is enough to absorb network jitter without holding many MB of
-        // already-fetched bytes when the client is slower than the upstream.
+        // serializer stitches bytes back together in plan order.
+        //
+        // Buffer sizing: when the scheduler pre-spawns fetchers for chunks
+        // the serializer won't reach for a while (typical of multi-volume
+        // tasks where `max_per_volume` forces the next-volume's first chunk
+        // to spawn early), those fetchers would otherwise block on `send`
+        // after a few reqwest stream items — and a blocked `send` means TCP
+        // backpressure on the upstream, which the user perceives as
+        // "0 B/s on volumes 2+". We need each chunk's channel to absorb the
+        // chunk's entire payload so the fetcher can run to completion and
+        // release its slot regardless of when the serializer catches up.
+        //
+        // Estimate: reqwest yields stream items in 8-32 KiB increments; we
+        // size for the conservative 16 KiB case. Cap so a wildly large
+        // `max_split` doesn't blow up memory.
+        let stream_item_estimate = 16 * 1024u64;
+        let chan_buffer = ((split / stream_item_estimate) as usize)
+            .max(8)
+            .min(512);
         let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
             Vec::with_capacity(total_chunks);
         let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
             Vec::with_capacity(total_chunks);
         for _ in 0..total_chunks {
-            let (tx, rx) = mpsc::channel::<Result<Bytes>>(4);
+            let (tx, rx) = mpsc::channel::<Result<Bytes>>(chan_buffer);
             senders.push(Some(tx));
             receivers.push(rx);
         }
@@ -902,22 +918,25 @@ impl Engine {
             // Helper: spawn fetchers until either every chunk is spawned or
             // `total_in_flight` hits `max_threads`. Two-pass policy:
             //
-            //   Pass 1 (strict): honor `max_per_volume` — pick the
-            //     lowest-indexed not-yet-spawned chunk whose volume still has
-            //     room. This spreads work across volumes so no single upstream
-            //     gets piled on.
+            //   Pass 1 (strict): pick the lowest plan-idx not-yet-spawned
+            //     chunk whose volume still has room. Plan idx is roughly
+            //     "distance from serializer head" — sequential chunks in
+            //     the same volume come first, then the first chunks of the
+            //     next volume. This concentrates parallelism on what the
+            //     serializer is about to consume, instead of pre-fetching
+            //     hundreds of MB into volumes the player won't reach for
+            //     a long time.
             //
-            //   Pass 2 (overflow): if pass 1 ran out of cap-respecting chunks
-            //     but there's still budget, allow `per_vol` to exceed
-            //     `max_per_volume`. This keeps idle threads from sitting on
-            //     their hands when every remaining chunk lives in a volume
-            //     that's already at its per-volume cap — typical when the
-            //     client's Range only touches one volume, or when one
-            //     volume's chunks finish faster than its siblings'.
+            //   Pass 2 (overflow): if pass 1 ran out of cap-respecting
+            //     chunks but there's still budget, allow `per_vol` to
+            //     exceed `max_per_volume`. This keeps idle threads from
+            //     sitting on their hands when every remaining chunk lives
+            //     in a volume that's already at its per-volume cap — the
+            //     typical case is a client `Range` that only touches one
+            //     volume.
             //
-            // The per-volume cap thus behaves as a *soft* limit: we prefer to
-            // spread across volumes when we can, but we won't waste task-wide
-            // concurrency budget when we can't.
+            // The per-volume cap thus behaves as a *soft* limit: honored
+            // first, relaxed only when no other choice exists.
             let try_spawn_more = |handles: &mut Vec<JoinHandle<()>>,
                                   per_vol: &mut Vec<usize>,
                                   total_in_flight: &mut usize,
@@ -926,7 +945,7 @@ impl Engine {
              -> usize {
                 let mut spawned_count = 0;
                 while *total_in_flight < max_threads {
-                    // Strict pass first.
+                    // Strict pass: lowest plan idx with cap room.
                     let mut pick: Option<usize> = None;
                     for idx in 0..total_chunks {
                         if spawned[idx] {
@@ -939,14 +958,13 @@ impl Engine {
                         pick = Some(idx);
                         break;
                     }
-                    // Overflow pass: any not-yet-spawned chunk will do.
+                    // Overflow pass: any not-yet-spawned chunk, lowest idx.
                     if pick.is_none() {
                         for idx in 0..total_chunks {
-                            if spawned[idx] {
-                                continue;
+                            if !spawned[idx] {
+                                pick = Some(idx);
+                                break;
                             }
-                            pick = Some(idx);
-                            break;
                         }
                     }
                     let idx = match pick {
@@ -2397,8 +2415,9 @@ mod tests {
     }
 
     /// Pure-data simulation of `try_spawn_more`'s two-pass policy: pick the
-    /// first not-yet-spawned chunk whose volume has room (strict pass), and
-    /// only if no such chunk exists, allow over-cap spawns (overflow pass).
+    /// lowest-idx not-yet-spawned chunk whose volume has room (strict pass),
+    /// and only if every volume is already at cap, allow over-cap spawns
+    /// (overflow pass).
     fn simulate_spawn_set(
         vol_of: &[usize],
         max_threads: usize,
@@ -2496,6 +2515,48 @@ mod tests {
         let vol_of: Vec<usize> = vec![0, 0, 0];
         let spawned = simulate_spawn_set(&vol_of, 8, 4, 1);
         assert_eq!(spawned, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn strict_pass_concentrates_on_first_volumes_for_serializer_locality() {
+        // Regression: with max_threads=16, cap=4, 8 volumes, we want
+        // 4+4+4+4 on vols 0..3 (the chunks the serializer will consume
+        // soonest), NOT spread across all 8. Pre-fetching far-future
+        // volumes wastes the channel buffer + cache write budget on
+        // chunks the player won't reach for many seconds.
+        let mut vol_of: Vec<usize> = Vec::new();
+        for vi in 0..8 {
+            for _ in 0..10 {
+                vol_of.push(vi);
+            }
+        }
+        let spawned = simulate_spawn_set(&vol_of, 16, 4, 8);
+        assert_eq!(spawned.len(), 16);
+        let mut counts = vec![0usize; 8];
+        for &idx in &spawned {
+            counts[vol_of[idx]] += 1;
+        }
+        assert_eq!(counts[0], 4, "v0 should hit cap");
+        assert_eq!(counts[1], 4, "v1 should hit cap");
+        assert_eq!(counts[2], 4, "v2 should hit cap");
+        assert_eq!(counts[3], 4, "v3 should hit cap");
+        for vi in 4..8 {
+            assert_eq!(counts[vi], 0, "v{} should be idle (far from head)", vi);
+        }
+    }
+
+    #[test]
+    fn chunk_zero_always_in_first_spawn() {
+        // Playback invariant: chunk 0 must be spawned in the initial batch
+        // — the serializer can't return any bytes to the client without it.
+        let vol_of: Vec<usize> = [0; 5]
+            .into_iter()
+            .chain([1; 5])
+            .chain([2; 5])
+            .collect();
+        let spawned = simulate_spawn_set(&vol_of, 3, 4, 3);
+        assert_eq!(spawned.len(), 3);
+        assert!(spawned.contains(&0), "chunk 0 must be in first spawn set");
     }
 
     #[test]
