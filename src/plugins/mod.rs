@@ -154,6 +154,38 @@ pub struct ForwardResult {
     pub message: Option<String>,
 }
 
+/// Live status update emitted while a plugin's forward operation runs. The
+/// route handler streams these to the client as NDJSON so the UI can render
+/// a progress bar instead of just "executing…". Plugins are free to call
+/// the callback as often as they like — the route handler does its own
+/// throttling for the wire — but in practice they should still be sparing
+/// (every ~50 ms or so) to avoid swamping the channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForwardProgress {
+    /// Bytes processed so far across the whole forward op (input bytes
+    /// consumed, not output bytes — for the encrypt-then-split case those
+    /// are equal anyway).
+    pub bytes_done: u64,
+    /// Total bytes the plugin expects to process. `0` means "unknown" — the
+    /// UI should fall back to a spinner instead of a percentage.
+    pub bytes_total: u64,
+    /// Free-form short label for the current phase. ChaCha20 emits e.g.
+    /// `"encrypt"` or `"split"`. Optional — empty string is fine when the
+    /// plugin only has one phase.
+    pub phase: String,
+}
+
+/// Type-erased progress callback the plugin receives. Cheap to clone (it's
+/// already an `Arc` under the hood). Plugins that don't report progress can
+/// simply never call it.
+pub type ProgressSender = Arc<dyn Fn(ForwardProgress) + Send + Sync>;
+
+/// No-op progress sender — used by the default `forward` impl and by tests
+/// that don't care about progress events.
+pub fn noop_progress() -> ProgressSender {
+    Arc::new(|_| {})
+}
+
 /// Byte-level transform applied to outgoing data. Implementations must be
 /// random-access: invoking `transform(off, &mut buf)` twice with the same
 /// `off` and `buf` must always produce the same result, because the engine
@@ -225,11 +257,16 @@ pub trait ProxyPlugin: Send + Sync {
     /// filesystem paths supplied by `params` — no network upload/download.
     /// Implementations should be blocking-friendly; the route handler wraps
     /// the call in `spawn_blocking`.
+    ///
+    /// `progress` is called periodically with byte counters so the UI can
+    /// render a progress bar. Plugins that don't report progress can ignore
+    /// the parameter — passing `noop_progress()` from a caller is fine.
     fn forward(
         &self,
         _global: &serde_json::Value,
         _task: &serde_json::Value,
         _params: &serde_json::Value,
+        _progress: ProgressSender,
     ) -> Result<ForwardResult, String> {
         Err("plugin does not support forward operation".into())
     }

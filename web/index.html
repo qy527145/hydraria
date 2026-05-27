@@ -3246,25 +3246,122 @@ async function runPluginForward(plugin, card) {
     if (params[k] === null) delete params[k];
   }
   const resultBox = card.querySelector('[data-role="result"]');
+  resultBox.style.color = "";
   resultBox.style.display = "";
-  resultBox.textContent = "执行中…";
+  resultBox.innerHTML = "";
+
+  // Build a lightweight progress UI. The streaming endpoint emits NDJSON
+  // frames: progress / result / error. We parse each line and update the
+  // bar; the bar stays at 0% until the first progress frame so an instant
+  // failure doesn't briefly flash a misleading 100%.
+  const progressWrap = document.createElement('div');
+  progressWrap.style.marginBottom = '8px';
+  const progressLabel = document.createElement('div');
+  progressLabel.style.fontSize = '11px';
+  progressLabel.style.color = 'var(--muted)';
+  progressLabel.style.marginBottom = '4px';
+  progressLabel.textContent = '执行中…';
+  const progressTrack = document.createElement('div');
+  progressTrack.className = 'progress';
+  progressTrack.style.display = 'block';
+  const progressBar = document.createElement('div');
+  progressBar.className = 'progress-bar';
+  progressBar.style.width = '0%';
+  progressTrack.appendChild(progressBar);
+  progressWrap.appendChild(progressLabel);
+  progressWrap.appendChild(progressTrack);
+  resultBox.appendChild(progressWrap);
+
+  let started = Date.now();
+
   try {
-    const r = await api(`/api/plugins/${plugin.id}/forward`, {
-      method: "POST",
+    const res = await fetch(`/api/plugins/${plugin.id}/forward`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ task: taskCfg, params }),
     });
-    renderForwardResult(resultBox, r);
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const j = await res.json(); msg = j.error || msg; } catch {}
+      throw new Error(msg);
+    }
+
+    let finalFrame = null;
+    let errorFrame = null;
+    await readNdjsonStream(res, frame => {
+      if (frame.type === 'progress') {
+        const pct = frame.bytes_total > 0
+          ? Math.min(100, (frame.bytes_done / frame.bytes_total) * 100)
+          : 0;
+        progressBar.style.width = pct.toFixed(1) + '%';
+        const elapsed = (Date.now() - started) / 1000;
+        const speed = elapsed > 0.05 ? frame.bytes_done / elapsed : 0;
+        const phase = frame.phase ? `${frame.phase} · ` : '';
+        progressLabel.textContent = frame.bytes_total > 0
+          ? `${phase}${pct.toFixed(1)}% · ${fmtBytes(frame.bytes_done)} / ${fmtBytes(frame.bytes_total)} · ${fmtBytes(speed)}/s`
+          : `${phase}${fmtBytes(frame.bytes_done)} 已处理 · ${fmtBytes(speed)}/s`;
+      } else if (frame.type === 'result') {
+        finalFrame = frame;
+      } else if (frame.type === 'error') {
+        errorFrame = frame;
+      }
+    });
+
+    if (errorFrame) {
+      throw new Error(errorFrame.error || '未知错误');
+    }
+    if (!finalFrame) {
+      throw new Error('未收到结果帧');
+    }
+    progressBar.style.width = '100%';
+    progressLabel.textContent = `完成 · 用时 ${((Date.now() - started) / 1000).toFixed(1)}s`;
+    renderForwardResult(resultBox, finalFrame, /*keepProgress=*/true);
     toast("执行成功", "ok");
   } catch (e) {
-    resultBox.textContent = "失败：" + e.message;
-    resultBox.style.color = "var(--bad)";
+    progressLabel.textContent = '失败';
+    progressLabel.style.color = 'var(--bad)';
+    progressBar.style.background = 'var(--bad)';
+    const errLine = document.createElement('div');
+    errLine.style.color = 'var(--bad)';
+    errLine.style.marginTop = '6px';
+    errLine.textContent = '失败：' + e.message;
+    resultBox.appendChild(errLine);
     toast("执行失败：" + e.message, "error");
   }
 }
 
-function renderForwardResult(box, r) {
+/// Read an NDJSON response body line by line, calling `onFrame` for each
+/// parsed object. Lines split across chunk boundaries are buffered. Lines
+/// that fail to parse are skipped silently — the stream is best-effort and
+/// a malformed frame shouldn't kill the whole run.
+async function readNdjsonStream(res, onFrame) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      try { onFrame(JSON.parse(line)); } catch {}
+    }
+  }
+  // Trailing partial line (no newline) — try one last parse so we don't
+  // drop a final frame on slow / truncated streams.
+  if (buf.trim()) {
+    try { onFrame(JSON.parse(buf)); } catch {}
+  }
+}
+
+function renderForwardResult(box, r, keepProgress = false) {
   box.style.color = "";
-  box.innerHTML = "";
+  if (!keepProgress) {
+    box.innerHTML = "";
+  }
   if (r.message) {
     const msg = document.createElement("div");
     msg.style.color = "var(--good)";

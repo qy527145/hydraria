@@ -6,7 +6,7 @@ use crate::models::{
     AppState, ContentDispositionMode, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry,
     TaskInfo, TaskUpdate, short_id,
 };
-use crate::plugins::{ForwardResult, PluginInfo};
+use crate::plugins::PluginInfo;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -910,9 +910,17 @@ struct ForwardReq {
 }
 
 /// `POST /api/plugins/:plugin_id/forward` — run the plugin's sender-side
-/// operation. For ChaCha20 this reads a local plaintext file and writes its
-/// ciphertext to another local path, returning the (possibly auto-generated)
-/// key+nonce for the user to paste into the matching task config.
+/// operation and stream **NDJSON** progress + final result back. Each line
+/// is one JSON object:
+///
+///   * `{"type":"progress","bytes_done":..,"bytes_total":..,"phase":".."}`
+///   * `{"type":"result", ...}`  — the final ForwardResult fields, flattened
+///     onto the same object (`bytes_in`, `bytes_out`, `info`, `message`)
+///   * `{"type":"error","error":".."}`
+///
+/// We chose NDJSON over SSE so the existing `fetch()` plumbing on the UI
+/// (which already JSON-decodes responses) only needs a stream-reader added
+/// around it — no `EventSource`, no second protocol.
 ///
 /// File IO runs on a blocking pool so it doesn't stall the tokio runtime —
 /// the operation can be multi-GB on a fast disk.
@@ -920,7 +928,7 @@ async fn plugin_forward(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
     Json(req): Json<ForwardReq>,
-) -> Result<Json<ForwardResult>, ProxyError> {
+) -> Result<Response, ProxyError> {
     let plugin = state
         .plugins
         .get(&plugin_id)
@@ -938,14 +946,69 @@ async fn plugin_forward(
         .cloned()
         .unwrap_or_else(|| plugin.default_global_config());
 
+    // Channel from blocking encrypt loop → SSE-style streaming response.
+    // Buffered so a slow client doesn't backpressure the encrypt loop into
+    // stalling — we'd rather drop progress events than slow the work down.
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+
     let plugin_for_blocking = Arc::clone(&plugin);
-    let result = tokio::task::spawn_blocking(move || {
-        plugin_for_blocking.forward(&global, &req.task, &req.params)
-    })
-    .await
-    .map_err(|e| ProxyError::Internal(format!("forward task join: {e}")))?
-    .map_err(ProxyError::Internal)?;
-    Ok(Json(result))
+    let task = req.task;
+    let params = req.params;
+    let progress_tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        // The progress callback runs synchronously inside the encrypt loop,
+        // so we use the channel's `try_send` which never blocks. When the
+        // buffer is full we drop the event — the next tick will catch up.
+        let progress: crate::plugins::ProgressSender = Arc::new(move |p| {
+            let payload = serde_json::json!({
+                "type": "progress",
+                "bytes_done": p.bytes_done,
+                "bytes_total": p.bytes_total,
+                "phase": p.phase,
+            });
+            if let Ok(mut s) = serde_json::to_vec(&payload) {
+                s.push(b'\n');
+                let _ = progress_tx.try_send(bytes::Bytes::from(s));
+            }
+        });
+        let outcome = plugin_for_blocking.forward(&global, &task, &params, progress);
+        let final_payload = match outcome {
+            Ok(r) => serde_json::json!({
+                "type": "result",
+                "bytes_in": r.bytes_in,
+                "bytes_out": r.bytes_out,
+                "info": r.info,
+                "message": r.message,
+            }),
+            Err(e) => serde_json::json!({
+                "type": "error",
+                "error": e,
+            }),
+        };
+        if let Ok(mut s) = serde_json::to_vec(&final_payload) {
+            s.push(b'\n');
+            // Final frame: blocking_send so it can't be dropped by a full
+            // buffer — without this the UI may never see the result on a
+            // backpressured channel.
+            let _ = tx.blocking_send(bytes::Bytes::from(s));
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let body = Body::from_stream(stream);
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    // Disable proxy buffering (nginx and friends will hold the whole body
+    // otherwise, defeating the point of streaming).
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(resp)
 }
 
 /// `GET /api/fs/info` — small capability probe so the UI knows whether to
