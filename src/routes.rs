@@ -230,9 +230,26 @@ async fn patch_task(
     let entry = state
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+    // Snapshot the cache key before the URL list changes so we can migrate
+    // the on-disk entry if the user just rotated a signed link.
+    let old_cache_key = crate::cache::CacheStore::key_for_task(&entry.config_snapshot());
     entry
         .apply_update(update)
         .map_err(ProxyError::Internal)?;
+    let new_cache_key = crate::cache::CacheStore::key_for_task(&entry.config_snapshot());
+    if old_cache_key != new_cache_key {
+        match state.cache.migrate_key(&old_cache_key, &new_cache_key) {
+            Ok(true) => tracing::info!(
+                "cache migrated for task {}: {} -> {}",
+                task_id, old_cache_key, new_cache_key,
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                "cache migration failed for task {} ({} -> {}): {}",
+                task_id, old_cache_key, new_cache_key, e,
+            ),
+        }
+    }
     Ok(Json(state.task_info(&task_id, &entry)))
 }
 

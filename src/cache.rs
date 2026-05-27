@@ -459,6 +459,46 @@ impl CacheStore {
         self.entries.read().get(key).cloned()
     }
 
+    /// Move an entry's on-disk state from `from_key` to `to_key`. Used when a
+    /// task's URLs change (e.g. a pan-CDN signed link expires and the user
+    /// pastes a new one for the same content) — the cache key is derived
+    /// from the URL list, so without migration the old directory becomes an
+    /// orphan and the user pays a full re-fetch.
+    ///
+    /// Optimistic: we don't verify the new URLs point to the same content.
+    /// If they don't, `CacheStore::open`'s fresh-probe path will see
+    /// incompatible etag/size and wipe the renamed directory on the next
+    /// stream request — same outcome as the no-migration baseline.
+    ///
+    /// Safety: refuses to migrate while a live in-memory `CacheEntry` exists
+    /// under `from_key`. A live entry's internal `root: PathBuf` would go
+    /// stale across the rename, breaking `persist_bitmap` for in-flight
+    /// writes. The expected real-world path here — user notices a download
+    /// stalled, replaces a dead URL — has no active stream and so no live
+    /// entry, so this restriction barely costs anything in practice.
+    ///
+    /// Returns `Ok(true)` when a rename actually happened, `Ok(false)` for
+    /// every no-op condition (same key, no source dir, destination exists,
+    /// source still in use). I/O errors propagate as `Err`.
+    pub fn migrate_key(&self, from_key: &str, to_key: &str) -> Result<bool> {
+        if from_key == to_key {
+            return Ok(false);
+        }
+        let from = self.entry_dir(from_key);
+        let to = self.entry_dir(to_key);
+        if !from.is_dir() {
+            return Ok(false);
+        }
+        if to.exists() {
+            return Ok(false);
+        }
+        if self.entries.read().contains_key(from_key) {
+            return Ok(false);
+        }
+        std::fs::rename(&from, &to).map_err(ProxyError::Io)?;
+        Ok(true)
+    }
+
     pub fn clear(&self, key: &str) -> Result<()> {
         self.entries.write().remove(key);
         let dir = self.entry_dir(key);
@@ -496,18 +536,90 @@ impl CacheStore {
     }
 
     pub fn stats(&self, key: &str) -> Option<CacheStats> {
-        self.entries.read().get(key).map(|e| e.stats())
+        if let Some(e) = self.entries.read().get(key) {
+            return Some(e.stats());
+        }
+        // In-memory miss — entry was never opened in this process (typical
+        // right after restart, before any stream request has run). Read the
+        // bitmap straight off disk so the dashboard reflects the durable
+        // state instead of looking empty.
+        self.stats_from_disk(key)
     }
 
-    /// Sum `bytes_cached` across all open entries. (Closed entries — wiped
-    /// or never opened in this process — are not counted; that's fine for
-    /// the UI's "current footprint" since we re-open lazily.)
+    /// Read meta.json + bitmap.bin off disk and synthesize a CacheStats
+    /// without opening the data file or inserting into `entries`. Returns
+    /// None when there's no on-disk entry for `key` (or it's malformed).
+    /// `hits`/`misses` reset to zero — they're per-process counters and
+    /// haven't started counting yet for this entry.
+    fn stats_from_disk(&self, key: &str) -> Option<CacheStats> {
+        let dir = self.entry_dir(key);
+        if !dir.is_dir() {
+            return None;
+        }
+        let meta: CacheMeta = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())?;
+        let bm = std::fs::read(dir.join("bitmap.bin")).ok()?;
+        let blocks_total = meta.total_size.div_ceil(meta.block_size);
+        let blocks_cached = bm
+            .iter()
+            .map(|b| b.count_ones() as u64)
+            .sum::<u64>()
+            .min(blocks_total);
+        let bytes_cached = (blocks_cached * meta.block_size).min(meta.total_size);
+        let bitmap_summary = downsample_bitmap(&bm, blocks_total, 128);
+        Some(CacheStats {
+            key: key.to_string(),
+            total_size: meta.total_size,
+            bytes_cached,
+            blocks_cached,
+            blocks_total,
+            hits: 0,
+            misses: 0,
+            etag: meta.etag,
+            bitmap_summary,
+        })
+    }
+
+    /// Sum `bytes_cached` across every entry currently on disk. Walks the
+    /// cache root one level deep and reads each entry's bitmap to compute
+    /// covered bytes — so the count is accurate after a restart, before any
+    /// entry has been re-opened. Falls back to in-memory state when the
+    /// directory walk fails for any reason.
     pub fn total_bytes_on_disk(&self) -> u64 {
-        self.entries
-            .read()
-            .values()
-            .map(|e| e.bytes_cached.load(Ordering::Relaxed))
-            .sum()
+        let mut total: u64 = 0;
+        let read = match std::fs::read_dir(&self.root) {
+            Ok(r) => r,
+            Err(_) => {
+                return self
+                    .entries
+                    .read()
+                    .values()
+                    .map(|e| e.bytes_cached.load(Ordering::Relaxed))
+                    .sum();
+            }
+        };
+        for ent in read.flatten() {
+            let path = ent.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let key = match path.file_name().and_then(|s| s.to_str()) {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+            // Prefer in-memory live state when available — `bytes_cached` is
+            // updated incrementally as fetches land, so it stays in lockstep
+            // with the bitmap without re-reading from disk every tick.
+            if let Some(e) = self.entries.read().get(&key) {
+                total = total.saturating_add(e.bytes_cached.load(Ordering::Relaxed));
+                continue;
+            }
+            if let Some(s) = self.stats_from_disk(&key) {
+                total = total.saturating_add(s.bytes_cached);
+            }
+        }
+        total
     }
 }
 
@@ -661,5 +773,92 @@ mod tests {
         // Filling the tail finally completes it.
         merge_interval(&mut s2, 1000, 1024);
         assert!(interval_set_covers(&s2, block_len));
+    }
+
+    fn fresh_store() -> (PathBuf, CacheStore) {
+        // Unique per-test subdir under the system temp root. We don't bother
+        // with cleanup on drop — these are tiny scratch dirs and CI tmpfs
+        // gets wiped between runs anyway.
+        let id = format!(
+            "hydraria-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let dir = std::env::temp_dir().join(id);
+        let store = CacheStore::new(dir.clone()).expect("store");
+        (dir, store)
+    }
+
+    fn seed_entry_dir(store: &CacheStore, key: &str) {
+        let dir = store.entry_dir(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        std::fs::write(dir.join("bitmap.bin"), [0u8; 4]).unwrap();
+        std::fs::write(dir.join("file.bin"), b"").unwrap();
+    }
+
+    #[test]
+    fn migrate_key_renames_directory_when_dest_is_free() {
+        let (root, store) = fresh_store();
+        seed_entry_dir(&store, "old");
+        let moved = store.migrate_key("old", "new").unwrap();
+        assert!(moved);
+        assert!(!store.entry_dir("old").exists());
+        assert!(store.entry_dir("new").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_key_noop_for_same_key() {
+        let (root, store) = fresh_store();
+        seed_entry_dir(&store, "k");
+        let moved = store.migrate_key("k", "k").unwrap();
+        assert!(!moved);
+        assert!(store.entry_dir("k").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_key_noop_when_source_missing() {
+        let (root, store) = fresh_store();
+        let moved = store.migrate_key("ghost", "new").unwrap();
+        assert!(!moved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_key_refuses_to_overwrite_existing_dest() {
+        let (root, store) = fresh_store();
+        seed_entry_dir(&store, "old");
+        seed_entry_dir(&store, "new");
+        let moved = store.migrate_key("old", "new").unwrap();
+        assert!(!moved, "must not clobber existing dest");
+        assert!(store.entry_dir("old").is_dir(), "source preserved");
+        assert!(store.entry_dir("new").is_dir(), "dest preserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_key_refuses_when_source_has_live_entry() {
+        // A live in-memory entry's `root` would go stale across the rename
+        // and break `persist_bitmap`. Skip the migration in that case.
+        let (root, store) = fresh_store();
+        let meta = CacheMeta {
+            etag: Some("e".into()),
+            last_modified: None,
+            total_size: 1024,
+            content_type: None,
+            block_size: BLOCK_SIZE,
+            urls: vec![],
+        };
+        let _live = store.open("live", meta).unwrap();
+        let moved = store.migrate_key("live", "new").unwrap();
+        assert!(!moved);
+        assert!(store.entry_dir("live").is_dir(), "source preserved");
+        assert!(!store.entry_dir("new").exists(), "dest not created");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
