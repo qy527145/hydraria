@@ -1103,6 +1103,40 @@ impl Engine {
                                         }
                                         return;
                                     }
+                                    // While we were awaiting the (possibly slow)
+                                    // `out_tx.send`, fetchers may have completed
+                                    // and sent their release events. With the
+                                    // per-chunk channel buffer now sized to hold
+                                    // a full chunk's payload, this is the
+                                    // common case: a fetcher finishes pumping
+                                    // ~split bytes into its channel and exits
+                                    // long before the serializer drains them
+                                    // to a slow client. `select!`'s `biased`
+                                    // policy keeps re-entering this arm as long
+                                    // as `rx` has buffered items, so the release
+                                    // arm would otherwise not run until the
+                                    // serializer hits a chunk with no fetcher —
+                                    // typically after ~max_threads × split
+                                    // bytes of already-buffered data have
+                                    // drained, during which every upstream URL
+                                    // reports 0 B/s. Drain pending releases and
+                                    // immediately top up the in-flight window
+                                    // so new fetchers stay hot on the upstream.
+                                    while let Ok(vi) = release_rx.try_recv() {
+                                        if vi < per_vol.len() && per_vol[vi] > 0 {
+                                            per_vol[vi] -= 1;
+                                        }
+                                        if total_in_flight > 0 {
+                                            total_in_flight -= 1;
+                                        }
+                                    }
+                                    try_spawn_more(
+                                        &mut handles,
+                                        &mut per_vol,
+                                        &mut total_in_flight,
+                                        &mut spawned,
+                                        &mut senders,
+                                    );
                                 }
                                 None => {
                                     // Chunk i fully delivered. Move to next.
