@@ -1,5 +1,7 @@
 # Hydraria
 
+**English** · [简体中文](README.zh-CN.md)
+
 > A high-performance, low-latency, multi-threaded HTTP streaming proxy written in Rust — with a built-in web dashboard.
 
 Hydraria turns a slow, single-source HTTP download into a parallelized, multi-source pull, then streams the assembled bytes back to any standard HTTP client (browser, VLC, IINA, Aria2, `wget`, …) over a stable short link. The whole thing is one statically linked Rust binary; the dashboard is embedded inside it via `rust-embed`, so there is nothing to deploy on the frontend.
@@ -231,6 +233,38 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 └── web
     └── index.html     # dashboard (embedded into the binary at compile time)
 ```
+
+## Changelog
+
+### v0.1.6
+
+- **Scheduler starvation fix** — under slow clients (single-connection browser downloads), the main loop's `biased select!` preferred draining `rx` and left `release_rx` un-polled for long stretches, so every upstream URL dropped to 0 B/s until the already-buffered data drained. After each forwarded item we now non-blocking-drain pending release events and immediately re-spawn, keeping upstreams hot end to end.
+- **Less thread laziness** — per-chunk channel buffer changed from a fixed 4 to a split-derived size (~split / 16 KiB, capped at 512), so fetchers no longer backpressure their channel and stall as "0 B/s on volumes 2+". The scheduler's strict pass now picks by plan order rather than spreading across volumes, concentrating parallelism on what the serializer is about to consume instead of pre-fetching far-future volumes.
+- **Plugin / volume UX polish** — improvements to the volume + plugin sections of the create / edit modal.
+- **Cache identity tighter** — additional edge cases tightened around cache-hit recognition.
+
+### v0.1.5
+
+- **Two-level concurrent scheduling** — introduced `max_per_volume` as a soft cap, so per-URL/per-IP concurrency stays bounded while task-wide `max_threads` still fills up. Strict + overflow two-pass spawn keeps the budget at its limit even when work is unevenly distributed.
+- **Source dashboard upgrades** — URL health now reports `in_flight_requests` and `volume_size`; the dashboard renders live in-flight counts and per-volume sizes per URL.
+- **HEAD-unsupported skip list** — per-task shared set of URLs that have rejected HEAD; subsequent probes skip straight to the 1-byte Range GET.
+- **Global cache wipe** — `DELETE /api/cache` clears the local cache for every task in one shot.
+
+### v0.1.4
+
+- **Sticky modal action bar** — long forms keep their close / save buttons in reach at the bottom.
+- **Plugin config preserved on JSON import** — fixed an import path that dropped the plugin section.
+
+### v0.1.3
+
+- **Plugin system + ChaCha20 decrypt plugin** — outgoing byte pipeline can stack multiple transforms, applied in reverse. Bundled ChaCha20-Poly1305 decrypt plugin enables encrypted origin → plaintext client playback.
+- **Cache concurrent-write race fixed** — bitmap race when multiple fetchers write the same block in parallel.
+
+### v0.1.2 / v0.1.1
+
+- **Seven core optimizations** — cross-volume cache, resume-from-offset, weighted source selection, clone / import / export, cache heatmap, `download` CLI subcommand.
+- **Drag-to-reorder volumes + auto filename LCP merge** — UI supports drag-reordering; multi-volume tasks pick the longest common prefix across per-volume filenames as the default output name.
+- **Cross-volume warm-up scheduling** — pre-opens connections to the next volume before the boundary, avoiding TCP-setup latency at the transition.
 
 ## Roadmap
 
