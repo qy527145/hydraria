@@ -1,12 +1,14 @@
-use crate::cache::{CacheEntry, CacheMeta};
+use crate::cache::{CacheEntry, CacheMeta, Staging};
+use crate::download::{DownloadJob, PersistedDownload};
 use crate::engine::{Engine, UpstreamProbe, parse_range_header, suggest_volume_filename};
 use crate::error::ProxyError;
 use crate::fs_pick::{self, PickRequest, PickResponse};
 use crate::models::{
-    AppState, ContentDispositionMode, GlobalSettingsUpdate, GlobalState, TaskConfig, TaskEntry,
-    TaskInfo, TaskUpdate, short_id,
+    AppState, ConnectionGuard, ContentDispositionMode, GlobalSettingsUpdate, GlobalState,
+    TaskConfig, TaskEntry, TaskInfo, TaskUpdate, short_id,
 };
 use crate::plugins::PluginInfo;
+use crate::schedule::Strategy;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -86,6 +88,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/pause", post(pause_task))
         .route("/api/tasks/{task_id}/resume", post(resume_task))
         .route("/api/tasks/{task_id}/cache", delete(clear_task_cache))
+        .route(
+            "/api/tasks/{task_id}/download",
+            post(start_download).delete(cancel_download),
+        )
+        .route("/api/tasks/{task_id}/download/pause", post(pause_download))
+        .route("/api/tasks/{task_id}/download/resume", post(resume_download))
         .route("/api/cache", delete(clear_all_cache))
         .route("/api/tasks/{task_id}/export", get(export_task))
         .route("/api/probe", post(probe_urls))
@@ -347,6 +355,14 @@ async fn stream_task(
     handle_stream(state, task_id, range, false).await
 }
 
+/// Serve the proxy stream. **Playback only** — latency-first scheduling that
+/// prioritizes the bytes just past the client's Range start, because that is
+/// what a player is blocked on.
+///
+/// Bulk downloads deliberately do *not* come through here. An HTTP response body
+/// is an ordered byte stream, so a download served this way is hostage to
+/// whichever request sits at the read head; `POST /api/tasks/:id/download` runs
+/// a server-side job instead, writing out of order straight to a file.
 async fn handle_stream(
     state: AppState,
     task_id: String,
@@ -372,6 +388,73 @@ async fn handle_stream(
         return Ok((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
     }
 
+    let (cfg, probe, engine) = prepare_engine(&state, &task_id, &entry).await?;
+
+    // Acquire the staging substrate for the multi-threaded path: persistent
+    // (the task's cache entry) when `cache: true`, an ephemeral scratch file
+    // otherwise. HEAD requests never move bytes, so don't allocate one.
+    let staging: Option<Staging> = if head_only {
+        None
+    } else {
+        match resolve_staging(&state, &cfg, &probe) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "staging unavailable for task {} ({}); falling back to the \
+                     in-memory ordered path",
+                    task_id,
+                    e,
+                );
+                None
+            }
+        }
+    };
+    // The in-memory fallback still benefits from a *persistent* cache entry;
+    // an ephemeral scratch file is only meaningful to the staged path.
+    let cache_entry: Option<Arc<CacheEntry>> = staging
+        .as_ref()
+        .filter(|s| !s.is_ephemeral())
+        .map(|s| Arc::clone(s.entry()));
+    tracing::debug!(
+        "stream task={} staging={} mode={}",
+        task_id,
+        match &staging {
+            Some(s) if s.is_ephemeral() => "ephemeral",
+            Some(_) => "cache",
+            None => "none",
+        },
+        if probe.accepts_ranges && probe.total_size.is_some() { "ranged" } else { "passthrough" },
+    );
+
+    let engine = Arc::new(engine.with_cache(cache_entry.clone()));
+
+    build_stream_response(
+        state,
+        task_id,
+        entry,
+        engine,
+        probe,
+        range_header,
+        head_only,
+        cfg.content_disposition,
+        staging,
+        Strategy::latency_default(),
+    )
+    .await
+}
+
+/// Probe a task's upstream and assemble a fully-wired `Engine` for it: health
+/// accumulators, volume layout, and the plugin transform pipeline.
+///
+/// Shared by the playback stream and the download API — both need the same
+/// probe (which is cached per task, since players re-probe on every seek) and
+/// the same engine, and neither should be duplicating this. The returned engine
+/// deliberately has **no** cache/staging attached; that is the caller's choice.
+async fn prepare_engine(
+    state: &AppState,
+    task_id: &str,
+    entry: &Arc<TaskEntry>,
+) -> Result<(Arc<TaskConfig>, UpstreamProbe, Engine), ProxyError> {
     let cfg = Arc::new(entry.config_snapshot());
     let engine = Engine::new(Arc::clone(&cfg))?
         .with_head_unsupported(Arc::clone(&entry.head_unsupported));
@@ -458,24 +541,6 @@ async fn handle_stream(
         }
     }
 
-    // Resolve cache entry up-front when (a) the task wants caching, (b) the
-    // upstream supports ranges, and (c) we know a real total size. Any
-    // mismatch with previously-stored meta wipes the on-disk cache and
-    // starts over (auto-clear policy).
-    let cache_entry: Option<Arc<CacheEntry>> =
-        match resolve_cache(&state, &cfg, &probe) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("cache disabled for task {}: {}", task_id, e);
-                None
-            }
-        };
-    tracing::debug!(
-        "stream task={} cache={} mode={}",
-        task_id,
-        cache_entry.is_some(),
-        if probe.accepts_ranges && probe.total_size.is_some() { "ranged" } else { "passthrough" },
-    );
 
     let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
     // Build the plugin transform pipeline from the task's enabled plugins
@@ -494,25 +559,188 @@ async fn handle_stream(
     } else {
         Some(Arc::new(pipeline))
     };
-    let engine = Arc::new(
-        engine
-            .with_cache(cache_entry.clone())
-            .with_health(health)
-            .with_volumes(probe.volumes.clone())
-            .with_pipeline(pipeline),
-    );
+    let engine = engine
+        .with_health(health)
+        .with_volumes(probe.volumes.clone())
+        .with_pipeline(pipeline);
+    Ok((cfg, probe, engine))
+}
 
-    build_stream_response(
-        state,
-        task_id,
-        entry,
-        engine,
-        probe,
-        range_header,
-        head_only,
-        cfg.content_disposition,
-    )
-    .await
+#[derive(Debug, Default, Deserialize)]
+struct StartDownloadReq {
+    /// Output directory. Falls back to the global `download_dir` setting.
+    #[serde(default)]
+    dir: Option<String>,
+    /// Output filename. Falls back to whatever the upstream probe detected.
+    #[serde(default)]
+    filename: Option<String>,
+    /// Worker count. Falls back to the task's `max_threads`.
+    #[serde(default)]
+    threads: Option<usize>,
+}
+
+/// Start (or restart) a server-side download for this task.
+///
+/// This is the bulk-transfer path, deliberately separate from `/stream/:id`:
+/// workers fetch claims in whatever order completes soonest and `pwrite` them at
+/// absolute offsets, so no single slow request can gate progress the way it must
+/// in an ordered HTTP response.
+async fn start_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    body: Option<Json<StartDownloadReq>>,
+) -> Result<Json<crate::download::DownloadInfo>, ProxyError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let entry = state
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
+
+    let dir = req
+        .dir
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .or_else(|| state.settings.read().download_dir.clone())
+        .ok_or_else(|| {
+            ProxyError::Internal(
+                "no download directory: pass `dir` or set one in settings".into(),
+            )
+        })?;
+
+    let (cfg, probe, engine) = prepare_engine(&state, &task_id, &entry).await?;
+    // Out-of-order writes at absolute offsets are only meaningful when the
+    // upstream honours ranges and we know how big the file is.
+    if !probe.accepts_ranges {
+        return Err(ProxyError::Internal(
+            "upstream doesn't support byte ranges; cannot download in parallel".into(),
+        ));
+    }
+    let total = probe.total_size.filter(|t| *t > 0).ok_or_else(|| {
+        ProxyError::Internal("upstream didn't report a size; cannot download".into())
+    })?;
+
+    let filename = req
+        .filename
+        .as_deref()
+        .and_then(crate::download::sanitize_filename)
+        .or_else(|| probe.filename.as_deref().and_then(crate::download::sanitize_filename))
+        .unwrap_or_else(|| format!("{task_id}.bin"));
+
+    let mut urls = cfg.urls();
+    urls.sort_unstable();
+    let meta = CacheMeta {
+        etag: probe.etag.clone(),
+        last_modified: probe.last_modified.clone(),
+        total_size: total,
+        content_type: probe.content_type.clone(),
+        block_size: crate::cache::BLOCK_SIZE,
+        urls,
+    };
+
+    let job = DownloadJob::new(
+        Arc::new(engine),
+        task_id.clone(),
+        std::path::PathBuf::from(&dir),
+        filename,
+        meta,
+        req.threads.unwrap_or(cfg.max_threads).max(1),
+    )?;
+    state.downloads.insert(Arc::clone(&job));
+    job.start();
+    Ok(Json(job.info()))
+}
+
+async fn pause_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<crate::download::DownloadInfo>, ProxyError> {
+    let job = state
+        .downloads
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::Internal(format!("no download for task {task_id}")))?;
+    job.pause();
+    Ok(Json(job.info()))
+}
+
+async fn resume_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<crate::download::DownloadInfo>, ProxyError> {
+    let job = state
+        .downloads
+        .get(&task_id)
+        .ok_or_else(|| ProxyError::Internal(format!("no download for task {task_id}")))?;
+    job.start();
+    Ok(Json(job.info()))
+}
+
+/// Cancel and discard the partial data.
+async fn cancel_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ProxyError> {
+    if let Some(job) = state.downloads.remove(&task_id) {
+        job.cancel();
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Recreate download jobs restored from disk. Jobs that were running when the
+/// process last exited pick up where they left off — the bytes are already in
+/// the `.part` file and its bitmap says which, so resuming costs one probe.
+pub async fn restore_downloads(state: AppState, saved: Vec<PersistedDownload>) {
+    for p in saved {
+        let Some(entry) = state.get(&p.task_id) else {
+            tracing::warn!(
+                "skipping restored download for unknown task {}",
+                p.task_id,
+            );
+            continue;
+        };
+        let prepared = prepare_engine(&state, &p.task_id, &entry).await;
+        let (cfg, probe, engine) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("restored download {} probe failed: {}", p.task_id, e);
+                continue;
+            }
+        };
+        let Some(total) = probe.total_size.filter(|t| *t > 0) else {
+            tracing::warn!("restored download {}: upstream size unknown", p.task_id);
+            continue;
+        };
+        let mut urls = cfg.urls();
+        urls.sort_unstable();
+        let meta = CacheMeta {
+            etag: probe.etag.clone(),
+            last_modified: probe.last_modified.clone(),
+            total_size: total,
+            content_type: probe.content_type.clone(),
+            block_size: crate::cache::BLOCK_SIZE,
+            urls,
+        };
+        match DownloadJob::new(
+            Arc::new(engine),
+            p.task_id.clone(),
+            std::path::PathBuf::from(&p.out_dir),
+            p.filename.clone(),
+            meta,
+            p.threads,
+        ) {
+            Ok(job) => {
+                state.downloads.insert(Arc::clone(&job));
+                if p.was_running {
+                    job.start();
+                }
+                tracing::info!(
+                    "restored download task={} ({}), running={}",
+                    p.task_id,
+                    p.filename,
+                    p.was_running,
+                );
+            }
+            Err(e) => tracing::warn!("restored download {} failed to open: {}", p.task_id, e),
+        }
+    }
 }
 
 /// Decide which filename (if any) to advertise on Content-Disposition.
@@ -538,23 +766,26 @@ fn resolve_served_filename(cfg: &TaskConfig, detected: Option<String>) -> Option
     }
 }
 
-fn resolve_cache(
+/// Acquire the staging substrate for one stream.
+///
+/// Requires byte-range support and a known total size — without both there is
+/// nothing to schedule and the caller falls back to a single passthrough
+/// stream. `cache: true` yields the durable entry (bytes outlive the stream);
+/// otherwise an ephemeral scratch file is used and removed when the last
+/// concurrent stream on this content finishes.
+fn resolve_staging(
     state: &AppState,
     cfg: &TaskConfig,
     probe: &UpstreamProbe,
-) -> Result<Option<Arc<CacheEntry>>, ProxyError> {
-    if !cfg.cache {
-        tracing::trace!("cache skipped: task.cache = false");
-        return Ok(None);
-    }
+) -> Result<Option<Staging>, ProxyError> {
     if !probe.accepts_ranges {
-        tracing::trace!("cache skipped: upstream doesn't support ranges");
+        tracing::trace!("staging skipped: upstream doesn't support ranges");
         return Ok(None);
     }
     let total = match probe.total_size {
         Some(t) if t > 0 => t,
         _ => {
-            tracing::trace!("cache skipped: unknown total size");
+            tracing::trace!("staging skipped: unknown total size");
             return Ok(None);
         }
     };
@@ -572,14 +803,19 @@ fn resolve_cache(
         block_size: crate::cache::BLOCK_SIZE,
         urls,
     };
-    let entry = state.cache.open(&key, meta)?;
+    let staging =
+        crate::cache::CacheStore::acquire_staging(&state.cache, &key, meta, cfg.cache)?;
     tracing::debug!(
-        "cache opened key={} total={} etag={:?}",
-        key, total, probe.etag,
+        "staging ready key={} total={} persistent={} etag={:?}",
+        key,
+        total,
+        !staging.is_ephemeral(),
+        probe.etag,
     );
-    Ok(Some(entry))
+    Ok(Some(staging))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_stream_response(
     state: AppState,
     task_id: String,
@@ -589,6 +825,8 @@ async fn build_stream_response(
     range_header: Option<String>,
     head_only: bool,
     disposition: ContentDispositionMode,
+    staging: Option<Staging>,
+    strategy: Strategy,
 ) -> Result<Response, ProxyError> {
     let _ = state; // reserved for future per-state telemetry
 
@@ -639,7 +877,7 @@ async fn build_stream_response(
             return Ok(resp);
         }
         let upstream = engine.open_passthrough(None).await?;
-        entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        let conn_guard = Arc::new(ConnectionGuard::new(Arc::clone(&entry)));
         let entry_for_count = Arc::clone(&entry);
         let state_for_count = state.clone();
         let task_limiter = Arc::clone(&entry.limiter);
@@ -658,7 +896,10 @@ async fn build_stream_response(
             let global_limiter = Arc::clone(&global_limiter);
             let engine_for_transform = Arc::clone(&engine_for_transform);
             let merged_cursor = Arc::clone(&merged_cursor);
+            // Keeps the connection gauge up until the stream is dropped.
+            let conn_guard = Arc::clone(&conn_guard);
             async move {
+                let _conn = conn_guard;
                 let item = match item {
                     Ok(b) => {
                         let n = b.len() as u64;
@@ -734,19 +975,29 @@ async fn build_stream_response(
         return Ok(resp);
     }
 
-    entry.active_connections.fetch_add(1, Ordering::Relaxed);
+    let conn_guard = Arc::new(ConnectionGuard::new(Arc::clone(&entry)));
     let entry_for_count = Arc::clone(&entry);
     let state_for_count = state.clone();
     let task_limiter = Arc::clone(&entry.limiter);
     let global_limiter = Arc::clone(&state.global_limiter);
 
-    let rx = engine.stream_range(start, end, open_ended);
+    // Staged path when a staging file is available: workers fetch out of order
+    // straight to disk and an ordered reader streams from it, so memory no
+    // longer bounds how much reordering we can absorb. Falls back to the
+    // in-memory ordered path (bounded lookahead, fixed splits) otherwise.
+    let rx = match staging {
+        Some(s) => engine.stream_staged(start, end, strategy, s),
+        None => engine.stream_range(start, end, open_ended),
+    };
     let stream = ReceiverStream::new(rx).then(move |item| {
         let entry_for_count = Arc::clone(&entry_for_count);
         let state_for_count = state_for_count.clone();
         let task_limiter = Arc::clone(&task_limiter);
         let global_limiter = Arc::clone(&global_limiter);
+        // Keeps the connection gauge up until the stream is dropped.
+        let conn_guard = Arc::clone(&conn_guard);
         async move {
+            let _conn = conn_guard;
             match item {
                 Ok(b) => {
                     let n = b.len() as u64;

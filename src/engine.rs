@@ -1,7 +1,8 @@
-use crate::cache::CacheEntry;
+use crate::cache::{CacheEntry, Staging};
 use crate::error::{ProxyError, Result};
 use crate::models::{TaskConfig, UrlHealthAcc};
 use crate::plugins::TransformPipeline;
+use crate::schedule::{Claim, Scheduler, Strategy};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
@@ -18,6 +19,24 @@ use tokio::task::JoinHandle;
 /// elsewhere) only has a few hundred KB of in-flight work to abandon.
 const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
+
+/// Floor on the per-chunk retry budget. See `Engine::fetch_attempts`.
+const MIN_FETCH_ATTEMPTS: usize = 4;
+
+/// How much the staged reader lifts out of the staging file per emit. Matches
+/// the cache block size, which is the natural granularity for both the bitmap
+/// and the page cache.
+const READ_CHUNK: u64 = crate::cache::BLOCK_SIZE;
+
+/// Ceiling on how far ahead of the serializer the in-memory fallback path
+/// (`stream_range`) may spawn fetchers, in chunks.
+///
+/// Only the staged path can absorb arbitrary reordering — it spills to disk.
+/// In memory, every chunk the serializer hasn't reached yet is a live buffer,
+/// so an unbounded window turns a slow head chunk into unbounded RAM: a
+/// measured run against a heavy-tail upstream pulled 1088 MB while the client
+/// had received 256 MB, leaving 832 MB parked in channels.
+const FALLBACK_LOOKAHEAD_CHUNKS: usize = 2;
 
 /// One chunk of a multi-volume task: an ordered list of mirror URLs that all
 /// serve this volume's bytes, plus its position in the merged stream. A
@@ -73,11 +92,34 @@ struct FetchTarget {
 
 impl Engine {
     pub fn new(config: Arc<TaskConfig>) -> Result<Self> {
+        // HTTP/1.1 only, deliberately. hyper's connection pool hands out a
+        // *shared* reservation for HTTP/2 connections (`Reservation::Shared`)
+        // and a unique one for HTTP/1. Since reqwest enables `http2` by
+        // default and virtually every CDN negotiates h2 over ALPN, leaving it
+        // on means all `max_threads` concurrent chunk requests to one host
+        // multiplex onto a *single* TCP connection — one congestion window,
+        // and only one instance of whatever per-connection rate limit the
+        // origin applies. That silently collapses N-way parallelism back to
+        // 1× and is the single biggest throughput cliff against pan/CDN
+        // origins. Forcing h1 gives us one real socket per in-flight fetcher.
+        //
+        // The timeout is a *read* timeout rather than a total-request one, and
+        // it is deliberately long. Staging relays (the pan-CDN middlemen that
+        // materialize an entire byte range upstream before emitting anything)
+        // routinely take tens of seconds to send their first byte, and that is
+        // a healthy request, not a stalled one — a 30 s deadline here failed
+        // 84 out of 84 requests against one such origin. Its remaining job is
+        // narrow: detect a socket that has genuinely stopped delivering, and
+        // give the scheduler the failure signal it needs to shrink an
+        // oversized claim (see `Scheduler::note_claim_outcome`). TCP keepalive
+        // covers peers that vanish without closing.
         let client = Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
-            .timeout(Duration::from_secs(60))
+            .tcp_keepalive(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(15))
+            .http1_only()
             .http1_title_case_headers()
             .build()
             .map_err(ProxyError::Upstream)?;
@@ -109,6 +151,11 @@ impl Engine {
         self
     }
 
+    /// Volume layout this engine was built with, for handing to a `Scheduler`.
+    pub(crate) fn volumes(&self) -> Option<Arc<Vec<VolumeMeta>>> {
+        self.volumes.clone()
+    }
+
     /// Plug in the task-shared set of URLs known to reject HEAD requests.
     /// `probe_one` reads this on entry to skip the HEAD round-trip and writes
     /// to it when a HEAD fails for the first time. Without this set installed
@@ -136,7 +183,7 @@ impl Engine {
     /// a pipeline it materializes a writeable copy, transforms in place, and
     /// returns the frozen result. Net cost: one clone of the slice's bytes
     /// when transforms are active, zero otherwise.
-    fn transform_outgoing(&self, merged_offset: u64, data: Bytes) -> Bytes {
+    pub(crate) fn transform_outgoing(&self, merged_offset: u64, data: Bytes) -> Bytes {
         match &self.pipeline {
             Some(p) if !p.is_empty() => {
                 if data.is_empty() {
@@ -262,15 +309,21 @@ impl Engine {
     }
 
     /// Retry budget for a single chunk fetch: rotate through the relevant
-    /// volume's mirrors twice. `locator` is the chunk's start offset, used to
-    /// pick the volume in multi-part tasks; in single-volume tasks every
-    /// chunk lands in the one volume so `locator` doesn't matter.
-    fn fetch_attempts(&self, locator: u64) -> usize {
+    /// volume's mirrors twice, with a floor of `MIN_FETCH_ATTEMPTS`. The
+    /// floor matters for single-URL tasks (the common netdisk case), where
+    /// `mirrors × 2` is only 2 — and a chunk that exhausts its budget aborts
+    /// the *whole* stream, so two transient hiccups would kill a download
+    /// that has no second source to fall back on.
+    ///
+    /// `locator` is the chunk's start offset, used to pick the volume in
+    /// multi-part tasks; in single-volume tasks every chunk lands in the one
+    /// volume so `locator` doesn't matter.
+    pub(crate) fn fetch_attempts(&self, locator: u64) -> usize {
         let n = self
             .volume_at(locator)
             .map(|v| v.urls.len())
             .unwrap_or_else(|| self.config.urls().len());
-        n.max(1) * 2
+        (n.max(1) * 2).max(MIN_FETCH_ATTEMPTS)
     }
 
     /// Translate a merged-stream `[span_start, span_end]` plus an in-volume
@@ -840,23 +893,25 @@ impl Engine {
         // Per-chunk channels so fetchers can run concurrently while the
         // serializer stitches bytes back together in plan order.
         //
-        // Buffer sizing: when the scheduler pre-spawns fetchers for chunks
-        // the serializer won't reach for a while (typical of multi-volume
-        // tasks where `max_per_volume` forces the next-volume's first chunk
-        // to spawn early), those fetchers would otherwise block on `send`
-        // after a few reqwest stream items — and a blocked `send` means TCP
-        // backpressure on the upstream, which the user perceives as
-        // "0 B/s on volumes 2+". We need each chunk's channel to absorb the
-        // chunk's entire payload so the fetcher can run to completion and
-        // release its slot regardless of when the serializer catches up.
+        // Buffer sizing: a fetcher MUST be able to push its entire chunk into
+        // the channel without blocking. If it can't, it parks in `tx.send()`
+        // still holding its scheduler slot and its upstream connection — and
+        // for any chunk other than the one at the serializer head, "until the
+        // serializer catches up" can be minutes. That drains the in-flight
+        // window exactly when we want the next request on the wire, which is
+        // catastrophic against origins whose dominant cost is per-request
+        // latency (staging/relay CDNs that materialize a whole byte range
+        // upstream before emitting the first byte) rather than bandwidth.
         //
-        // Estimate: reqwest yields stream items in 8-32 KiB increments; we
-        // size for the conservative 16 KiB case. Cap so a wildly large
-        // `max_split` doesn't blow up memory.
-        let stream_item_estimate = 16 * 1024u64;
-        let chan_buffer = ((split / stream_item_estimate) as usize)
-            .max(8)
-            .min(512);
+        // Over-provisioning is free: tokio's mpsc bound is a permit count,
+        // not a preallocation, and a fetcher never sends more than `split`
+        // bytes no matter how many permits exist. So peak memory stays
+        // bounded by `max_threads × max_split` and the only thing this
+        // number decides is whether a fetcher can run to completion. Size
+        // against a pessimistically small stream item so the estimate can
+        // never come up short.
+        const MIN_STREAM_ITEM: u64 = 4 * 1024;
+        let chan_buffer = split.div_ceil(MIN_STREAM_ITEM).clamp(8, 65536) as usize;
         let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
             Vec::with_capacity(total_chunks);
         let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
@@ -937,17 +992,28 @@ impl Engine {
             //
             // The per-volume cap thus behaves as a *soft* limit: honored
             // first, relaxed only when no other choice exists.
-            let try_spawn_more = |handles: &mut Vec<JoinHandle<()>>,
+            //
+            // Both passes are additionally bounded by a lookahead window that
+            // slides with the serializer (`head`). Unlike the staged path,
+            // which spills reordered bytes to disk, every chunk the serializer
+            // hasn't reached yet is a live in-memory buffer here — so an
+            // unbounded window converts one slow head chunk into unbounded
+            // RAM. See `FALLBACK_LOOKAHEAD_CHUNKS`.
+            let try_spawn_more = |head: usize,
+                                  handles: &mut Vec<JoinHandle<()>>,
                                   per_vol: &mut Vec<usize>,
                                   total_in_flight: &mut usize,
                                   spawned: &mut Vec<bool>,
                                   senders: &mut Vec<Option<mpsc::Sender<Result<Bytes>>>>|
              -> usize {
+                let window_end =
+                    head.saturating_add(max_threads.saturating_mul(FALLBACK_LOOKAHEAD_CHUNKS));
+                let limit = total_chunks.min(window_end.max(head + 1));
                 let mut spawned_count = 0;
                 while *total_in_flight < max_threads {
                     // Strict pass: lowest plan idx with cap room.
                     let mut pick: Option<usize> = None;
-                    for idx in 0..total_chunks {
+                    for idx in 0..limit {
                         if spawned[idx] {
                             continue;
                         }
@@ -958,9 +1024,9 @@ impl Engine {
                         pick = Some(idx);
                         break;
                     }
-                    // Overflow pass: any not-yet-spawned chunk, lowest idx.
+                    // Overflow pass: any not-yet-spawned chunk in the window.
                     if pick.is_none() {
-                        for idx in 0..total_chunks {
+                        for idx in 0..limit {
                             if !spawned[idx] {
                                 pick = Some(idx);
                                 break;
@@ -998,6 +1064,7 @@ impl Engine {
             // get cross-volume coverage because once a volume hits its cap
             // the loop falls through to the next volume's first chunk.
             let initial = try_spawn_more(
+                0,
                 &mut handles,
                 &mut per_vol,
                 &mut total_in_flight,
@@ -1131,6 +1198,7 @@ impl Engine {
                                         }
                                     }
                                     try_spawn_more(
+                                        i,
                                         &mut handles,
                                         &mut per_vol,
                                         &mut total_in_flight,
@@ -1152,6 +1220,7 @@ impl Engine {
                                 total_in_flight -= 1;
                             }
                             try_spawn_more(
+                                i,
                                 &mut handles,
                                 &mut per_vol,
                                 &mut total_in_flight,
@@ -1166,6 +1235,230 @@ impl Engine {
         });
 
         out_rx
+    }
+
+    /// Ordered streaming backed by a staging file instead of per-chunk memory
+    /// channels — the path that makes unlimited claim sizes and scenario-aware
+    /// scheduling possible.
+    ///
+    /// Workers pull [`Claim`]s from the [`Scheduler`] and write bytes at their
+    /// absolute offsets, in whatever order they arrive. A single reader walks
+    /// `[start, end]` forward, emitting each contiguous run as soon as it lands
+    /// and reporting its position back so a latency-first strategy can keep the
+    /// critical window pinned to it.
+    ///
+    /// Compared with `stream_range`, memory no longer scales with
+    /// `max_threads × max_split`: an out-of-order arrival costs disk, not RAM,
+    /// so one slow upstream request can't force the scheduler to either stall
+    /// or buffer unboundedly.
+    pub fn stream_staged(
+        self: Arc<Self>,
+        start: u64,
+        end: u64,
+        strategy: Strategy,
+        staging: Staging,
+    ) -> mpsc::Receiver<Result<Bytes>> {
+        let (out_tx, out_rx) = mpsc::channel::<Result<Bytes>>(8);
+        let max_threads = self.config.max_threads.max(1);
+        let max_per_volume = self.config.max_per_volume.max(1);
+        // `max_split == 0` means "let the scheduler size claims"; any other
+        // value is a hard ceiling the user asked for.
+        let split_cap = Some(self.config.max_split).filter(|c| *c > 0);
+
+        let already = staging.entry().staged_ranges(start, end);
+        let staged_bytes: u64 = already.iter().map(|&(s, e)| e - s + 1).sum();
+        let scheduler = Scheduler::new(
+            start,
+            end,
+            strategy,
+            self.volumes.clone(),
+            max_threads,
+            max_per_volume,
+            split_cap,
+            &already,
+        );
+
+        tracing::debug!(
+            "stream_staged [{}, {}] strategy={} threads={} per_volume={} split_cap={:?} \
+             ephemeral={} already_staged={} bytes",
+            start,
+            end,
+            strategy.label(),
+            max_threads,
+            max_per_volume,
+            split_cap,
+            staging.is_ephemeral(),
+            staged_bytes,
+        );
+
+        let run = Arc::new(StagedRun {
+            engine: Arc::clone(&self),
+            scheduler: parking_lot::Mutex::new(scheduler),
+            staging,
+            fatal: parking_lot::Mutex::new(None),
+            wake: tokio::sync::watch::Sender::new(0),
+            active_workers: AtomicUsize::new(max_threads),
+            failures: AtomicUsize::new(0),
+            failure_budget: max_threads.saturating_mul(2).max(8),
+        });
+
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(max_threads);
+        for worker in 0..max_threads {
+            let run = Arc::clone(&run);
+            handles.push(tokio::spawn(async move { run.run_worker(worker).await }));
+        }
+        tokio::spawn(async move { run.run_reader(start, end, out_tx, handles).await });
+
+        out_rx
+    }
+
+    /// Fetch one claim in a single upstream request, writing bytes straight
+    /// into staging at their absolute offsets.
+    ///
+    /// Two behaviours worth calling out:
+    ///
+    /// * **Resume, don't restart.** Retries pick up at `claim.cursor()`, so a
+    ///   request that dies at 90% costs the last 10%, not the whole claim.
+    /// * **Yield to theft.** `claim.end()` is re-read on every stream item
+    ///   because another worker may have taken this claim's tail. Overrunning
+    ///   it would duplicate that worker's transfer.
+    ///
+    /// `transform_on_write` decides whether the plugin pipeline runs before the
+    /// bytes hit disk:
+    ///
+    /// * `false` for playback staging — the file holds raw upstream bytes
+    ///   (ciphertext for an encrypted task) and the ordered reader transforms
+    ///   on the way out, so a byte range can serve any number of readers.
+    /// * `true` for a download — the artifact on disk is the deliverable and
+    ///   must be plaintext.
+    ///
+    /// Transforming on write is only sound because the pipeline is
+    /// offset-addressed (`apply_reverse(merged_offset, ..)`) and therefore
+    /// position-local: any range can be transformed independently, which is
+    /// also what makes a resumed download's already-written bytes still valid.
+    /// A future stateful transform (streaming compression, say) would break
+    /// that and needs handling here.
+    pub(crate) async fn fetch_claim(
+        &self,
+        worker: usize,
+        claim: &Claim,
+        sink: &CacheEntry,
+        transform_on_write: bool,
+    ) -> Result<()> {
+        let attempts = self.fetch_attempts(claim.start);
+        let mut last_err: Option<ProxyError> = None;
+
+        for attempt in 0..attempts {
+            let resume_at = claim.cursor();
+            let claim_end = claim.end();
+            if resume_at > claim_end {
+                return Ok(());
+            }
+            let target = match self.resolve_target(
+                worker,
+                attempt,
+                claim.start,
+                resume_at,
+                claim_end,
+            )? {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
+            tracing::trace!(
+                "fetch claim worker={} attempt={} url={} range={}-{} merged_start={}",
+                worker,
+                attempt,
+                target.url,
+                target.local_start,
+                target.local_end,
+                target.merged_start,
+            );
+
+            let req_start = Instant::now();
+            let _in_flight = self.in_flight_guard(&target.url);
+            let resp = match self.client.get(&target.url).headers(headers).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.record_failure(&target.url, None, &msg);
+                    tracing::debug!(
+                        "claim worker={} attempt={} url={} network error: {}",
+                        worker, attempt, target.url, msg,
+                    );
+                    last_err = Some(ProxyError::Upstream(e));
+                    continue;
+                }
+            };
+            let latency_ms = req_start.elapsed().as_millis() as u64;
+            let status = resp.status();
+            let status_code = status.as_u16();
+            if status != StatusCode::PARTIAL_CONTENT {
+                // Staged writes land at absolute offsets, so a 200 (whole file
+                // from byte 0) would corrupt the layout. Rotate mirrors.
+                self.record_failure(
+                    &target.url,
+                    Some(status_code),
+                    &format!("expected 206, got {status_code}"),
+                );
+                last_err = Some(ProxyError::BadStatus(status_code));
+                continue;
+            }
+            self.record_success(&target.url, status_code, latency_ms);
+
+            let mut cursor = target.merged_start;
+            let mut stream = resp.bytes_stream();
+            let mut had_err = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(b) => {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        // Re-read every item: our tail may have been stolen.
+                        let live_end = claim.end();
+                        if cursor > live_end {
+                            break;
+                        }
+                        let room = (live_end - cursor + 1) as usize;
+                        let take = room.min(b.len());
+                        let slice = b.slice(0..take);
+                        let slice = if transform_on_write {
+                            self.transform_outgoing(cursor, slice)
+                        } else {
+                            slice
+                        };
+                        if let Err(e) = sink.write_range(cursor, &slice) {
+                            // Losing the backing file is unrecoverable — there
+                            // is nowhere left to put the bytes.
+                            return Err(ProxyError::Io(e));
+                        }
+                        cursor += take as u64;
+                        claim.advance_to(cursor);
+                        self.record_bytes(&target.url, take as u64);
+                        if take < b.len() {
+                            break; // reached the claim's (possibly cut) end
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        self.record_failure(&target.url, Some(status_code), &msg);
+                        tracing::debug!(
+                            "claim worker={} attempt={} url={} mid-stream error at {}; \
+                             will resume there",
+                            worker, attempt, target.url, cursor,
+                        );
+                        last_err = Some(ProxyError::Upstream(e));
+                        had_err = true;
+                        break;
+                    }
+                }
+            }
+            if !had_err {
+                return Ok(());
+            }
+        }
+        Err(last_err.unwrap_or(ProxyError::NoUpstream))
     }
 
     async fn fetch_chunk_to(
@@ -1596,11 +1889,194 @@ impl Engine {
     }
 }
 
+/// Aborts a staged stream's fetchers when the reader's scope ends. `JoinHandle`
+/// abort is the only way to cancel an in-flight `reqwest` request, so a plain
+/// "please stop" flag would not release the socket.
+struct WorkerAbort(Vec<JoinHandle<()>>);
+
+impl Drop for WorkerAbort {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// Shared state for one staged stream: the claim scheduler, the staging file,
+/// and the coordination between `max_threads` writers and the single reader.
+struct StagedRun {
+    engine: Arc<Engine>,
+    scheduler: parking_lot::Mutex<Scheduler>,
+    /// Owned here so an ephemeral scratch directory outlives every worker and
+    /// the reader — it is removed when the last `Arc<StagedRun>` drops.
+    staging: Staging,
+    fatal: parking_lot::Mutex<Option<String>>,
+    /// Pulsed whenever a worker's state changes (claim finished, failed, or the
+    /// worker exited). The reader waits on this alongside the staging file's
+    /// write counter, so it learns "nobody is coming" as promptly as it learns
+    /// about new bytes.
+    wake: tokio::sync::watch::Sender<u64>,
+    active_workers: AtomicUsize,
+    failures: AtomicUsize,
+    /// Permanently-failed claims tolerated before the stream gives up. A failed
+    /// claim's range goes back to the pool, so without a ceiling a dead
+    /// upstream would be retried forever.
+    failure_budget: usize,
+}
+
+impl StagedRun {
+    fn bump(&self) {
+        self.wake.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    async fn run_worker(self: Arc<Self>, worker: usize) {
+        loop {
+            if self.fatal.lock().is_some() {
+                break;
+            }
+            let claim = self.scheduler.lock().claim(worker);
+            let Some(claim) = claim else { break };
+            let res = self
+                .engine
+                .fetch_claim(worker, &claim, self.staging.entry(), false)
+                .await;
+            // `cursor` is the first byte we did not deliver; whatever remains
+            // of the claim returns to the pool for another worker — or for the
+            // next iteration of this one.
+            self.scheduler.lock().finish(worker, claim.cursor());
+            if let Err(e) = res {
+                // Feed the failure into automatic claim sizing before anything
+                // else: an oversized claim against a staging relay shows up
+                // here as a read timeout, and shrinking is the only way out.
+                self.scheduler.lock().note_claim_outcome(false);
+                let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    "claim worker={} failed ({}/{}), auto_target now {} B: {}",
+                    worker,
+                    n,
+                    self.failure_budget,
+                    self.scheduler.lock().auto_target(),
+                    e,
+                );
+                if n >= self.failure_budget {
+                    *self.fatal.lock() = Some(e.to_string());
+                    self.bump();
+                    break;
+                }
+            } else {
+                self.scheduler.lock().note_claim_outcome(true);
+            }
+            self.bump();
+        }
+        self.active_workers.fetch_sub(1, Ordering::Relaxed);
+        self.bump();
+    }
+
+    async fn run_reader(
+        self: Arc<Self>,
+        start: u64,
+        end: u64,
+        out_tx: mpsc::Sender<Result<Bytes>>,
+        workers: Vec<JoinHandle<()>>,
+    ) {
+        // Whatever ends this reader — full delivery, client disconnect, fatal
+        // error — must also stop the fetchers. Without it a client that walks
+        // away mid-download leaves `max_threads` requests running to
+        // completion: upstream bandwidth burnt for nobody, the per-URL
+        // in-flight gauge pinned, and an ephemeral scratch directory kept
+        // alive by the workers' own `Arc<StagedRun>`.
+        let _abort_workers = WorkerAbort(workers);
+        // Subscribe before the first availability check: a write that lands in
+        // between then leaves these receivers behind rather than parking us on
+        // a notification that already fired.
+        let mut writes = self.staging.entry().subscribe_progress();
+        let mut wake = self.wake.subscribe();
+        let mut cursor = start;
+
+        while cursor <= end {
+            let want = (end - cursor + 1).min(READ_CHUNK);
+            let n = self.staging.entry().contiguous_from(cursor, want);
+            if n == 0 {
+                // Bind before awaiting: holding the guard across an `.await`
+                // would make this future non-Send.
+                let fatal = self.fatal.lock().clone();
+                if let Some(msg) = fatal {
+                    let _ = out_tx.send(Err(ProxyError::Internal(msg))).await;
+                    return;
+                }
+                if self.active_workers.load(Ordering::Relaxed) == 0 {
+                    // Re-check before declaring a stall: the last worker may
+                    // have written exactly these bytes and exited between our
+                    // availability check and this load.
+                    if self.staging.entry().contiguous_from(cursor, want) == 0 {
+                        tracing::warn!(
+                            "staged stream stalled at offset {} with no workers left",
+                            cursor,
+                        );
+                        let _ = out_tx
+                            .send(Err(ProxyError::Internal(format!(
+                                "upstream stalled at offset {cursor}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    _ = writes.changed() => {}
+                    _ = wake.changed() => {}
+                    // Client disconnects are otherwise invisible while we're
+                    // parked: nothing here calls `send`, so the closed channel
+                    // goes unnoticed and the workers keep fetching for a client
+                    // that left. On a heavy-tail upstream that wait is minutes.
+                    _ = out_tx.closed() => {
+                        tracing::debug!(
+                            "client gone while waiting at offset {}, aborting workers",
+                            cursor,
+                        );
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            let staging = Arc::clone(self.staging.entry());
+            let (lo, hi) = (cursor, cursor + n - 1);
+            let read = tokio::task::spawn_blocking(move || staging.read_range(lo, hi)).await;
+            let bytes = match read {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    let _ = out_tx.send(Err(ProxyError::Io(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = out_tx
+                        .send(Err(ProxyError::Internal(format!("staging read task: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            // Staging holds raw upstream bytes — ciphertext for an encrypted
+            // task — so the plugin pipeline runs on the way out here, the same
+            // contract the cached-read path in `fetch_chunk_cached` follows.
+            let out = self.engine.transform_outgoing(cursor, bytes);
+            if out_tx.send(Ok(out)).await.is_err() {
+                tracing::debug!("client gone at offset {}, ending staged stream", cursor);
+                return;
+            }
+            cursor += n;
+            // Let a latency-first scheduler move its critical window with us.
+            self.scheduler.lock().set_read_head(cursor);
+            self.bump();
+        }
+        tracing::debug!("staged stream delivered [{}, {}] in full", start, end);
+    }
+}
+
 /// RAII counter for per-URL in-flight HTTP requests. Held by the engine
 /// across one fetch attempt; decrements on drop, so cancellation paths
 /// (client disconnect → task abort) don't leak the counter.
 struct InFlightGuard(Arc<crate::models::UrlHealthAcc>);
-
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.in_flight_requests.fetch_sub(1, Ordering::Relaxed);

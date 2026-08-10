@@ -121,15 +121,26 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         state_file.clone(),
         GlobalSettings::default(),
         plugins,
+        Arc::new(hydraria::download::DownloadManager::new()),
     );
     let state = Arc::new(state);
 
-    let restored = state.restore().unwrap_or_else(|e| {
+    let (restored, pending_downloads) = state.restore().unwrap_or_else(|e| {
         tracing::warn!("could not restore persisted state ({e}); starting fresh");
-        0
+        (0, Vec::new())
     });
 
     Arc::clone(&state).spawn_background();
+
+    // Reopening a download needs an upstream probe, so it happens here rather
+    // than inside the synchronous `restore`. Jobs that were running when we
+    // last exited resume from their `.part` bitmap.
+    if !pending_downloads.is_empty() {
+        let s = (*state).clone();
+        tokio::spawn(async move {
+            hydraria::routes::restore_downloads(s, pending_downloads).await;
+        });
+    }
 
     let app = build_router((*state).clone()).layer(tower_http::cors::CorsLayer::permissive());
 

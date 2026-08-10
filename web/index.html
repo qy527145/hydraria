@@ -384,6 +384,24 @@
   /* Block-bitmap heat-strip: each bucket is one fill percentage 0..100.
      Rendered as a 1D row of segments — fully cached = accent, empty = bg.
      Hover shows the underlying byte-range tooltip. */
+  /* Download progress block, sits between the meta grid and the action row. */
+  .dl-panel {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(56, 189, 248, 0.06);
+  }
+  .dl-panel .dl-line {
+    font-size: 12px;
+    color: var(--text);
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .list .task .dl-panel .cache-strip { display: none; }
+
   .cache-strip {
     display: flex;
     height: 8px;
@@ -970,9 +988,9 @@
           <input id="f-per-volume" type="number" value="4" min="1" max="128" />
         </div>
         <div>
-          <label class="field">分片大小 <span class="hint-inline">如 5M / 1M / 512K</span></label>
-          <input id="f-split" type="text" value="5M" />
-          <div class="hint" id="f-split-hint">合法</div>
+          <label class="field">分片大小 <span class="hint-inline">留空=自动不限,或填 5M / 512K</span></label>
+          <input id="f-split" type="text" placeholder="auto" />
+          <div class="hint" id="f-split-hint">自动 · 不限大小,按剩余量/空闲线程数切分</div>
         </div>
       </div>
 
@@ -1076,8 +1094,8 @@
           <input id="e-per-volume" type="number" min="1" max="128" />
         </div>
         <div>
-          <label class="field">分片大小</label>
-          <input id="e-split" type="text" />
+          <label class="field">分片大小 <span class="hint-inline">留空=自动不限</span></label>
+          <input id="e-split" type="text" placeholder="auto" />
           <div class="hint" id="e-split-hint">&nbsp;</div>
         </div>
       </div>
@@ -1147,10 +1165,41 @@
   </div>
 
   <!-- Settings modal -->
+  <div class="modal-bg" id="download-modal">
+    <div class="modal" style="max-width: 520px;">
+      <h3>下载到本地</h3>
+      <div class="modal-sub" id="dl-sub">多线程乱序直写文件，以最快下载完为目标。</div>
+
+      <label class="field">保存目录</label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input id="dl-dir" type="text" placeholder="选择或粘贴目录" style="flex:1;" />
+        <button type="button" class="ghost" id="dl-dir-pick" style="padding:6px 10px;" title="选择目录…">📂</button>
+      </div>
+
+      <label class="field">文件名</label>
+      <input id="dl-filename" type="text" placeholder="留空则用上游探测到的名字" />
+
+      <label class="field">并发线程 <span class="hint-inline">默认取任务配置</span></label>
+      <input id="dl-threads" type="number" min="1" max="128" />
+
+      <div class="modal-actions">
+        <button class="ghost" id="btn-dl-cancel">取消</button>
+        <button class="primary" id="btn-dl-start">开始下载</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-bg" id="settings-modal">
     <div class="modal">
       <h3>全局设置</h3>
       <div class="modal-sub">所有任务共享的限制与状态。</div>
+
+      <label class="field">默认下载目录 <span class="hint-inline">下载按钮的默认写入位置</span></label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input id="s-download-dir" type="text" placeholder="例如 /Users/me/Downloads" style="flex:1;" />
+        <button type="button" class="ghost" id="s-download-dir-pick" style="padding:6px 10px;" title="选择目录…">📂</button>
+      </div>
+      <div class="hint">留空则每次下载都必须显式指定目录。</div>
 
       <label class="field">全局限速 <span class="hint-inline">所有流量总和，留空或 0 = 不限</span></label>
       <input id="s-rate" type="text" placeholder="例如 10M" />
@@ -1501,7 +1550,7 @@ function taskCard(t) {
         <div class="label">${cache ? 'cached' : 'split'}</div>
         <div class="value">${cache
           ? fmtBytes(cache.bytes_cached) + (cachePct !== null ? ` <span style="color:var(--muted);font-weight:400;font-size:11px;">(${cachePct}%)</span>` : '')
-          : fmtBytes(t.config.max_split)}</div>
+          : (t.config.max_split ? fmtBytes(t.config.max_split) : 'auto')}</div>
       </div>
       <div class="meta-cell">
         <div class="label">${cache ? 'hit-rate' : 'conns'}</div>
@@ -1510,6 +1559,8 @@ function taskCard(t) {
           : t.active_connections}</div>
       </div>
     </div>
+
+    ${downloadPanelHtml(t)}
 
     <div class="task-actions">
       ${actionsHtml(t)}
@@ -1525,6 +1576,48 @@ function taskCard(t) {
 // is rebuilt every render — fine because it's tiny — and shows on the
 // button's click. A single document-level handler closes any open menu
 // when you click anywhere else (`closeAllMenus`, wired below).
+// Download controls. Absent job → a single "download" button; live job →
+// pause/resume + cancel. The progress itself is rendered separately by
+// downloadPanelHtml so it can sit above the action row.
+function downloadActionsHtml(t) {
+  const d = t.download;
+  if (!d || d.state === "done") {
+    return `<button class="primary" data-dl-open="${t.task_id}" data-tip="多线程乱序下载到本地文件">⇩ 下载</button>`;
+  }
+  const toggle = d.state === "running"
+    ? `<button class="warn" data-dl-pause="${t.task_id}">⏸ 暂停下载</button>`
+    : `<button class="good" data-dl-resume="${t.task_id}">▶ 继续下载</button>`;
+  return `${toggle}<button class="danger" data-dl-cancel="${t.task_id}" data-tip="取消下载并删除已下载的部分">✕ 取消下载</button>`;
+}
+
+// Progress block for an active/finished job. Reuses the same .progress bar and
+// heat strip the cache view uses — for an out-of-order download the strip is a
+// genuinely informative picture of which regions have landed.
+function downloadPanelHtml(t) {
+  const d = t.download;
+  if (!d) return "";
+  const pct = d.total_bytes > 0
+    ? Math.min(100, Math.round((d.done_bytes / d.total_bytes) * 100))
+    : 0;
+  const strip = (d.bitmap_summary && d.bitmap_summary.length)
+    ? cacheStripHtml({ bitmap_summary: d.bitmap_summary, total_size: d.total_bytes })
+    : "";
+  let line;
+  if (d.state === "done") {
+    line = `<span style="color:var(--ok);">✓ 已完成</span> · <span title="${d.output_path || ''}">${(d.output_path || d.filename).split('/').pop()}</span>`;
+  } else if (d.state === "failed") {
+    line = `<span style="color:var(--err);">✕ 失败</span> · ${escapeHtml(d.error || "未知错误")}`;
+  } else {
+    const speed = d.state === "running" ? ` · ${fmtBytes(d.current_speed_bps)}/s` : " · 已暂停";
+    line = `${pct}%${speed} · ${fmtBytes(d.done_bytes)} / ${fmtBytes(d.total_bytes)} · ${d.threads} 线程`;
+  }
+  return `
+    <div class="dl-panel" title="${escapeHtml(d.out_dir + '/' + d.filename)}">
+      <div class="dl-line">⇩ ${line}</div>
+      ${d.state === "done" ? "" : `<div class="progress"><div class="progress-bar" style="width:${pct}%;"></div></div>${strip}`}
+    </div>`;
+}
+
 function actionsHtml(t) {
   const cache = !!t.cache;
   // Each menu item gets the same `data-*` attributes the existing
@@ -1538,6 +1631,7 @@ function actionsHtml(t) {
     cache ? `<button class="menu-item danger" data-del-with-cache="${t.task_id}">⌫ 删除并清缓存</button>` : '',
   ].filter(Boolean).join('');
   return `
+    ${downloadActionsHtml(t)}
     ${t.paused
       ? `<button class="good" data-resume="${t.task_id}">▶ 恢复</button>`
       : `<button class="warn" data-pause="${t.task_id}">⏸ 暂停</button>`}
@@ -1649,6 +1743,23 @@ function attachCardEvents(root) {
       b.classList.add("copied");
       setTimeout(() => b.classList.remove("copied"), 800);
     }
+  });
+  root.querySelectorAll("[data-dl-open]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    openDownloadModal(b.dataset.dlOpen);
+  });
+  root.querySelectorAll("[data-dl-pause]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.dlPause}/download/pause`, "POST", "下载已暂停");
+  });
+  root.querySelectorAll("[data-dl-resume]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    doAction(`/api/tasks/${b.dataset.dlResume}/download/resume`, "POST", "下载已继续");
+  });
+  root.querySelectorAll("[data-dl-cancel]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm("取消下载？\n\n已下载的部分会被删除，下次需要从头开始。")) return;
+    doAction(`/api/tasks/${b.dataset.dlCancel}/download`, "DELETE", "下载已取消");
   });
   root.querySelectorAll("[data-pause]").forEach(b => b.onclick = (e) => {
     e.stopPropagation();
@@ -2001,15 +2112,24 @@ function validateVolumes(scope, counterEl) {
 
 function validateSplit(inputEl, hintEl) {
   const v = inputEl.value.trim();
-  if (!v) { hintEl.textContent = "默认 5M"; hintEl.className = "hint"; inputEl.classList.remove("invalid"); return { valid: true, value: "5M" }; }
+  // Empty / 0 / "auto" all select automatic sizing: the server derives each
+  // claim from the work remaining and the number of free workers, with no
+  // ceiling. That's what lets one worker pull hundreds of MB in a single
+  // request and amortize a multi-second per-request latency.
+  if (!v || v === "0" || v.toLowerCase() === "auto") {
+    hintEl.textContent = "自动 · 不限大小,按剩余量/空闲线程数切分";
+    hintEl.className = "ok-text";
+    inputEl.classList.remove("invalid");
+    return { valid: true, value: 0 };
+  }
   const ok = SPLIT_RE.test(v);
   if (!ok) {
-    hintEl.textContent = '格式错误,需匹配 ^[0-9]+[kKmMgG]?B?$,例如 512K / 5M / 1G';
+    hintEl.textContent = '格式错误,需匹配 ^[0-9]+[kKmMgG]?B?$,例如 512K / 5M / 1G,或留空=自动';
     hintEl.className = "err-text";
     inputEl.classList.add("invalid");
     return { valid: false };
   }
-  hintEl.textContent = "✓ 合法";
+  hintEl.textContent = "✓ 固定上限 " + v;
   hintEl.className = "ok-text";
   inputEl.classList.remove("invalid");
   return { valid: true, value: v };
@@ -2167,7 +2287,7 @@ bindFilenameControls("e");
 // explicit Cancel (both communicate intent to discard).
 const CREATE_DRAFT_KEY = "hydraria.createDraft.v1";
 const CREATE_DEFAULTS = {
-  headers: "", name: "", rate: "", threads: "16", perVolume: "4", split: "5M",
+  headers: "", name: "", rate: "", threads: "16", perVolume: "4", split: "",
   cache: false, persist: false, algorithm: "token_bucket",
   volumes: [], autoFilename: true, outputFilename: "",
   contentDisposition: "auto",
@@ -2210,7 +2330,7 @@ function openCreate() {
   $("#f-rate").value = d.rate ?? "";
   $("#f-threads").value = d.threads ?? "16";
   $("#f-per-volume").value = d.perVolume ?? "4";
-  $("#f-split").value = d.split ?? "5M";
+  $("#f-split").value = d.split ?? "";
   $("#f-cache").checked = !!d.cache;
   $("#f-persist").checked = !!d.persist;
   $("#f-algorithm").value = d.algorithm ?? "token_bucket";
@@ -2342,7 +2462,7 @@ function applyParsedConfig(cfg, sourceLabel, scope, mode) {
   if (!merge || has("max_per_volume"))
     $(`#${scope}-per-volume`).value = typeof cfg.max_per_volume === "number" ? cfg.max_per_volume : 4;
   if (!merge || has("max_split"))
-    $(`#${scope}-split`).value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "5M";
+    $(`#${scope}-split`).value = cfg.max_split ? fmtBytesPlain(cfg.max_split) : "";
   if (!merge || has("cache"))
     $(`#${scope}-cache`).checked = !!cfg.cache;
   if (!merge || has("persist"))
@@ -2507,7 +2627,9 @@ function openEdit(id) {
   renderVolumesEditor("e", layout);
   $("#e-threads").value = t.config.max_threads;
   $("#e-per-volume").value = typeof t.config.max_per_volume === "number" ? t.config.max_per_volume : 4;
-  $("#e-split").value = (fmtBytes(t.config.max_split)).replace(/ /g, '');
+  $("#e-split").value = t.config.max_split
+    ? (fmtBytes(t.config.max_split)).replace(/ /g, '')
+    : "";
   $("#e-headers").value = Object.keys(t.config.headers || {}).length
     ? JSON.stringify(t.config.headers, null, 2)
     : "";
@@ -2561,6 +2683,92 @@ $("#btn-edit-save").onclick = async () => {
   }
 };
 
+/* ---- download ---- */
+
+let downloadTaskId = null;
+
+async function openDownloadModal(taskId) {
+  downloadTaskId = taskId;
+  const t = (lastTasks || []).find(x => x.task_id === taskId);
+  let defaultDir = "";
+  try {
+    const s = await api("/api/settings");
+    defaultDir = s.download_dir || "";
+  } catch { /* fall through to an empty field */ }
+
+  $("#dl-dir").value = defaultDir;
+  // Prefer the name the task already resolves for its Content-Disposition —
+  // that's the same probe result the server would fall back to anyway.
+  $("#dl-filename").value = (t && t.config && t.config.output_filename) || "";
+  $("#dl-threads").value = (t && t.config && t.config.max_threads) || 16;
+  $("#dl-sub").textContent = t && t.config && t.config.name
+    ? `${t.config.name} · 多线程乱序直写文件`
+    : "多线程乱序直写文件，以最快下载完为目标。";
+  $("#download-modal").classList.add("show");
+}
+
+function closeDownloadModal() {
+  $("#download-modal").classList.remove("show");
+  downloadTaskId = null;
+}
+
+$("#btn-dl-cancel").onclick = closeDownloadModal;
+
+$("#btn-dl-start").onclick = async () => {
+  if (!downloadTaskId) return;
+  const dir = $("#dl-dir").value.trim();
+  if (!dir) {
+    toast("请先选择保存目录", "error");
+    return;
+  }
+  const threads = parseInt($("#dl-threads").value, 10);
+  const payload = {
+    dir,
+    filename: $("#dl-filename").value.trim() || null,
+    threads: Number.isFinite(threads) && threads > 0 ? threads : null,
+  };
+  try {
+    await api(`/api/tasks/${downloadTaskId}/download`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    toast("下载已开始", "ok");
+    closeDownloadModal();
+    refresh();
+  } catch (e) {
+    toast("启动下载失败：" + e.message, "error");
+  }
+};
+
+// Native directory pickers for the two path fields.
+async function wireDirPicker(inputId, btnId, title) {
+  const btn = $("#" + btnId);
+  if (!btn) return;
+  btn.onclick = async () => {
+    if (!pickerSupported) {
+      toast("此平台不支持原生目录选择，请手动粘贴路径", "error");
+      return;
+    }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "…";
+    try {
+      const r = await api("/api/fs/pick", {
+        method: "POST",
+        body: JSON.stringify({ kind: "open_directory", title }),
+      });
+      if (r && r.path) $("#" + inputId).value = r.path;
+    } catch (e) {
+      toast("打开选择器失败：" + e.message, "error");
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = false;
+    }
+  };
+}
+wireDirPicker("dl-dir", "dl-dir-pick", "选择保存目录");
+wireDirPicker("s-download-dir", "s-download-dir-pick", "选择默认下载目录");
+
 /* ---- settings ---- */
 
 async function openSettings() {
@@ -2572,6 +2780,7 @@ async function openSettings() {
     $("#s-rate-hint").textContent = "0 或留空 = 不限";
     $("#s-rate-hint").className = "hint";
     $("#s-algorithm").value = s.global_rate_limit_algorithm || "token_bucket";
+    $("#s-download-dir").value = s.download_dir || "";
     if (lastGlobal) {
       $("#s-cache-total").textContent = fmtBytes(lastGlobal.cache_total_bytes);
       $("#s-cache-detail").textContent = `跨任务汇总；按 URL 哈希存于 ~/.hydraria/cache`;
@@ -2604,6 +2813,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if ($("#create-modal").classList.contains("show")) { closeCreate(); return; }
   if ($("#edit-modal").classList.contains("show")) { closeEdit(); return; }
+  if ($("#download-modal").classList.contains("show")) { closeDownloadModal(); return; }
   if ($("#settings-modal").classList.contains("show")) {
     $("#settings-modal").classList.remove("show");
   }
@@ -2634,6 +2844,7 @@ $("#btn-settings-save").onclick = async () => {
   const payload = {
     global_rate_limit_bps: v || 0,
     global_rate_limit_algorithm: $("#s-algorithm").value,
+    download_dir: $("#s-download-dir").value.trim(),
   };
   try {
     await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });

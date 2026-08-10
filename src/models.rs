@@ -44,6 +44,14 @@ pub struct TaskConfig {
     /// its per-URL connection limit when there's no alternative.
     #[serde(default = "default_per_volume")]
     pub max_per_volume: usize,
+    /// Upper bound on one upstream range request, or **0 for automatic**.
+    ///
+    /// Automatic lets the scheduler size claims from the work remaining and the
+    /// number of free workers, with no ceiling — which is what allows a single
+    /// worker to pull hundreds of megabytes in one request and amortize a
+    /// multi-second per-request latency the way a dedicated downloader does.
+    /// A non-zero value is a hard cap, kept for upstreams that dislike long
+    /// ranges (and so that pre-existing tasks behave exactly as before).
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]
     pub max_split: u64,
     #[serde(default)]
@@ -115,8 +123,10 @@ fn default_auto_filename() -> bool {
     true
 }
 
+/// Automatic claim sizing. Pre-existing persisted tasks carry an explicit
+/// value and keep it; only tasks created without one opt into auto.
 fn default_split() -> u64 {
-    5 * 1024 * 1024
+    0
 }
 
 fn deserialize_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -299,6 +309,17 @@ impl ThroughputSampler {
         s.push(bps);
     }
 
+    /// Mean of the last `n` samples (all of them if fewer exist). Smooths the
+    /// bursty per-second reading into something a human can read.
+    pub fn recent_mean(&self, n: usize) -> u64 {
+        let s = self.samples.lock();
+        if s.is_empty() || n == 0 {
+            return 0;
+        }
+        let tail = &s[s.len().saturating_sub(n)..];
+        (tail.iter().sum::<u64>() / tail.len() as u64).max(0)
+    }
+
     pub fn snapshot(&self) -> Vec<u64> {
         self.samples.lock().clone()
     }
@@ -321,6 +342,38 @@ pub struct TaskInfo {
     pub url_health: Vec<UrlHealth>,
     pub current_speed_bps: u64,
     pub speed_samples: Vec<u64>,
+    /// Active (or last) server-side download job for this task, if any.
+    pub download: Option<crate::download::DownloadInfo>,
+}
+
+/// Holds a task's live-connection gauge up for exactly as long as the response
+/// body exists.
+///
+/// `active_connections` used to be incremented per stream and never
+/// decremented, so the dashboard's connection count only ever grew — a task
+/// with nothing streaming still reported connections from every request it had
+/// ever served. Tying the decrement to a guard's `Drop` makes it correct on
+/// every exit path, including client disconnects and errors.
+#[derive(Debug)]
+pub struct ConnectionGuard(Arc<TaskEntry>);
+
+impl ConnectionGuard {
+    pub fn new(entry: Arc<TaskEntry>) -> Self {
+        entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self(entry)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        // Saturating: an underflow would wrap the u32 to ~4 billion and make
+        // the gauge worse than useless.
+        let _ = self.0.active_connections.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -328,6 +381,8 @@ pub struct TaskEntry {
     pub config: RwLock<TaskConfig>,
     pub created_at: u64,
     pub bytes_served: AtomicU64,
+    /// Live client connections. Maintained exclusively through
+    /// [`ConnectionGuard`] so it can't drift.
     pub active_connections: AtomicU32,
     pub paused: AtomicBool,
     /// Per-URL health (one entry per unique URL across every volume's
@@ -496,8 +551,10 @@ impl TaskEntry {
             cfg.max_per_volume = p;
         }
         if let Some(s) = upd.max_split {
-            if s < 64 * 1024 {
-                return Err("max_split must be >= 64K".into());
+            // 0 = automatic: the scheduler sizes claims from the remaining work
+            // and the thread count, with no ceiling.
+            if s != 0 && s < 64 * 1024 {
+                return Err("max_split must be 0 (auto) or >= 64K".into());
             }
             cfg.max_split = s;
         }
@@ -575,6 +632,11 @@ pub struct GlobalSettings {
     /// interprets its own value (e.g. ChaCha20 stores I/O buffer size here).
     #[serde(default)]
     pub plugin_globals: HashMap<String, serde_json::Value>,
+    /// Where the download button writes by default. `None` until the user
+    /// picks one; a download started without an explicit directory then fails
+    /// with a message rather than guessing at somewhere in the filesystem.
+    #[serde(default)]
+    pub download_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -583,6 +645,7 @@ pub struct GlobalSettingsUpdate {
     pub global_rate_limit_bps: Option<u64>,
     pub global_rate_limit_algorithm: Option<Algorithm>,
     pub plugin_globals: Option<HashMap<String, serde_json::Value>>,
+    pub download_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -607,6 +670,7 @@ pub struct AppState {
     pub global_window_bytes: Arc<AtomicU64>,
     pub persist_path: Arc<std::path::PathBuf>,
     pub plugins: Arc<PluginRegistry>,
+    pub downloads: Arc<crate::download::DownloadManager>,
 }
 
 impl AppState {
@@ -616,6 +680,7 @@ impl AppState {
         persist_path: std::path::PathBuf,
         settings: GlobalSettings,
         plugins: Arc<PluginRegistry>,
+        downloads: Arc<crate::download::DownloadManager>,
     ) -> Self {
         let limiter = Arc::new(Limiter::new(
             settings.global_rate_limit_bps,
@@ -627,6 +692,7 @@ impl AppState {
             cache,
             settings: Arc::new(RwLock::new(settings)),
             global_limiter: limiter,
+            downloads,
             global_throughput: Arc::new(ThroughputSampler::new(60)),
             global_window_bytes: Arc::new(AtomicU64::new(0)),
             persist_path: Arc::new(persist_path),
@@ -697,6 +763,7 @@ impl AppState {
             url_health,
             current_speed_bps: entry.throughput.current(),
             speed_samples: entry.throughput.snapshot(),
+            download: self.downloads.info(id),
         }
     }
 
@@ -751,6 +818,14 @@ impl AppState {
             s.global_rate_limit_algorithm = a;
             self.global_limiter.set_algorithm(a);
         }
+        if let Some(d) = upd.download_dir {
+            let trimmed = d.trim();
+            s.download_dir = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
         if let Some(pg) = upd.plugin_globals {
             // Validate each plugin's new config against its own schema before
             // committing — a bad value here would otherwise only surface
@@ -775,6 +850,9 @@ impl AppState {
         struct Persisted {
             settings: GlobalSettings,
             tasks: Vec<PersistedTask>,
+            /// Unfinished downloads. The bytes live in `.part` files next to
+            /// their output, so this only needs enough to reopen them.
+            downloads: Vec<crate::download::PersistedDownload>,
         }
         #[derive(Serialize)]
         struct PersistedTask {
@@ -806,6 +884,7 @@ impl AppState {
         let p = Persisted {
             settings: self.settings.read().clone(),
             tasks,
+            downloads: self.downloads.persisted(),
         };
         let json = serde_json::to_string_pretty(&p)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -820,13 +899,19 @@ impl AppState {
     }
 
     /// Reload persisted tasks + settings from disk. Called once at startup.
-    pub fn restore(&self) -> std::io::Result<usize> {
+    ///
+    /// Returns the restored task count plus any unfinished downloads, which the
+    /// caller reopens once the runtime is up (reopening needs an upstream probe,
+    /// so it can't happen inside this synchronous function).
+    pub fn restore(&self) -> std::io::Result<(usize, Vec<crate::download::PersistedDownload>)> {
         #[derive(Deserialize)]
         struct Persisted {
             #[serde(default)]
             settings: GlobalSettings,
             #[serde(default)]
             tasks: Vec<PersistedTask>,
+            #[serde(default)]
+            downloads: Vec<crate::download::PersistedDownload>,
         }
         #[derive(Deserialize)]
         struct PersistedTask {
@@ -840,7 +925,7 @@ impl AppState {
 
         let path: &std::path::Path = &self.persist_path;
         if !path.exists() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         let data = std::fs::read_to_string(path)?;
         let p: Persisted = serde_json::from_str(&data)
@@ -871,7 +956,7 @@ impl AppState {
             self.insert(pt.id, Arc::new(with_ts));
             count += 1;
         }
-        Ok(count)
+        Ok((count, p.downloads))
     }
 
     /// Spawn a background ticker that:
@@ -894,6 +979,7 @@ impl AppState {
                     entry.tick_throughput();
                 }
                 me.tick_global_throughput(elapsed);
+                me.downloads.tick_throughput();
 
                 if last_persist.elapsed() >= Duration::from_secs(5) {
                     last_persist = Instant::now();
