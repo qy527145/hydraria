@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatSpeed, parseSize, percent, sizeInput } from './format';
+import { formatBytes, formatSpeed, parseSize, percent, sizeInput, timeAgo } from './format';
 
 describe('parseSize', () => {
   it('接受带单位和不带单位的写法', () => {
@@ -63,5 +63,27 @@ describe('percent', () => {
     expect(percent(10, 0)).toBe(0);
     expect(percent(5, 10)).toBe(50);
     expect(percent(11, 10)).toBe(100);
+  });
+});
+
+describe('timeAgo', () => {
+  const now = Date.UTC(2026, 7, 11, 12, 0, 0);
+  const ago = (seconds: number) => timeAgo(now / 1000 - seconds, now);
+
+  it('按秒/分钟/小时/天逐级换算', () => {
+    expect(ago(5)).toBe('刚刚');
+    expect(ago(50)).toBe('50 秒前');
+    expect(ago(90)).toBe('1 分钟前');
+    expect(ago(3 * 3600)).toBe('3 小时前');
+    expect(ago(3 * 86_400)).toBe('3 天前');
+  });
+
+  it('超过一周改显示日期——「23 天前」帮不上忙', () => {
+    expect(ago(23 * 86_400)).toBe(new Date(now - 23 * 86_400_000).toLocaleDateString('zh-CN'));
+  });
+
+  it('缺时间戳时显示占位符，未来时间不会变成负数', () => {
+    expect(timeAgo(0, now)).toBe('—');
+    expect(ago(-60)).toBe('刚刚');
   });
 });

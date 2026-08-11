@@ -233,6 +233,37 @@ impl CacheJob {
         self.throughput.push(bps);
         self.current_speed_bps.store(self.throughput.recent_mean(4), Ordering::Relaxed);
     }
+    /// Re-cut the claims whose requests have stopped producing bytes entirely.
+    ///
+    /// A merely slow upstream is handled inside the scheduler by stealing its
+    /// tail, which costs nothing and keeps its warm connection. A request that
+    /// has delivered nothing for [`crate::schedule::DEAD_CLAIM_WINDOW`] is a
+    /// different animal: there is no progress to protect, and nothing else will
+    /// notice it for a long time — the client's read timeout is the only other
+    /// backstop, and at 120 s it is four times slower to react.
+    ///
+    /// Aborting the worker is the point here, not a side effect: its range is
+    /// back on the pool, so letting a connection that later un-wedges keep
+    /// writing into it is the duplicate work this is trying to avoid.
+    ///
+    /// Driven from the same ~1 Hz tick as throughput sampling, which is what
+    /// the scheduler's progress bookkeeping expects.
+    pub fn sweep_stalled(self: &Arc<Self>) {
+        if !self.is_cache_active() && self.readers.read().is_empty() {
+            return;
+        }
+        let dead = self.scheduler.lock().reclaim_stalled();
+        if dead.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            "task {} re-cutting {} stalled claim(s): workers {:?}",
+            self.task_id,
+            dead.len(),
+            dead,
+        );
+        self.respawn(&dead);
+    }
     /// Add a playback reader. A fresh reader is a seek: point the scheduler at
     /// the new position and hand back the in-flight requests that no longer
     /// matter, so the pool converges on the reader within one request instead of
@@ -538,7 +569,10 @@ impl DownloadManager {
         self.jobs.read().get(task_id).map(|job| job.info())
     }
     pub fn tick_throughput(&self) {
-        for job in self.jobs.read().values() { job.tick_throughput(); }
+        for job in self.jobs.read().values() {
+            job.tick_throughput();
+            job.sweep_stalled();
+        }
     }
     pub fn persisted(&self) -> Vec<PersistedDownload> {
         self.jobs.read().values()

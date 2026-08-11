@@ -39,3 +39,31 @@ export function parseSize(value: string): number {
   if (power < 0) throw new Error('大小单位无效');
   return Math.floor(Number(match[1]) * 1024 ** power);
 }
+
+const RELATIVE_STEPS = [
+  [60, '秒'],
+  [60, '分钟'],
+  [24, '小时'],
+  [Infinity, '天'],
+] as const;
+
+/**
+ * Unix 秒转「多久以前」。任务列表按编辑时间逆序，卡片上标出这个时间，
+ * 排序才是用户能读懂的，而不是一串莫名其妙的顺序。
+ *
+ * 超过一周就直接显示日期——「23 天前」没有「2026-07-19」有用。
+ */
+export function timeAgo(unixSeconds: number, now = Date.now()): string {
+  if (!unixSeconds) return '—';
+  const diff = Math.max(0, Math.floor(now / 1000 - unixSeconds));
+  if (diff < 45) return '刚刚';
+  if (diff >= 7 * 86_400) {
+    return new Date(unixSeconds * 1000).toLocaleDateString('zh-CN');
+  }
+  let value = diff;
+  for (const [factor, unit] of RELATIVE_STEPS) {
+    if (value < factor) return `${Math.floor(value)} ${unit}前`;
+    value /= factor;
+  }
+  return `${Math.floor(value)} 天前`;
+}

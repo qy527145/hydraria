@@ -21,20 +21,80 @@
 //!   priority and deliberately *small* claims (short time-to-first-byte);
 //!   spare workers prefetch further out with large ones.
 //!
-//! Work stealing is what makes either policy robust against upstreams with a
-//! heavy latency tail: when a worker runs out of unclaimed work it takes the
-//! back half of whichever live claim has the most left, so one unlucky slow
-//! request can't leave the other workers idle.
+//! Assignment follows the three-tier escalation from `design.md` §6.1, in cost
+//! order — each tier is only reached when the one above it has nothing to give:
+//!
+//! * **T1 — take.** Claim out of the largest unclaimed gap (aria2's
+//!   `getSparseMissingUnusedIndex`), which maximizes the contiguous work bought
+//!   by one request. Latency mode overrides the score inside its critical
+//!   window: there, nearest-the-reader wins, because the reader's stall is the
+//!   thing being minimized.
+//! * **T2 — steal.** Nothing unclaimed left: move a live claim's end inward and
+//!   take the tail behind it. The victim notices at its next stream item and
+//!   retires early, so the handoff copies no bytes twice.
+//! * **T3 — hedge.** Nothing left to steal either, and the transfer is in its
+//!   tail: deliberately race one in-flight claim, charged against a hard
+//!   duplicate-byte budget. Bounded, throughput-mode-only, and the loser is cut
+//!   short by the same end-watermark the steal path uses.
+//!
+//! Two more mechanisms keep a straggling upstream from setting the pace: steal
+//! victims are chosen by slowness before size (`design.md` §6.4), and a claim
+//! that stops moving entirely is declared dead and re-cut
+//! ([`Scheduler::reclaim_stalled`]).
 
 use crate::engine::VolumeMeta;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// Never hand out (or steal into) a claim smaller than this. Below roughly a
-/// megabyte the per-request overhead starts to dominate the transfer on every
-/// upstream we care about, and on staging-style relays it dominates by orders
-/// of magnitude.
+/// Absolute floor on a claim, used once the transfer reaches its tail. Below
+/// roughly a megabyte the per-request overhead starts to dominate the transfer
+/// on every upstream we care about, and on staging-style relays it dominates by
+/// orders of magnitude.
 pub const MIN_CLAIM: u64 = 1024 * 1024;
+
+/// Working minimum fragment away from the tail (`design.md` §12
+/// `min_fragment`).
+///
+/// The floor is 8 MiB rather than [`MIN_CLAIM`] because a fresh request pays a
+/// round trip plus slow start plus whatever the origin spends seeking, and none
+/// of that amortizes over a smaller range (research.md §1.3). It binds in two
+/// places: how small a claim may be cut, and how much has to be left in a live
+/// claim before splitting it buys more parallelism than it costs.
+///
+/// [`Scheduler::min_frag`] relaxes it back to [`MIN_CLAIM`] in the tail, where
+/// the goal flips from "amortize overhead" to "get the last workers busy".
+pub const MIN_FRAGMENT: u64 = 8 * 1024 * 1024;
+
+/// Below this much work left, the transfer is in its tail: fragments relax to
+/// [`MIN_CLAIM`] and hedging unlocks. `design.md` §12:
+/// `max(4 × conns × min_fragment, 64 MiB)`.
+pub const ENDGAME_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// A live claim moving slower than this fraction of the median live rate is a
+/// straggler, and is preferred as a steal victim (`design.md` §12
+/// `straggler_ratio`).
+///
+/// Stealing rather than killing is deliberate: the straggler keeps its warm
+/// congestion window and everything it has already delivered, and simply ends
+/// up responsible for less (`design.md` §6.4).
+pub const STRAGGLER_RATIO: f64 = 0.35;
+
+/// A claim that has not moved a byte for this long is not slow, it is dead:
+/// [`Scheduler::reclaim_stalled`] takes the range back and the caller restarts
+/// the worker (`design.md` §12 `dead_conn_window`).
+pub const DEAD_CLAIM_WINDOW: Duration = Duration::from_secs(30);
+
+/// Rate samples shorter than this are noise, so a claim younger than it is
+/// never judged a straggler (`design.md` §11: 2000 ms or 512 KiB sampling
+/// threshold).
+const RATE_SAMPLE_WINDOW: Duration = Duration::from_secs(2);
+const RATE_SAMPLE_BYTES: u64 = 512 * 1024;
+
+/// Endgame duplicate-byte budget: `min(len / 200, 32 MiB)` — 0.5% of the
+/// transfer, capped (`design.md` §12 `dup_budget`). Spent, never refilled.
+const DUP_BUDGET_DIVISOR: u64 = 200;
+const DUP_BUDGET_MAX: u64 = 32 * 1024 * 1024;
 
 /// Default critical window for [`Strategy::Latency`]: how far ahead of the
 /// reader we treat bytes as "needed now" rather than "nice to have".
@@ -112,29 +172,46 @@ impl Strategy {
 /// `end` is shared and mutable: another worker may steal this claim's tail.
 /// Workers must therefore consult [`Claim::end`] on every stream item rather
 /// than caching it, and stop once the cursor passes it — the same contract
-/// gopeed's fetcher has with its re-read of `conn.Chunk.remain()`.
+/// gopeed's fetcher has with its re-read of `conn.Chunk.remain()`, and the
+/// `soft_end` handoff of `design.md` §3.1. It is the cheapest of the three
+/// cancellation mechanisms in §4.2 (cost: zero — the victim simply decides it
+/// is finished early), so it is the one used for stealing, for shortening a
+/// prefetch after a seek, and for cutting an endgame loser short.
 #[derive(Debug, Clone)]
 pub struct Claim {
     pub start: u64,
     pub volume: usize,
     end: Arc<AtomicU64>,
     cursor: Arc<AtomicU64>,
+    /// Bytes the worker has *committed* to writing — advanced before the write
+    /// rather than after it, so a thief reading it can never pick a split point
+    /// inside a write that is still in progress. `cursor` can't serve this
+    /// purpose: it has to stay a lower bound on delivered bytes because retries
+    /// resume from it.
+    reserved: Arc<AtomicU64>,
 }
 
 impl Claim {
     /// Current inclusive end. May shrink between calls.
     pub fn end(&self) -> u64 {
-        self.end.load(Ordering::Relaxed)
+        self.end.load(Ordering::Acquire)
     }
 
     /// Next byte this claim still owes.
     pub fn cursor(&self) -> u64 {
-        self.cursor.load(Ordering::Relaxed)
+        self.cursor.load(Ordering::Acquire)
+    }
+
+    /// Announce that bytes below `next` are about to be written. Call this
+    /// *before* the write; [`Claim::advance_to`] confirms it afterwards.
+    pub fn reserve(&self, next: u64) {
+        self.reserved.fetch_max(next, Ordering::AcqRel);
     }
 
     /// Record that everything below `next` has landed in staging.
     pub fn advance_to(&self, next: u64) {
-        self.cursor.store(next, Ordering::Relaxed);
+        self.reserved.fetch_max(next, Ordering::AcqRel);
+        self.cursor.store(next, Ordering::Release);
     }
 
     /// True once the cursor has passed the (possibly stolen-from) end.
@@ -154,15 +231,39 @@ impl Claim {
 struct Live {
     worker: usize,
     volume: usize,
+    /// Where the claim began, for rate accounting.
+    start: u64,
     end: Arc<AtomicU64>,
     cursor: Arc<AtomicU64>,
+    reserved: Arc<AtomicU64>,
+    /// When the claim was handed out, for rate accounting.
+    started: Instant,
+    /// Cursor and wall-clock at the last [`Scheduler::reclaim_stalled`] sweep,
+    /// so "has this moved at all" is answerable without a timer per claim.
+    last_cursor: u64,
+    last_progress: Instant,
+    /// `Some(primary_start)` when this is a speculative endgame copy of another
+    /// live claim. A hedge owns no range: it must never hand bytes back to the
+    /// unclaimed list, because the claim it is racing still owns them.
+    hedge_of: Option<u64>,
 }
 
 impl Live {
     fn remaining(&self) -> u64 {
-        let end = self.end.load(Ordering::Relaxed);
-        let cur = self.cursor.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Acquire);
+        let cur = self.cursor.load(Ordering::Acquire);
         if cur > end { 0 } else { end - cur + 1 }
+    }
+
+    /// Observed bytes per second, or `None` while the sample is too short to
+    /// mean anything (`design.md` §11).
+    fn rate(&self) -> Option<f64> {
+        let elapsed = self.started.elapsed();
+        let done = self.cursor.load(Ordering::Acquire).saturating_sub(self.start);
+        if elapsed < RATE_SAMPLE_WINDOW && done < RATE_SAMPLE_BYTES {
+            return None;
+        }
+        Some(done as f64 / elapsed.as_secs_f64().max(0.001))
     }
 }
 
@@ -193,6 +294,10 @@ pub struct Scheduler {
     /// Current ceiling for automatically-sized claims, grown on success and
     /// halved on failure. See [`Scheduler::note_claim_outcome`].
     auto_target: u64,
+    /// Duplicate bytes the endgame may still spend. Charged on every hedge and
+    /// never refilled, so a pathological tail can't turn into a request storm
+    /// against the origin (`design.md` §6.1).
+    dup_budget: u64,
 }
 
 impl Scheduler {
@@ -225,6 +330,9 @@ impl Scheduler {
             read_head: req_start,
             work_limit: None,
             auto_target: INITIAL_AUTO_CLAIM,
+            dup_budget: (req_end.saturating_sub(req_start).saturating_add(1)
+                / DUP_BUDGET_DIVISOR)
+                .min(DUP_BUDGET_MAX),
         };
         for &(s0, e0) in already_staged {
             s.subtract(s0, e0);
@@ -235,6 +343,56 @@ impl Scheduler {
     /// Total bytes nobody is working on yet.
     pub fn unclaimed_bytes(&self) -> u64 {
         self.unclaimed.iter().map(|&(s, e)| e - s + 1).sum()
+    }
+
+    /// Bytes of the request still outstanding: unclaimed plus whatever the live
+    /// claims still owe. Hedges are copies of ranges a primary already owns, so
+    /// they don't count.
+    fn remaining_work(&self) -> u64 {
+        let live: u64 = self
+            .live
+            .iter()
+            .filter(|l| l.hedge_of.is_none())
+            .map(|l| l.remaining())
+            .sum();
+        self.unclaimed_bytes().saturating_add(live)
+    }
+
+    /// Where the tail begins: `max(4 × conns × min_fragment, 64 MiB)`
+    /// (`design.md` §12).
+    ///
+    /// Four rounds of full-width work is the point past which handing out
+    /// 8 MiB fragments still keeps every worker busy to the end. Inside it,
+    /// the aim changes from amortizing per-request overhead to converging, so
+    /// fragments relax and hedging unlocks.
+    fn endgame_threshold(&self) -> u64 {
+        (self.max_threads as u64)
+            .saturating_mul(4)
+            .saturating_mul(MIN_FRAGMENT)
+            .max(ENDGAME_FLOOR)
+    }
+
+    fn in_tail(&self) -> bool {
+        self.remaining_work() < self.endgame_threshold()
+    }
+
+    /// Smallest fragment worth cutting right now.
+    ///
+    /// [`MIN_FRAGMENT`] is a Policy A constant (`design.md` §6.1) and applies
+    /// only to downloads: it relaxes to [`MIN_CLAIM`] once the transfer reaches
+    /// its tail (§6.1 T2'), where the goal flips from amortizing per-request
+    /// overhead to getting the last workers busy.
+    ///
+    /// Playback is Policy B and sizes work from the reader's deadline instead
+    /// (§7.3, where the chunk nearest the play head is *deliberately* as small
+    /// as 64 KiB). Holding it to an 8 MiB floor would forbid exactly the splits
+    /// that shorten time-to-first-byte, so it keeps the [`MIN_CLAIM`] floor.
+    fn min_frag(&self) -> u64 {
+        match self.strategy {
+            Strategy::Latency { .. } => MIN_CLAIM,
+            Strategy::Throughput if self.in_tail() => MIN_CLAIM,
+            Strategy::Throughput => MIN_FRAGMENT,
+        }
     }
 
     /// True when every byte of the request is either staged or being fetched.
@@ -299,8 +457,8 @@ impl Scheduler {
         let mut reclaimed = Vec::new();
         let mut i = 0;
         while i < self.live.len() {
-            let cursor = self.live[i].cursor.load(Ordering::Relaxed);
-            let end = self.live[i].end.load(Ordering::Relaxed);
+            let cursor = self.live[i].cursor.load(Ordering::Acquire);
+            let end = self.live[i].end.load(Ordering::Acquire);
             // Keep claims that are finished (the worker is about to report in)
             // or that overlap the window the reader cares about.
             let done = cursor > end;
@@ -311,9 +469,53 @@ impl Scheduler {
             }
             let live = self.live.remove(i);
             reclaimed.push(live.worker);
-            self.insert_unclaimed(cursor, end);
+            // A hedge owns nothing: the claim it was racing still holds this
+            // range, so handing it back would queue it for a second fetch.
+            if live.hedge_of.is_none() {
+                self.insert_unclaimed(cursor, end);
+            }
         }
         reclaimed
+    }
+
+    /// Declare stopped claims dead, hand their ranges back, and return the
+    /// workers whose requests the caller should abort and restart.
+    ///
+    /// `design.md` §6.4 separates two failure modes that look alike from the
+    /// outside. A *slow* claim is handled by stealing — it keeps its warm
+    /// connection and the bytes it already delivered, and simply owes less. A
+    /// *stopped* one (nothing at all for [`DEAD_CLAIM_WINDOW`], the "30 s under
+    /// 1 B/s" rule, which also covers aria2's "owner is idle and has written
+    /// nothing") has no bytes to protect and no evidence its connection will
+    /// ever produce any, so the cheap fix is the wrong one: re-cut it.
+    ///
+    /// Intended to be driven from the same ~1 Hz tick that samples throughput;
+    /// progress is tracked between calls rather than with a timer per claim.
+    pub fn reclaim_stalled(&mut self) -> Vec<usize> {
+        let now = Instant::now();
+        let mut dead = Vec::new();
+        let mut i = 0;
+        while i < self.live.len() {
+            let cursor = self.live[i].cursor.load(Ordering::Acquire);
+            let end = self.live[i].end.load(Ordering::Acquire);
+            if cursor > self.live[i].last_cursor || cursor > end {
+                // Moving, or finished and about to report in.
+                self.live[i].last_cursor = cursor;
+                self.live[i].last_progress = now;
+                i += 1;
+                continue;
+            }
+            if now.duration_since(self.live[i].last_progress) < DEAD_CLAIM_WINDOW {
+                i += 1;
+                continue;
+            }
+            let live = self.live.remove(i);
+            dead.push(live.worker);
+            if live.hedge_of.is_none() {
+                self.insert_unclaimed(cursor, end);
+            }
+        }
+        dead
     }
 
     /// Feed a completed claim's outcome back into automatic sizing.
@@ -344,8 +546,17 @@ impl Scheduler {
         self.auto_target
     }
 
+    #[cfg(test)]
+    fn unclaimed_ranges(&self) -> &[(u64, u64)] {
+        &self.unclaimed
+    }
+
     /// Hand `worker` its next claim, or `None` when there is nothing left to
-    /// do — neither unclaimed work nor a live claim big enough to split.
+    /// do — no unclaimed work, no live claim big enough to split, and no
+    /// endgame budget left.
+    ///
+    /// The three tiers of `design.md` §6.1, in cost order: take, then steal,
+    /// then (in the tail only) hedge.
     pub fn claim(&mut self, worker: usize) -> Option<Claim> {
         // Regions in priority order. Latency mode looks in the critical window
         // first; both modes then fall back to everything up to the horizon,
@@ -378,6 +589,8 @@ impl Scheduler {
             }
         };
 
+        // T1: something unclaimed. Cheapest tier and the only one that adds no
+        // risk of duplicate work, so it is exhausted before anything else.
         for (i, &(rs, re)) in regions.iter().enumerate() {
             let in_critical = i == 0 && matches!(self.strategy, Strategy::Latency { .. });
             // Two passes per region: honour `max_per_volume`, then ignore it.
@@ -396,10 +609,20 @@ impl Scheduler {
             }
         }
 
-        // Nothing unclaimed anywhere: steal the back half of the biggest live
-        // claim. Without this, the slowest single request in flight decides
-        // when the whole transfer ends.
-        self.steal(worker)
+        // T2: nothing unclaimed anywhere — steal the back half of a live claim.
+        // Without this, the slowest single request in flight decides when the
+        // whole transfer ends.
+        if let Some(c) = self.steal(worker) {
+            return Some(c);
+        }
+
+        // T3: nothing left to split either. In the tail, and only for a
+        // download (playback answers a starved reader with its critical window,
+        // not with duplicate bytes), race an in-flight claim on a budget.
+        if matches!(self.strategy, Strategy::Throughput) && self.in_tail() {
+            return self.hedge(worker);
+        }
+        None
     }
 
     /// Release `worker`'s claim. `reached` is the first byte it did *not*
@@ -410,13 +633,62 @@ impl Scheduler {
             return;
         };
         let live = self.live.remove(pos);
-        let end = live.end.load(Ordering::Relaxed);
-        if reached <= end {
-            self.insert_unclaimed(reached, end);
+        let end = live.end.load(Ordering::Acquire);
+        let complete = reached > end;
+        match live.hedge_of {
+            // A hedge owns no range — the primary it raced does. Handing bytes
+            // back here would schedule a third fetch of the same range.
+            Some(primary_start) => {
+                if complete {
+                    self.cut_short(|l| l.hedge_of.is_none() && l.start == primary_start);
+                }
+            }
+            None => {
+                if complete {
+                    // Won the race (or was never in one). Any hedge still
+                    // fetching this range is pure waste now.
+                    self.cut_short(|l| l.hedge_of == Some(live.start));
+                } else {
+                    self.insert_unclaimed(reached, end);
+                }
+            }
         }
     }
 
+    /// Tell the first matching live claim it is already finished, by pulling
+    /// its end below its cursor. The worker sees it at its next stream item and
+    /// retires — the zero-cost cancellation of `design.md` §4.2, which beats
+    /// resetting the stream because the connection stays warm and poolable.
+    fn cut_short(&mut self, matches: impl Fn(&Live) -> bool) {
+        let Some(loser) = self.live.iter().find(|l| matches(l)) else {
+            return;
+        };
+        let cursor = loser.cursor.load(Ordering::Acquire);
+        loser
+            .end
+            .fetch_min(cursor.saturating_sub(1), Ordering::AcqRel);
+    }
+
     /// Carve a claim out of `[rs, re]`.
+    ///
+    /// Which gap it comes from is the scoring decision of `design.md` §1:
+    ///
+    /// * Inside latency mode's critical window, the first gap wins — that is
+    ///   the one nearest the reader, and the reader's stall is what the window
+    ///   exists to minimize. A capped volume there blocks the pass entirely so
+    ///   the caller's second, cap-ignoring pass can overflow *into the volume
+    ///   the reader is actually waiting on*.
+    /// * Everywhere else the largest gap wins (aria2
+    ///   `getSparseMissingUnusedIndex`): one request should buy as much
+    ///   contiguous work as possible, and a capped volume is simply skipped in
+    ///   favour of the next-largest gap, which by construction lives on a
+    ///   different URL and so is real added parallelism.
+    ///
+    /// aria2 additionally starts at the *midpoint* of the winning gap, because
+    /// its segments grow forward until they collide with someone else's. Here
+    /// the range is subtracted at hand-out, so collisions are impossible and
+    /// taking from the front is strictly better: it leaves one gap instead of
+    /// two and keeps the completed prefix contiguous for the ordered reader.
     fn take_unclaimed(
         &mut self,
         worker: usize,
@@ -425,22 +697,12 @@ impl Scheduler {
         respect_cap: bool,
         in_critical: bool,
     ) -> Option<Claim> {
-        // First unclaimed interval that intersects the region.
-        let (idx, seg_start) = self.unclaimed.iter().enumerate().find_map(|(i, &(s, e))| {
-            if e < rs || s > re {
-                None
-            } else {
-                Some((i, s.max(rs)))
-            }
-        })?;
-        let (_, seg_end_full) = self.unclaimed[idx];
-        let seg_end = seg_end_full.min(re);
+        let idx = self.pick_gap(rs, re, respect_cap, in_critical)?;
+        let (gap_start, gap_end) = self.unclaimed[idx];
+        let seg_start = gap_start.max(rs);
+        let seg_end = gap_end.min(re);
 
         let volume = self.volume_of(seg_start);
-        if respect_cap && self.live_in_volume(volume) >= self.max_per_volume {
-            return None;
-        }
-
         // Clip to the volume that contains `seg_start` — one claim, one URL.
         let vol_end = self.volume_end(seg_start).unwrap_or(seg_end);
         let hard_end = seg_end.min(vol_end);
@@ -449,38 +711,106 @@ impl Scheduler {
         let end = hard_end.min(seg_start.saturating_add(want.saturating_sub(1)));
 
         self.subtract(seg_start, end);
+        Some(self.register(worker, seg_start, end, volume, None))
+    }
+
+    /// Index of the unclaimed interval this claim should come out of.
+    fn pick_gap(&self, rs: u64, re: u64, respect_cap: bool, nearest_wins: bool) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, &(s, e)) in self.unclaimed.iter().enumerate() {
+            if e < rs || s > re {
+                continue;
+            }
+            let seg_start = s.max(rs);
+            if nearest_wins {
+                // `unclaimed` is sorted, so the first hit is the nearest one.
+                let volume = self.volume_of(seg_start);
+                if respect_cap && self.live_in_volume(volume) >= self.max_per_volume {
+                    return None;
+                }
+                return Some(i);
+            }
+            let volume = self.volume_of(seg_start);
+            if respect_cap && self.live_in_volume(volume) >= self.max_per_volume {
+                continue;
+            }
+            let score = e.min(re) - seg_start + 1;
+            if best.is_none_or(|(_, b)| score > b) {
+                best = Some((i, score));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Record a handed-out range and build the worker's handle for it.
+    fn register(
+        &mut self,
+        worker: usize,
+        start: u64,
+        end: u64,
+        volume: usize,
+        hedge_of: Option<u64>,
+    ) -> Claim {
+        let now = Instant::now();
         let claim = Claim {
-            start: seg_start,
+            start,
             volume,
             end: Arc::new(AtomicU64::new(end)),
-            cursor: Arc::new(AtomicU64::new(seg_start)),
+            cursor: Arc::new(AtomicU64::new(start)),
+            reserved: Arc::new(AtomicU64::new(start)),
         };
         self.live.push(Live {
             worker,
             volume,
+            start,
             end: Arc::clone(&claim.end),
             cursor: Arc::clone(&claim.cursor),
+            reserved: Arc::clone(&claim.reserved),
+            started: now,
+            last_cursor: start,
+            last_progress: now,
+            hedge_of,
         });
-        Some(claim)
+        claim
     }
 
-    /// Take the back half of the live claim with the most work left.
+    /// T2 — take the back half of a live claim (`design.md` §3.1
+    /// `steal_far_half`).
+    ///
+    /// The victim is not interrupted and loses nothing it has already fetched:
+    /// its end moves inward, and at its next stream item it simply decides it
+    /// is done. That is why stealing, not killing, is the answer to a slow
+    /// connection — a kill throws away a warm congestion window and every byte
+    /// in flight (`design.md` §6.4).
     fn steal(&mut self, worker: usize) -> Option<Claim> {
-        let victim = self
-            .live
-            .iter()
-            .filter(|l| l.worker != worker && l.remaining() > MIN_CLAIM * 2)
-            .max_by_key(|l| l.remaining())?;
+        let min_frag = self.min_frag();
+        // Splitting has to leave both halves worth a request of their own.
+        let pos = self.pick_victim(worker, min_frag.saturating_mul(2))?;
+        let victim = &self.live[pos];
 
-        let v_end = victim.end.load(Ordering::Relaxed);
+        let v_end = victim.end.load(Ordering::Acquire);
         let remaining = victim.remaining();
         // Same split point gopeed uses: halve what's *left*, not the original
         // claim, so a victim that is nearly done isn't cut at a stale offset.
+        // (`design.md` writes this as `max(written_hwm, midpoint)`, which hands
+        // the thief more than half of the remainder whenever the victim is less
+        // than half done; halving the remainder balances the two.)
         let split_at = v_end - remaining / 2;
         if split_at >= v_end {
             return None;
         }
-        let new_start = split_at + 1;
+        victim.end.store(split_at, Ordering::Release);
+
+        // The victim clamps each write to the end it read just before writing,
+        // so it may already have committed to bytes past the split point. Start
+        // after whatever it reserved rather than at the split, and the handoff
+        // transfers zero bytes twice.
+        let new_start = split_at
+            .saturating_add(1)
+            .max(victim.reserved.load(Ordering::Acquire));
+        if new_start > v_end {
+            return None;
+        }
         let volume = self.volume_of(new_start);
         // A claim never spans volumes, so the stolen tail is in the victim's
         // volume by construction; clip anyway to stay honest if that ever
@@ -489,21 +819,97 @@ impl Scheduler {
         if new_end < new_start {
             return None;
         }
-        victim.end.store(split_at, Ordering::Relaxed);
+        Some(self.register(worker, new_start, new_end, volume, None))
+    }
 
-        let claim = Claim {
-            start: new_start,
-            volume,
-            end: Arc::new(AtomicU64::new(new_end)),
-            cursor: Arc::new(AtomicU64::new(new_start)),
+    /// Which live claim to rob. Slowness beats size (`design.md` §6.4): a
+    /// straggler is where the transfer's completion time is actually being
+    /// decided, whereas the biggest claim may simply be the one that started
+    /// last. Size is the tie-break when no rate sample is trustworthy yet.
+    fn pick_victim(&self, worker: usize, need: u64) -> Option<usize> {
+        let eligible: Vec<usize> = (0..self.live.len())
+            .filter(|&i| self.live[i].worker != worker && self.live[i].hedge_of.is_none())
+            .filter(|&i| self.live[i].remaining() > need)
+            .collect();
+        if eligible.is_empty() {
+            return None;
+        }
+        // Median over every live claim, not just the eligible ones — the point
+        // of comparison is "slow relative to this upstream right now".
+        let mut rates: Vec<f64> = self.live.iter().filter_map(|l| l.rate()).collect();
+        if rates.len() >= 3 {
+            rates.sort_unstable_by(f64::total_cmp);
+            let cutoff = rates[rates.len() / 2] * STRAGGLER_RATIO;
+            let slowest = eligible
+                .iter()
+                .filter_map(|&i| self.live[i].rate().map(|r| (i, r)))
+                .filter(|&(_, r)| r < cutoff)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((i, _)) = slowest {
+                return Some(i);
+            }
+        }
+        eligible.into_iter().max_by_key(|&i| self.live[i].remaining())
+    }
+
+    /// T3 — the endgame (`design.md` §6.1). Every byte is claimed and nothing
+    /// is big enough to split, so the only way left to help is to fetch a range
+    /// somebody else is already fetching and let the two race.
+    ///
+    /// Three limits keep this from becoming self-inflicted DDoS, which is what
+    /// an unconditional endgame turns into on a correlated slowdown:
+    ///
+    /// * a hard duplicate-byte budget (0.5% of the transfer, ≤32 MiB) that is
+    ///   spent and never refilled;
+    /// * a duplication factor of two — one hedge per claim, never a third;
+    /// * a [`MIN_CLAIM`] floor, because a duplicate request too small to
+    ///   amortize its own round trip cannot win a race it started late.
+    ///
+    /// The loser is cut short through [`Scheduler::cut_short`] as soon as the
+    /// winner reports, so the wasted bytes are bounded by one stream item on
+    /// top of whatever the loser had already fetched.
+    fn hedge(&mut self, worker: usize) -> Option<Claim> {
+        if self.dup_budget < MIN_CLAIM {
+            return None;
+        }
+        let hedged: Vec<u64> = self.live.iter().filter_map(|l| l.hedge_of).collect();
+        let candidates: Vec<usize> = (0..self.live.len())
+            .filter(|&i| {
+                let l = &self.live[i];
+                l.worker != worker
+                    && l.hedge_of.is_none()
+                    && l.remaining() >= MIN_CLAIM
+                    && !hedged.contains(&l.start)
+            })
+            .collect();
+        // Race the slowest claim: it is the one holding up the transfer, and
+        // the one a fresh request has a chance of beating.
+        let by_rate = candidates
+            .iter()
+            .copied()
+            .filter_map(|i| self.live[i].rate().map(|r| (i, r)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i);
+        let pos = match by_rate {
+            Some(i) => i,
+            None => candidates
+                .into_iter()
+                .max_by_key(|&i| self.live[i].remaining())?,
         };
-        self.live.push(Live {
-            worker,
-            volume,
-            end: Arc::clone(&claim.end),
-            cursor: Arc::clone(&claim.cursor),
-        });
-        Some(claim)
+
+        let target = &self.live[pos];
+        let primary_start = target.start;
+        let lo = target.cursor.load(Ordering::Acquire);
+        let hi = target
+            .end
+            .load(Ordering::Acquire)
+            .min(lo.saturating_add(self.dup_budget - 1));
+        if hi < lo || hi - lo + 1 < MIN_CLAIM {
+            return None;
+        }
+        self.dup_budget -= hi - lo + 1;
+        let volume = self.volume_of(lo);
+        Some(self.register(worker, lo, hi, volume, Some(primary_start)))
     }
 
     /// True when `offset` sits in the stretch immediately ahead of the reader,
@@ -555,7 +961,7 @@ impl Scheduler {
         let even = self
             .unclaimed_bytes()
             .div_ceil(free_slots)
-            .max(MIN_CLAIM);
+            .max(self.min_frag());
         // The probed ceiling caps the even split: `even` says how much work a
         // worker *should* take to finish alongside its peers, `auto_target`
         // says how much this upstream has actually proven it can deliver in one
@@ -962,11 +1368,15 @@ mod tests {
         let stale = s.reclaim_outside_window(MIN_CLAIM);
         assert_eq!(stale, vec![0], "only the far worker is reclaimed");
 
-        // The delivered megabyte is not back on the unclaimed list; the rest is.
-        let replacement = s.claim(0).unwrap();
-        assert_eq!(
-            replacement.start, MIN_CLAIM,
-            "refetching starts at the cursor, not at the claim's start",
+        // The delivered megabyte is not back on the unclaimed list; the rest of
+        // the abandoned claim is. (Which gap the pool picks up *next* is the
+        // largest-gap decision, not this test's business — so assert on the
+        // give-back itself.)
+        assert!(
+            s.unclaimed_ranges().contains(&(MIN_CLAIM, 4 * MIN_CLAIM - 1)),
+            "refetching must resume at the cursor, not at the claim's start; \
+             unclaimed = {:?}",
+            s.unclaimed_ranges(),
         );
     }
 
@@ -1179,5 +1589,256 @@ mod tests {
         s.finish(1, b.end() + 1);
         assert!(s.is_drained());
         assert!(s.claim(0).is_none());
+    }
+
+    /// Building block for the fragmented-ledger tests: a request whose ledger
+    /// already has holes punched in it, the way reclaims, retries and a warm
+    /// cache leave one. Two narrow gaps low in the file, one wide gap high up.
+    fn fragmented(strategy: Strategy) -> Scheduler {
+        Scheduler::new(
+            0,
+            600 * MIN_CLAIM - 1,
+            strategy,
+            None,
+            4,
+            4,
+            Some(4 * MIN_CLAIM),
+            &[
+                (2 * MIN_CLAIM, 3 * MIN_CLAIM - 1),
+                (5 * MIN_CLAIM, 100 * MIN_CLAIM - 1),
+            ],
+        )
+    }
+
+    #[test]
+    fn claims_come_out_of_the_largest_gap() {
+        // aria2's `getSparseMissingUnusedIndex`, and the reason for it: one
+        // request should buy as much contiguous work as it can. First-fit
+        // instead hands the next worker whatever sliver happens to sit lowest
+        // in the file, which is how a ledger fragmented by reclaims and retries
+        // degenerates into a request storm.
+        let mut s = fragmented(Strategy::Throughput);
+        assert_eq!(
+            s.claim(0).unwrap().start,
+            100 * MIN_CLAIM,
+            "expected the 500 MiB gap, not one of the 2 MiB slivers below it",
+        );
+    }
+
+    #[test]
+    fn the_critical_window_still_takes_the_nearest_gap() {
+        // Largest-gap is a throughput score. Inside the reader's window the
+        // score is proximity — the viewer is blocked on the *next* byte, not on
+        // whichever hole happens to be widest.
+        let mut s = fragmented(Strategy::Latency {
+            critical_window: 600 * MIN_CLAIM,
+            head_claim: MIN_CLAIM,
+        });
+        assert_eq!(
+            s.claim(0).unwrap().start,
+            0,
+            "the reader's window must be filled front-to-back, not widest-first",
+        );
+    }
+
+    #[test]
+    fn the_tail_relaxes_fragments_to_one_megabyte() {
+        // design.md §6.1 T2': in the endgame the goal flips from amortizing
+        // per-request overhead to getting everyone busy, so a remainder too
+        // small to be worth splitting mid-transfer becomes worth splitting.
+        let mut s = Scheduler::new(
+            0,
+            32 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            1,
+            1,
+            None,
+            &[],
+        );
+        warm_to(&mut s, 32 * MIN_CLAIM);
+        let victim = s.claim(0).unwrap();
+        victim.advance_to(victim.end() - 12 * MIN_CLAIM + 1);
+        assert!(s.in_tail(), "32 MiB left is inside the endgame threshold");
+        let thief = s.claim(1).expect("tail fragments relax to MIN_CLAIM");
+        assert_eq!(thief.end() - thief.start + 1, 6 * MIN_CLAIM);
+    }
+
+    #[test]
+    fn playback_is_not_held_to_the_download_fragment_floor() {
+        // MIN_FRAGMENT is a Policy A constant. Applying it to playback would
+        // forbid splitting the small claims near the read head — which is
+        // backwards, since those are small precisely to shorten the stall the
+        // viewer feels.
+        let mut s = Scheduler::new(
+            0,
+            4000 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 4 * MIN_CLAIM,
+                head_claim: 4 * MIN_CLAIM,
+            },
+            None,
+            1,
+            1,
+            Some(4 * MIN_CLAIM),
+            &[],
+        );
+        let victim = s.claim(0).unwrap();
+        assert_eq!(victim.end() - victim.start + 1, 4 * MIN_CLAIM);
+        // Pin the pool to exactly that claim so the only way to help is to
+        // split it.
+        s.set_work_limit(Some(4 * MIN_CLAIM));
+        assert!(!s.in_tail(), "a 4 GiB file is nowhere near its tail");
+        let thief = s
+            .claim(1)
+            .expect("a 4 MiB head claim must still be splittable");
+        assert_eq!(thief.end() - thief.start + 1, 2 * MIN_CLAIM);
+    }
+
+    #[test]
+    fn a_steal_starts_after_whatever_the_victim_reserved() {
+        // The victim clamps each write to the end it read a moment earlier, so
+        // between the steal and the victim noticing it there may be a write
+        // already committed past the split point. Starting at the reservation
+        // rather than the split is what keeps the handoff at zero duplicated
+        // bytes (design.md §3.1).
+        let mut s = Scheduler::new(
+            0,
+            32 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            1,
+            1,
+            None,
+            &[],
+        );
+        warm_to(&mut s, 32 * MIN_CLAIM);
+        let victim = s.claim(0).unwrap();
+        let split = victim.end() - victim.remaining() / 2;
+        // In-flight write that will land past where the thief would cut.
+        victim.reserve(split + MIN_CLAIM);
+
+        let thief = s.claim(1).unwrap();
+        assert_eq!(
+            thief.start,
+            split + MIN_CLAIM,
+            "the thief must start past the victim's committed write",
+        );
+    }
+
+    #[test]
+    fn a_dead_claim_is_re_cut_and_its_worker_restarted() {
+        let mut s = sched(Strategy::Throughput, 4, None);
+        let stuck = s.claim(0).unwrap();
+        let live = s.claim(1).unwrap();
+        stuck.advance_to(stuck.start + MIN_CLAIM); // delivered, then stopped
+        s.reclaim_stalled(); // arms the progress baseline
+
+        // Nothing has moved since; pretend the window elapsed.
+        for l in s.live.iter_mut() {
+            l.last_progress -= DEAD_CLAIM_WINDOW;
+        }
+        live.advance_to(live.start + MIN_CLAIM); // this one is still working
+
+        assert_eq!(s.reclaim_stalled(), vec![0], "only the dead claim is re-cut");
+        assert!(
+            s.unclaimed_ranges()
+                .contains(&(stuck.start + MIN_CLAIM, stuck.end())),
+            "the undelivered part of a dead claim goes back on the pool",
+        );
+    }
+
+    #[test]
+    fn the_endgame_hedges_on_a_budget_and_cuts_the_loser_short() {
+        // design.md §6.1 T3. Everything is claimed and nothing is big enough to
+        // split, so the last idle worker races the straggler.
+        let mut s = Scheduler::new(
+            0,
+            400 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            1,
+            1,
+            None,
+            &[],
+        );
+        warm_to(&mut s, MAX_AUTO_CLAIM);
+        let mut primary = s.claim(0).unwrap();
+        while s.unclaimed_bytes() > 0 {
+            s.finish(0, u64::MAX);
+            primary = s.claim(0).unwrap();
+        }
+        // Too little left to steal, so T1 and T2 are both exhausted.
+        primary.advance_to(primary.end() - MIN_CLAIM + 1);
+        assert!(s.in_tail());
+
+        let hedge = s.claim(1).expect("the endgame must find work");
+        assert_eq!(hedge.start, primary.cursor(), "hedges race from the cursor");
+        assert_eq!(hedge.end(), primary.end());
+
+        // Duplication factor two: one copy of a claim, never a third.
+        assert!(s.claim(2).is_none());
+
+        // Primary wins: the hedge is told it is already done. No stream reset
+        // needed — the same end-watermark the steal path uses.
+        primary.advance_to(primary.end() + 1);
+        s.finish(0, primary.end() + 1);
+        assert!(hedge.is_complete(), "the loser must be cut short");
+    }
+
+    #[test]
+    fn the_endgame_budget_is_spent_not_refilled() {
+        // 0.5% of the transfer, capped at 32 MiB, and a hedge too small to
+        // amortize its own round trip is not worth issuing at all — which is
+        // what stops a small file from hedging on a few kilobytes.
+        let mut s = Scheduler::new(
+            0,
+            32 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            1,
+            1,
+            None,
+            &[],
+        );
+        warm_to(&mut s, 32 * MIN_CLAIM);
+        let only = s.claim(0).unwrap();
+        only.advance_to(only.end() - MIN_CLAIM + 1);
+        assert!(s.in_tail());
+        assert!(
+            s.claim(1).is_none(),
+            "0.5% of 32 MiB is 168 KiB — below the floor where a request pays \
+             for itself",
+        );
+    }
+
+    #[test]
+    fn playback_never_hedges() {
+        // Duplicate bytes are a download's answer to a straggler. A starved
+        // reader is answered with the critical window instead — spending its
+        // bandwidth on a second copy of bytes already in flight is exactly
+        // backwards.
+        let mut s = Scheduler::new(
+            0,
+            400 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 400 * MIN_CLAIM,
+                head_claim: MIN_CLAIM,
+            },
+            None,
+            1,
+            1,
+            None,
+            &[],
+        );
+        warm_to(&mut s, MAX_AUTO_CLAIM);
+        let mut last = s.claim(0).unwrap();
+        while s.unclaimed_bytes() > 0 {
+            s.finish(0, u64::MAX);
+            last = s.claim(0).unwrap();
+        }
+        last.advance_to(last.end() - MIN_CLAIM + 1);
+        assert!(s.in_tail());
+        assert!(s.claim(1).is_none());
     }
 }

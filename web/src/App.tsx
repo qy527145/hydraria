@@ -87,14 +87,9 @@ export default function App() {
 
       <Layout.Content>
         <main className="page">
-          <section className="hero">
-            <div>
-              <span>PLAYBACK + COMPLETE CACHE</span>
-              <h1>两种场景，一份本地数据</h1>
-              <p>
-                代理播放优先响应 seek，完整缓存优先尽快补齐文件。两者可同时运行，共享线程、分片与磁盘缓存。
-              </p>
-            </div>
+          {/* 仪表盘是天天盯的东西，不是落地页：标题和介绍文字换成一条工具栏，
+              省下的整屏高度直接给任务卡片。 */}
+          <div className="toolbar">
             <Input
               allowClear
               prefix={<SearchOutlined />}
@@ -102,7 +97,12 @@ export default function App() {
               value={query}
               onChange={event => setQuery(event.target.value)}
             />
-          </section>
+            <span className="toolbar-count">
+              {query.trim() && filtered.length !== tasks.length
+                ? `匹配 ${filtered.length} / ${tasks.length}`
+                : `${tasks.length} 个任务 · 按最近编辑排序`}
+            </span>
+          </div>
 
           {error && <Alert type="error" showIcon message={error} />}
 

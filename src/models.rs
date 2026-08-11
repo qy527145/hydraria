@@ -335,6 +335,10 @@ pub struct TaskInfo {
     pub proxy_url: String,
     pub config: TaskConfig,
     pub created_at: u64,
+    /// Unix seconds of the last configuration edit, or `created_at` for a task
+    /// nobody has edited. The dashboard orders by this, so "what was I just
+    /// working on" is what the list opens on.
+    pub updated_at: u64,
     pub bytes_served: u64,
     pub active_connections: u32,
     pub paused: bool,
@@ -380,6 +384,10 @@ impl Drop for ConnectionGuard {
 pub struct TaskEntry {
     pub config: RwLock<TaskConfig>,
     pub created_at: u64,
+    /// Unix seconds of the last successful [`TaskEntry::apply_update`]. Atomic
+    /// rather than behind the config lock so `task_info` can read it without
+    /// ordering itself against a writer.
+    pub updated_at: AtomicU64,
     pub bytes_served: AtomicU64,
     /// Live client connections. Maintained exclusively through
     /// [`ConnectionGuard`] so it can't drift.
@@ -458,11 +466,16 @@ impl TaskConfig {
 }
 
 impl TaskEntry {
-    pub fn new(mut config: TaskConfig) -> Self {
-        let now = SystemTime::now()
+    /// Unix seconds, or 0 if the clock is before the epoch.
+    fn now() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    pub fn new(mut config: TaskConfig) -> Self {
+        let now = Self::now();
         config.normalize();
         let url_health = config
             .urls()
@@ -476,6 +489,7 @@ impl TaskEntry {
         Self {
             config: RwLock::new(config),
             created_at: now,
+            updated_at: AtomicU64::new(now),
             bytes_served: AtomicU64::new(0),
             active_connections: AtomicU32::new(0),
             paused: AtomicBool::new(false),
@@ -593,6 +607,9 @@ impl TaskEntry {
         if let Some(cd) = upd.content_disposition {
             cfg.content_disposition = cd;
         }
+        // Only on the success path: a rejected edit changed nothing the user
+        // asked for, so it should not reorder the dashboard either.
+        self.updated_at.store(Self::now(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -752,6 +769,7 @@ impl AppState {
             proxy_url: format!("http://{}/stream/{}", self.bind_addr, id),
             config: cfg,
             created_at: entry.created_at,
+            updated_at: entry.updated_at.load(Ordering::Relaxed),
             bytes_served: entry.bytes_served.load(Ordering::Relaxed),
             active_connections: entry.active_connections.load(Ordering::Relaxed),
             paused: entry.paused.load(Ordering::Relaxed),
@@ -763,12 +781,26 @@ impl AppState {
         }
     }
 
+    /// Every task, most recently edited first.
+    ///
+    /// Ordering belongs here rather than in the dashboard because the map's
+    /// iteration order is arbitrary: without it the list visibly reshuffles on
+    /// every one-second poll. Newest-edit-first also means the task you just
+    /// saved is the one you are looking at. `task_id` breaks ties so tasks
+    /// created inside the same second (a restore, or a burst of API calls)
+    /// still have a stable order.
     pub fn list(&self) -> Vec<TaskInfo> {
         let guard = self.tasks.read();
-        guard
+        let mut out: Vec<TaskInfo> = guard
             .iter()
             .map(|(id, entry)| self.task_info(id, entry))
-            .collect()
+            .collect();
+        out.sort_unstable_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.task_id.cmp(&b.task_id))
+        });
+        out
     }
 
     pub fn global_state(&self) -> GlobalState {
@@ -855,6 +887,7 @@ impl AppState {
             id: String,
             config: TaskConfig,
             created_at: u64,
+            updated_at: u64,
             paused: bool,
         }
 
@@ -869,6 +902,7 @@ impl AppState {
                         id: id.clone(),
                         config: cfg,
                         created_at: entry.created_at,
+                        updated_at: entry.updated_at.load(Ordering::Relaxed),
                         paused: entry.paused.load(Ordering::Relaxed),
                     })
                 } else {
@@ -915,6 +949,10 @@ impl AppState {
             config: TaskConfig,
             #[serde(default)]
             created_at: u64,
+            /// Absent in state files written before edit tracking existed;
+            /// those tasks fall back to `created_at` below.
+            #[serde(default)]
+            updated_at: u64,
             #[serde(default)]
             paused: bool,
         }
@@ -941,12 +979,14 @@ impl AppState {
         for pt in p.tasks {
             let entry = Arc::new(TaskEntry::new(pt.config));
             entry.paused.store(pt.paused, Ordering::Relaxed);
-            // Force timestamp from disk so "created" age survives restart.
-            // (TaskEntry::new sets it to "now" — there's no setter, but
-            // created_at is pub so we set it via a small dance: rebuild
-            // with the right ts.)
+            // Force timestamps from disk so "created" age and edit order both
+            // survive a restart — `TaskEntry::new` stamps them with "now".
+            let created_at = pt.created_at.max(1);
+            entry
+                .updated_at
+                .store(pt.updated_at.max(created_at), Ordering::Relaxed);
             let with_ts = TaskEntry {
-                created_at: pt.created_at.max(1),
+                created_at,
                 ..Arc::try_unwrap(entry).unwrap_or_else(|_| unreachable!())
             };
             self.insert(pt.id, Arc::new(with_ts));
@@ -1014,6 +1054,10 @@ impl AppState {
                 continue;
             }
             id.hash(&mut hasher);
+            // Edit order is persisted state the dashboard sorts on, so a
+            // re-save that happens to leave every config field identical still
+            // has to reach disk.
+            e.updated_at.load(Ordering::Relaxed).hash(&mut hasher);
             for vol in &cfg.volumes {
                 b"|".hash(&mut hasher);
                 for u in vol {
@@ -1058,4 +1102,52 @@ pub fn short_id() -> String {
         out.push(alphabet[(b as usize) % alphabet.len()] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(name: &str) -> TaskConfig {
+        serde_json::from_value(serde_json::json!({
+            "volumes": [["https://example.invalid/a"]],
+            "name": name,
+        }))
+        .expect("TaskConfig fills its own defaults")
+    }
+
+    #[test]
+    fn an_edit_stamps_the_task_and_a_rejected_one_does_not() {
+        // The dashboard orders by this timestamp, so it has to move on a real
+        // edit — and hold still when the edit was refused, or a typo would
+        // jump a task to the top of the list without changing anything.
+        let entry = TaskEntry::new(config("before"));
+        let created = entry.updated_at.load(Ordering::Relaxed);
+        assert_eq!(created, entry.created_at, "an unedited task reads as created");
+
+        entry.updated_at.store(created - 60, Ordering::Relaxed);
+        entry
+            .apply_update(TaskUpdate {
+                name: Some(Some("after".into())),
+                ..Default::default()
+            })
+            .expect("renaming is valid");
+        let edited = entry.updated_at.load(Ordering::Relaxed);
+        assert!(edited > created - 60, "a successful edit must restamp");
+
+        entry.updated_at.store(edited - 60, Ordering::Relaxed);
+        assert!(
+            entry
+                .apply_update(TaskUpdate {
+                    max_threads: Some(0),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert_eq!(
+            entry.updated_at.load(Ordering::Relaxed),
+            edited - 60,
+            "a rejected edit must not reorder the list",
+        );
+    }
 }

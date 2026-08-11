@@ -17,7 +17,7 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 
 ## Highlights
 
-- **Multi-threaded chunked fetching** — each request is split into `max_split`-sized byte ranges and pulled concurrently up to `max_threads`. The scheduler uses a sliding window over the in-flight set, so the chunk being drained is always among those running (no starvation).
+- **Claim-based multi-threaded fetching** — `max_threads` workers each claim a contiguous range, pull it in one request, and write it at its absolute offset. An idle worker escalates through three tiers: carve from the **largest gap** (T1) → steal the tail of someone else's in-flight request (T2) → hedge it on a budget once only the tail is left (T3). Steal victims are picked by slowness, not size, and a request that hasn't moved for 30 s is declared dead and re-cut.
 - **Multi-source failover** — list multiple origin URLs; chunks are round-robined across them and a failed chunk transparently retries on a different origin.
 - **Range / Seek support** — when a player issues `Range: bytes=…` (e.g. seeking forward in a video), Hydraria re-plans the chunks from that offset. No re-download of earlier bytes. Always responds with `206` when the client sent a Range header (which is what Chrome's `<video>` element relies on to know seeking is supported).
 - **Disk cache** — opt-in per task. Bytes are stored in a sparse file keyed by the SHA-256 of the URL list, with a bitmap tracking 1-MB block completion. A second request to the same task is served entirely from disk; no upstream traffic. ETag-validated on every probe; an upstream change auto-wipes and re-fetches.
@@ -210,9 +210,9 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 
 1. **Probe** — when a client connects, Hydraria first issues a `HEAD` for cheap metadata (Content-Type, Content-Length, ETag, Last-Modified) and then a `Range: bytes=0-0` `GET`. The 206 response from the GET is the only reliable signal that an origin actually supports byte ranges (many CDNs serve ranges but don't advertise `Accept-Ranges` on HEAD).
 2. **Cache check (if enabled)** — Hydraria opens (or rewires) the cache entry keyed by the SHA-256 of the URL list. A stored meta with a non-matching ETag/size is treated as stale and the on-disk state is wiped.
-3. **Plan** — given the client's effective range `[start, end]`, the engine slices it into `max_split`-sized sub-ranges.
-4. **Pull** — each sub-range fetches in parallel under a sliding-window scheduler. The same task that drains chunks in order also spawns the next chunk when the previous one finishes; this keeps `max_threads` chunks in-flight while guaranteeing the chunk being drained is always among the running set (a plain semaphore would deadlock against the bounded per-chunk channels).
-5. **Stitch** — a serializer task drains the per-chunk channels in plan order and forwards bytes to the client. Bounded channels backpressure the fetchers when the client reads slowly.
+3. **Claim** — the effective range `[start, end]` goes to the scheduler whole; there is no pre-computed plan, and a worker carves a range only when it asks for one. How big is adaptive (8 MiB to start, doubling on success and halving on failure, capped at 64 MiB); a non-zero `max_split` is a hard ceiling on top of that.
+4. **Pull** — one request per worker per range, written to the local file at its absolute offset. A shared end-watermark is the only preemption mechanism: when someone moves it inward, the worker retires cleanly at its next stream item, so no byte is ever fetched twice.
+5. **Stitch** — the ordered reader reads from that local file and drags the critical window along as it goes. Write order is irrelevant; only the reader cares about order.
 6. **Cache writeback** — for cache-enabled tasks, every byte received from upstream is `pwrite`-ed to the sparse cache file at its absolute offset. Block-completion is tracked via a per-block byte-counter; when a block is fully covered, its bit is flipped in the bitmap (which is fsync-rotated to disk).
 7. **Retry** — if a chunk's origin fails mid-stream, the engine retries that chunk on the next URL in the round-robin list.
 

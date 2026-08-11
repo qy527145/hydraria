@@ -1,6 +1,7 @@
 import { Badge, Descriptions, Drawer, Table, Typography } from 'antd';
 import type { TaskInfo, UrlHealth } from '../../api/client';
 import { formatBytes, formatSpeed } from '../../utils/format';
+import CacheHeatmap from './CacheHeatmap';
 
 interface Props {
   task: TaskInfo;
@@ -11,6 +12,9 @@ interface Props {
 /** 只读诊断面板。卡片正面只放两个场景的操作，排障信息全部收到这里。 */
 export default function TaskDetails({ task, open, onClose }: Props) {
   const { config } = task;
+  // 卡片上的分布条是压扁的，容不下逐段的字节区间；这里放全尺寸的带 tooltip 版本。
+  const heat = task.cache_job?.bitmap_summary ?? task.cache?.bitmap_summary ?? [];
+  const total = task.cache_job?.total_bytes ?? task.cache?.total_size ?? 0;
   return (
     <Drawer title={`${config.name || task.task_id} · 任务详情`} width={760} open={open} onClose={onClose}>
       <Descriptions
@@ -30,6 +34,16 @@ export default function TaskDetails({ task, open, onClose }: Props) {
           { key: 'write', label: '播放写透', children: config.cache ? '开启' : '关闭' },
         ]}
       />
+
+      {total > 0 && (
+        <>
+          <Typography.Title level={5}>本地分片分布</Typography.Title>
+          <Typography.Paragraph type="secondary">
+            播放与缓存共享同一份文件，已落盘的区间不会重复下载。悬停看每段的字节范围。
+          </Typography.Paragraph>
+          <CacheHeatmap values={heat} total={total} />
+        </>
+      )}
 
       <Typography.Title level={5}>源状态</Typography.Title>
       <Table<UrlHealth>

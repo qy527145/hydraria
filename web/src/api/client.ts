@@ -78,6 +78,8 @@ export interface TaskInfo {
   proxy_url: string;
   config: TaskConfig;
   created_at: number;
+  /** 最后一次配置编辑的 Unix 秒；从未编辑过时等于 created_at。列表按它逆序。 */
+  updated_at: number;
   bytes_served: number;
   active_connections: number;
   paused: boolean;

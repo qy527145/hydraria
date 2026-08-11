@@ -72,113 +72,192 @@ button, input { font: inherit; }
 .header-stats .ant-statistic-content { font-size: 15px !important; font-variant-numeric: tabular-nums; }
 
 /* ── 页面骨架 ───────────────────────────────────────────── */
-.page { width: min(1320px, calc(100% - 48px)); margin: 0 auto; padding: 28px 0 56px; }
+.page { width: min(1560px, calc(100% - 40px)); margin: 0 auto; padding: 20px 0 48px; }
 
-.hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(240px, 330px);
-  align-items: end;
-  gap: 24px;
-  margin-bottom: 24px;
-}
-.hero span {
-  color: var(--hy-accent);
-  font: 600 10px ui-monospace, SFMono-Regular, monospace;
-  letter-spacing: 1.8px;
-}
-.hero h1 { margin: 6px 0 0; font-size: clamp(24px, 3vw, 33px); line-height: 1.15; letter-spacing: -.6px; }
-.hero p { max-width: 640px; margin: 8px 0 0; color: #7e899e; }
+.toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+.toolbar .ant-input-affix-wrapper { max-width: 380px; }
+.toolbar-count { color: var(--hy-muted); font-size: 12px; }
 
 .loading { display: block; margin: 96px auto; }
-.task-list { display: grid; gap: 18px; }
 .page .ant-alert { margin-bottom: 18px; }
 .page .ant-empty { padding: 72px 0; }
 
+/* 卡片自动分列：1320px 的页面上是 3 列。单列全宽卡片是上一版最大的密度问题 ——
+   一屏只看得到两个任务，而每个任务真正有信息的部分只占其中一小块。 */
+.task-list {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+  align-items: start;
+}
+
 /* ── 任务卡片 ───────────────────────────────────────────── */
-.ant-card {
-  border-color: var(--hy-border) !important;
-  background: rgba(20, 24, 35, .88) !important;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, .18);
-  backdrop-filter: blur(8px);
-}
-.ant-card-head { min-height: 58px !important; border-bottom-color: var(--hy-border) !important; }
-
-.task-heading { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.task-heading > div:first-child { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.task-heading .ant-typography { margin: 0 !important; }
-.task-heading h4.ant-typography { font-size: 16px !important; }
-
-/* 两个场景等宽并列；窄屏下堆叠 */
-.scenario-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-@media (max-width: 1080px) {
-  .scenario-grid { grid-template-columns: minmax(0, 1fr); }
-  .hero { grid-template-columns: minmax(0, 1fr); align-items: start; }
-  .header-stats { display: none !important; }
-}
-
-.scenario {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px;
+.task-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px 13px;
   border: 1px solid var(--hy-border);
   border-radius: 12px;
-  background: var(--hy-panel);
-  /* 顶部一条 3px 色带就是场景标识，比图标更快辨认 */
-  border-top: 3px solid transparent;
+  background: rgba(20, 24, 35, .88);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, .18);
+  backdrop-filter: blur(8px);
+  container-type: inline-size;
 }
-.scenario.playback { border-top-color: var(--hy-info); background: linear-gradient(180deg, rgba(56, 189, 248, .07), transparent 120px), var(--hy-panel); }
-.scenario.cache { border-top-color: var(--hy-accent-2); background: linear-gradient(180deg, rgba(155, 123, 255, .07), transparent 120px), var(--hy-panel); }
+.task-card.paused { opacity: .82; }
 
-.scenario-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.scenario-title small { color: var(--hy-muted); font: 600 9px ui-monospace, monospace; letter-spacing: 1.6px; }
-.scenario-title h3 { margin: 3px 0 0; font-size: 16px; letter-spacing: -.2px; }
-.scenario-title p { margin: 5px 0 0; color: #7e899e; font-size: 12px; line-height: 1.5; }
-
-/* 关键读数用等宽数字，1s 轮询刷新时不会左右抖 */
-.scenario-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: auto; }
-.scenario-metrics span {
-  display: grid;
-  gap: 2px;
-  padding: 9px 11px;
-  border: 1px solid var(--hy-border);
-  border-radius: 9px;
-  background: rgba(10, 13, 20, .55);
+/* 统一的小标签样式：等宽、全大写、弱化 —— 读数本身才是主角。
+   nowrap 是必须的：`HIT-RATE` 一旦断成两行，那一格就比邻居高，整排都歪。 */
+.tc-cap {
+  color: var(--hy-muted);
+  font: 500 9.5px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: .9px;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
-.scenario-metrics b { font-size: 14px; font-variant-numeric: tabular-nums; }
-.scenario-metrics small { color: var(--hy-muted); font-size: 10px; letter-spacing: .4px; }
 
-/* 主按钮吃掉剩余宽度，清理按钮保持图标大小，不挤出卡片 */
-.scenario-actions { display: flex; gap: 8px; }
-.scenario-actions > .ant-btn:first-child { flex: 1; }
+.tc-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.tc-id {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--hy-panel-2);
+  color: var(--hy-muted);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+}
+.tc-name {
+  /* 名字和徽章一起让位，而不是名字先被削光：`min-width` 是它的下限 */
+  flex: 1 1 auto;
+  min-width: 4.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+.tc-name { cursor: default; }
+.tc-age { flex-shrink: 0; color: var(--hy-muted); font-size: 11px; }
 
-.proxy-link {
+/* 悬停任务名时的源提示：代理短链长得都一样，认任务得看它指向哪个文件 */
+.tc-hint { display: grid; gap: 3px; }
+.tc-hint-cap { color: rgba(255, 255, 255, .55); font-size: 10.5px; letter-spacing: .4px; }
+.tc-hint-url { font: 11px ui-monospace, SFMono-Regular, monospace; word-break: break-all; }
+/* 徽章靠右，并且是唯一允许被挤掉的东西：id 和名字必须始终可读 */
+.tc-badges { margin-left: auto; display: flex; gap: 4px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.tc-badges .ant-tag { margin: 0 !important; font-size: 10px; line-height: 17px; padding: 0 6px; }
+.tc-head .ant-btn { flex-shrink: 0; }
+
+.tc-url {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 4px 4px 11px;
+  gap: 8px;
+  padding: 6px 9px;
   border: 1px solid var(--hy-border);
-  border-radius: 9px;
+  border-radius: 8px;
   background: #0e1119;
+  color: var(--hy-info);
+  font: 11px ui-monospace, SFMono-Regular, monospace;
+  cursor: pointer;
+  transition: border-color .15s ease;
 }
-.proxy-link .ant-typography { flex: 1; min-width: 0; color: var(--hy-info) !important; font: 12px ui-monospace, SFMono-Regular, monospace; }
+.tc-url:hover { border-color: var(--hy-accent); }
+.tc-url > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-url .anticon { color: var(--hy-muted); }
 
-.activity { display: flex; align-items: center; gap: 6px; color: var(--hy-good); font-size: 11px; }
-.error-line {
-  padding: 8px 11px;
-  border: 1px solid rgba(248, 113, 113, .35);
-  border-radius: 9px;
-  background: rgba(248, 113, 113, .08);
-  color: #fca5a5;
-  font-size: 12px;
-  word-break: break-all;
+.tc-spark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: rgba(10, 13, 20, .55);
+}
+.tc-spark svg { margin-left: auto; }
+.tc-spark b { font: 600 12px ui-monospace, SFMono-Regular, monospace; font-variant-numeric: tabular-nums; }
+
+.tc-local { display: grid; gap: 4px; }
+.tc-progress { height: 4px; border-radius: 999px; background: var(--hy-panel-2); overflow: hidden; }
+.tc-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--hy-accent), var(--hy-info));
+  transition: width .3s ease;
 }
 
-/* 两列下方的通栏区域：强调两个场景写出的是同一份本地文件 */
-.shared-map { display: grid; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--hy-border); }
-.shared-map .field-heading span:first-child { color: #9fb0c9; font-size: 12px; }
+/* 落盘分布。每格一个区间，越亮表示落盘越多 —— 乱序下载时这张图比进度条有用得多 */
+.tc-heat { display: flex; gap: 1px; height: 9px; border-radius: 3px; overflow: hidden; background: var(--hy-panel-2); }
+.tc-heat > span { flex: 1; min-width: 0; transition: background .3s ease; }
+.tc-heat.empty { background: transparent; border: 1px dashed var(--hy-border); }
 
-/* 缓存分布热力条：每格一个分片区间，越亮表示落盘越多 */
+/* 六格读数。列宽自适应，窄卡片下自动折成两行，但每格永远对齐，
+   方便横向扫多个任务。 */
+/* 四格永远整齐：一行四个（常规卡片）或 2×2（很窄的卡片）。交给 auto-fit 会
+   排出 3+1 这种半空的一行，看着正是"密度不足"；所以按卡片自身宽度切，
+   而不是按视口——卡片宽度取决于当前分了几列。 */
+.tc-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+@container (min-width: 360px) {
+  .tc-metrics { grid-template-columns: repeat(4, 1fr); }
+}
+.tc-cell { min-width: 0; padding: 5px 8px; border-radius: 7px; background: rgba(10, 13, 20, .55); }
+.tc-val {
+  margin-top: 1px;
+  font: 600 12.5px ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tc-val small { margin-left: 4px; color: var(--hy-muted); font-size: 10px; font-weight: 400; }
+
+/* ── 按场景分组的操作条 ─────────────────────────────────── */
+.tc-scenarios { display: grid; gap: 6px; margin-top: 2px; padding-top: 9px; border-top: 1px dashed var(--hy-border); }
+
+.scenario-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  /* 左侧 2px 色带就是场景标识，比图标或标题更省地方 */
+  border-left: 2px solid transparent;
+  background: rgba(10, 13, 20, .5);
+}
+.scenario-bar.playback { border-left-color: var(--hy-info); }
+.scenario-bar.cache { border-left-color: var(--hy-accent-2); }
+.scenario-bar.cache.failed { border-left-color: #f87171; background: rgba(248, 113, 113, .08); }
+
+.scenario-label { display: flex; align-items: baseline; gap: 6px; min-width: 0; flex: 1; }
+.scenario-label .anticon { align-self: center; font-size: 12px; }
+.scenario-bar.playback .anticon { color: var(--hy-info); }
+.scenario-bar.cache .anticon { color: var(--hy-accent-2); }
+.scenario-label > span { flex-shrink: 0; font-size: 12px; font-weight: 600; }
+/* 活体状态行：唯一会被压缩的部分，按钮永远完整 */
+.scenario-label em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--hy-muted);
+  font-size: 11px;
+  font-style: normal;
+}
+.scenario-buttons { display: flex; gap: 5px; flex-shrink: 0; }
+.scenario-buttons .ant-btn { font-size: 12px; }
+
+@media (max-width: 1080px) {
+  .header-stats { display: none !important; }
+}
+@media (max-width: 520px) {
+  .task-list { grid-template-columns: minmax(0, 1fr); }
+  .scenario-bar { flex-wrap: wrap; }
+}
+
+/* 表单和弹窗里仍在用 antd Card（分卷编辑器、插件面板）；任务卡片已经不是 Card 了 */
+.ant-modal .ant-card,
+.ant-drawer .ant-card {
+  border-color: var(--hy-border) !important;
+  background: rgba(20, 24, 35, .88) !important;
+}
+
+/* 详情抽屉里的全尺寸落盘分布：比卡片上的压缩条高，每格带 tooltip */
 .cache-heat { display: flex; gap: 1px; height: 22px; border-radius: 6px; overflow: hidden; background: #0e1119; }
 .cache-heat > span { flex: 1; min-width: 0; transition: background .3s ease; }
 .cache-heat.empty { border: 1px dashed var(--hy-border); background: transparent; }

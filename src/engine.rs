@@ -1426,6 +1426,12 @@ impl Engine {
                         }
                         let room = (live_end - cursor + 1) as usize;
                         let take = room.min(b.len());
+                        // Publish the commitment *before* writing. A thief
+                        // splitting this claim right now reads this watermark
+                        // to pick its start offset, so the two never write the
+                        // same byte even though the write below is not atomic
+                        // with respect to the steal.
+                        claim.reserve(cursor + take as u64);
                         let slice = b.slice(0..take);
                         let slice = if transform_on_write {
                             self.transform_outgoing(cursor, slice)
