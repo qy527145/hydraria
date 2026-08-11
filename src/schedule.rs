@@ -181,6 +181,15 @@ pub struct Scheduler {
     req_end: u64,
     /// Where the ordered reader is. Drives the [`Strategy::Latency`] window.
     read_head: u64,
+    /// How far past `read_head` claims may reach, when set.
+    ///
+    /// Playback and whole-file caching share one scheduler, and the only thing
+    /// that separates them is this bound. Without it, latency mode's fallback
+    /// region is the entire request, so a reader that wants 4 MB in the middle
+    /// of a file quietly pulls all of it — which makes an explicit "cache the
+    /// whole file" action meaningless. `None` (caching) means the whole request
+    /// is fair game.
+    work_limit: Option<u64>,
     /// Current ceiling for automatically-sized claims, grown on success and
     /// halved on failure. See [`Scheduler::note_claim_outcome`].
     auto_target: u64,
@@ -214,6 +223,7 @@ impl Scheduler {
             req_start,
             req_end,
             read_head: req_start,
+            work_limit: None,
             auto_target: INITIAL_AUTO_CLAIM,
         };
         for &(s0, e0) in already_staged {
@@ -235,6 +245,75 @@ impl Scheduler {
     /// Move the reader position; re-derives the priority window.
     pub fn set_read_head(&mut self, offset: u64) {
         self.read_head = offset.clamp(self.req_start, self.req_end.saturating_add(1));
+    }
+    /// Switch scheduling policy without rebuilding live claims. A task-level
+    /// cache coordinator uses throughput mode while only background caching is
+    /// active, then flips to latency mode as soon as a playback reader seeks.
+    /// Existing requests are allowed to finish; every newly freed worker is
+    /// immediately assigned from the reader's critical window.
+    pub fn set_strategy(&mut self, strategy: Strategy) {
+        self.strategy = strategy;
+    }
+
+    /// Bound how far past the read head workers may claim, or lift the bound
+    /// with `None`. See [`Scheduler::work_limit`].
+    pub fn set_work_limit(&mut self, limit: Option<u64>) {
+        self.work_limit = limit.filter(|value| *value > 0);
+    }
+
+    /// Last byte workers may currently claim.
+    fn horizon(&self) -> u64 {
+        match self.work_limit {
+            Some(limit) => self
+                .read_head
+                .saturating_add(limit.saturating_sub(1))
+                .min(self.req_end),
+            None => self.req_end,
+        }
+    }
+
+    /// First byte workers may currently claim. A bounded (playback-only) pool
+    /// works strictly forward from the reader: bytes behind the read head were
+    /// either already delivered or skipped by a seek, so fetching them is not
+    /// what anybody is waiting for. Caching lifts the bound and sweeps the file
+    /// from the start.
+    fn floor(&self) -> u64 {
+        match self.work_limit {
+            Some(_) => self.read_head.max(self.req_start),
+            None => self.req_start,
+        }
+    }
+
+    /// Take back the live claims the reader won't reach soon, returning the
+    /// workers whose requests the caller should abort.
+    ///
+    /// A seek makes every in-flight request outside the new critical window
+    /// uninteresting: waiting for a 64 MiB throughput claim to come back before
+    /// the pool can serve the reader is exactly the stall latency mode exists to
+    /// avoid. Reclaiming at each claim's *cursor* keeps the bytes that already
+    /// landed — the earlier approach of aborting the whole pool and rebuilding
+    /// from the on-disk bitmap discarded everything still in flight, which
+    /// measured as roughly a fifth of a transfer being fetched twice.
+    pub fn reclaim_outside_window(&mut self, window: u64) -> Vec<usize> {
+        let hi = self.read_head.saturating_add(window.max(1));
+        let mut reclaimed = Vec::new();
+        let mut i = 0;
+        while i < self.live.len() {
+            let cursor = self.live[i].cursor.load(Ordering::Relaxed);
+            let end = self.live[i].end.load(Ordering::Relaxed);
+            // Keep claims that are finished (the worker is about to report in)
+            // or that overlap the window the reader cares about.
+            let done = cursor > end;
+            let overlaps = cursor < hi && end >= self.read_head;
+            if done || overlaps {
+                i += 1;
+                continue;
+            }
+            let live = self.live.remove(i);
+            reclaimed.push(live.worker);
+            self.insert_unclaimed(cursor, end);
+        }
+        reclaimed
     }
 
     /// Feed a completed claim's outcome back into automatic sizing.
@@ -269,9 +348,13 @@ impl Scheduler {
     /// do — neither unclaimed work nor a live claim big enough to split.
     pub fn claim(&mut self, worker: usize) -> Option<Claim> {
         // Regions in priority order. Latency mode looks in the critical window
-        // first; both modes then fall back to the whole request.
+        // first; both modes then fall back to everything up to the horizon,
+        // which equals the whole request unless a playback-only coordinator has
+        // bounded how far ahead the pool may run.
+        let horizon = self.horizon();
+        let floor = self.floor();
         let regions: Vec<(u64, u64)> = match self.strategy {
-            Strategy::Throughput => vec![(self.req_start, self.req_end)],
+            Strategy::Throughput => vec![(floor, horizon)],
             Strategy::Latency {
                 critical_window, ..
             } => {
@@ -286,14 +369,11 @@ impl Scheduler {
                 let depth = (self.max_threads as u64)
                     .saturating_mul(self.auto_target.max(MIN_CLAIM));
                 let window = critical_window.max(depth).max(1);
-                let hi = self
-                    .read_head
-                    .saturating_add(window - 1)
-                    .min(self.req_end);
+                let hi = self.read_head.saturating_add(window - 1).min(horizon);
                 if self.read_head <= hi {
-                    vec![(self.read_head, hi), (self.req_start, self.req_end)]
+                    vec![(self.read_head, hi), (floor, horizon)]
                 } else {
-                    vec![(self.req_start, self.req_end)]
+                    vec![(floor, horizon)]
                 }
             }
         };
@@ -816,6 +896,90 @@ mod tests {
         // Window exhausted → opportunistic prefetch from the earliest gap.
         let c = s.claim(2).unwrap();
         assert_eq!(c.start, 0, "prefetch starts at the earliest gap");
+    }
+
+    /// Playback-only: the pool must stay inside the horizon ahead of the reader
+    /// instead of falling back to the whole file. Without this bound, watching a
+    /// few megabytes quietly downloads everything and the explicit "cache the
+    /// whole file" action means nothing.
+    #[test]
+    fn a_work_limit_keeps_the_pool_ahead_of_the_reader() {
+        let mut s = Scheduler::new(
+            0,
+            100 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 2 * MIN_CLAIM,
+                head_claim: MIN_CLAIM,
+            },
+            None,
+            1,
+            4,
+            Some(MIN_CLAIM),
+            &[],
+        );
+        s.set_read_head(50 * MIN_CLAIM);
+        s.set_work_limit(Some(4 * MIN_CLAIM));
+        // Four 1 MiB claims cover [50, 54); after that there is nothing left
+        // inside the horizon, and nothing behind the reader may be taken.
+        for i in 0..4 {
+            let c = s.claim(i).unwrap();
+            assert_eq!(c.start, (50 + i as u64) * MIN_CLAIM);
+        }
+        assert!(
+            s.claim(9).is_none(),
+            "a bounded pool must not wander outside the reader's horizon",
+        );
+    }
+
+    #[test]
+    fn lifting_the_work_limit_opens_up_the_whole_file() {
+        let mut s = sched(Strategy::Throughput, 1, Some(MIN_CLAIM));
+        s.set_read_head(50 * MIN_CLAIM);
+        s.set_work_limit(Some(MIN_CLAIM));
+        let inside = s.claim(0).unwrap();
+        assert_eq!(inside.start, 50 * MIN_CLAIM);
+        assert!(s.claim(1).is_none(), "horizon is one claim deep");
+        // Pressing "cache" lifts the bound: the rest of the file, including
+        // everything before the reader, becomes fair game again.
+        s.set_work_limit(None);
+        assert_eq!(s.claim(1).unwrap().start, 0);
+    }
+
+    /// A seek hands back the requests the reader won't reach, and keeps the
+    /// bytes those requests already delivered — that difference is what stops a
+    /// seek from re-fetching data the pool had already paid for.
+    #[test]
+    fn reclaiming_outside_the_window_keeps_delivered_bytes() {
+        let mut s = sched(Strategy::Throughput, 4, Some(4 * MIN_CLAIM));
+        warm_to(&mut s, 4 * MIN_CLAIM);
+        let far = s.claim(0).unwrap();
+        let near = s.claim(1).unwrap();
+        assert_eq!(far.start, 0);
+        // Worker 0 delivered the first megabyte of its claim before the seek.
+        far.advance_to(MIN_CLAIM);
+
+        s.set_read_head(near.start);
+        let stale = s.reclaim_outside_window(MIN_CLAIM);
+        assert_eq!(stale, vec![0], "only the far worker is reclaimed");
+
+        // The delivered megabyte is not back on the unclaimed list; the rest is.
+        let replacement = s.claim(0).unwrap();
+        assert_eq!(
+            replacement.start, MIN_CLAIM,
+            "refetching starts at the cursor, not at the claim's start",
+        );
+    }
+
+    #[test]
+    fn reclaiming_leaves_the_reader_s_own_requests_alone() {
+        let mut s = sched(Strategy::Throughput, 4, Some(4 * MIN_CLAIM));
+        warm_to(&mut s, 4 * MIN_CLAIM);
+        let first = s.claim(0).unwrap();
+        s.set_read_head(first.start);
+        assert!(
+            s.reclaim_outside_window(8 * MIN_CLAIM).is_empty(),
+            "a claim overlapping the window must not be cancelled",
+        );
     }
 
     #[test]

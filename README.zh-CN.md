@@ -145,9 +145,18 @@ curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
 
 暂停后 `GET /stream/:task_id` 返回 `503 Service Unavailable`，任务配置 + 缓存保持不变。恢复后翻回正常。两者都返回当前 `TaskInfo`。
 
+#### `POST /api/tasks/:task_id/cache` 与 `…/cache/pause`
+
+把整个文件补齐到本地缓存，以及随时暂停这件事。与代理播放共用同一份稀疏文件和
+同一组线程：播放已经拉下来的分片不会重复下载，暂停缓存也不影响正在播放的连接。
+两者都返回当前的 `cache_job`（状态、进度、速度、并行线程数、活跃读取者数）。
+
+`POST …/cache` 是幂等的：已在缓存中就什么都不做，已缓存完整文件则直接回 `done`。
+
 #### `DELETE /api/tasks/:task_id/cache`
 
 清空该任务在盘上的缓存（稀疏文件 + 位图 + meta），任务本身保留。返回 `204`。
+缓存键由 URL 列表派生，因此同源的其他任务也会一并停止写入。
 
 #### `GET /api/settings` · `PUT /api/settings`
 

@@ -144,6 +144,12 @@ pub struct CacheEntry {
     /// between "availability came back 0" and "await" leaves the receiver
     /// behind, so `changed()` returns immediately instead of sleeping.
     progress: tokio::sync::watch::Sender<u64>,
+    /// Serializes the bitmap's write-then-rename. Concurrent writers used to
+    /// stage into one shared `bitmap.bin.tmp`, so whichever renamed second found
+    /// its temp file already consumed and failed with ENOENT — which the caller
+    /// treats as "lost the backing file" and turns into a failed job. Held only
+    /// across the two filesystem calls, never while fetching.
+    persist: Mutex<()>,
     /// True for ephemeral staging entries. Skips `persist_bitmap` (the
     /// directory is deleted once the last reader drops, so there is nothing
     /// to resume from) and marks the entry for removal by `release_staging`.
@@ -335,6 +341,7 @@ impl CacheEntry {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             progress: tokio::sync::watch::Sender::new(0),
+            persist: Mutex::new(()),
             ephemeral,
             meta: desired,
         }))
@@ -452,9 +459,15 @@ impl CacheEntry {
     }
 
     fn persist_bitmap(&self) -> std::io::Result<()> {
+        // One writer at a time, and a process-scoped temp name so two instances
+        // sharing a cache directory can't consume each other's staging file
+        // either. See the `persist` field for what the shared name cost us.
+        let _guard = self.persist.lock();
         let bm = self.bitmap.lock().clone();
         let path = self.root.join("bitmap.bin");
-        let tmp = self.root.join("bitmap.bin.tmp");
+        let tmp = self
+            .root
+            .join(format!("bitmap.bin.{}.tmp", std::process::id()));
         std::fs::write(&tmp, &bm)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())

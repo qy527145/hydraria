@@ -1,0 +1,235 @@
+/* Hydraria 控制台样式。
+   界面只围绕两个场景组织：代理播放（蓝）与完整缓存（紫），
+   两者在同一张任务卡片里左右并列，视觉上强调它们共享同一份本地数据。 */
+:root {
+  color-scheme: dark;
+  --hy-bg: #0a0c12;
+  --hy-panel: #141823;
+  --hy-panel-2: #1b202c;
+  --hy-border: #262c3a;
+  --hy-text: #e8ecf3;
+  --hy-muted: #6b7689;
+  --hy-accent: #6ea8ff;
+  --hy-accent-2: #9b7bff;
+  --hy-info: #38bdf8;
+  --hy-good: #4ade80;
+  --hy-warn: #fbbf24;
+}
+
+* { box-sizing: border-box; }
+
+html { min-width: 360px; overflow-y: scroll; background: var(--hy-bg); }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--hy-text);
+  background:
+    radial-gradient(1100px 620px at 6% -14%, rgba(49, 68, 115, .45), transparent 62%),
+    radial-gradient(880px 520px at 106% 4%, rgba(81, 43, 124, .38), transparent 62%),
+    var(--hy-bg);
+  background-attachment: fixed;
+}
+
+body > #root { min-height: 100vh; }
+button, input { font: inherit; }
+
+/* ── 外壳与顶栏 ─────────────────────────────────────────── */
+.app-shell { min-height: 100vh; background: transparent !important; }
+
+.app-header {
+  height: 72px !important;
+  padding: 0 28px !important;
+  display: grid !important;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 24px;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  border-bottom: 1px solid rgba(61, 72, 94, .65);
+  background: rgba(10, 12, 18, .78) !important;
+  backdrop-filter: blur(18px) saturate(130%);
+}
+
+.brand { display: flex; align-items: center; gap: 11px; }
+.brand-logo {
+  width: 36px; height: 36px;
+  display: grid; place-items: center;
+  border-radius: 9px;
+  color: #090b10;
+  font-size: 19px;
+  background: linear-gradient(135deg, var(--hy-accent), var(--hy-accent-2));
+  box-shadow: 0 8px 24px rgba(110, 168, 255, .28);
+}
+.brand > span:last-child { display: grid; line-height: 1.05; }
+.brand b { font-size: 14px; letter-spacing: 2.4px; font-weight: 700; }
+.brand small { margin-top: 5px; color: var(--hy-muted); font-size: 8px; letter-spacing: 1.4px; }
+
+/* 顶栏三个吞吐指标：等宽数字，避免读数跳动时布局抖动 */
+.header-stats { display: flex; justify-content: center; gap: 30px; }
+.header-stats .ant-statistic-title { margin-bottom: 2px !important; color: var(--hy-muted) !important; font-size: 10px; letter-spacing: .8px; text-transform: uppercase; }
+.header-stats .ant-statistic-content { font-size: 15px !important; font-variant-numeric: tabular-nums; }
+
+/* ── 页面骨架 ───────────────────────────────────────────── */
+.page { width: min(1320px, calc(100% - 48px)); margin: 0 auto; padding: 28px 0 56px; }
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 330px);
+  align-items: end;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+.hero span {
+  color: var(--hy-accent);
+  font: 600 10px ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 1.8px;
+}
+.hero h1 { margin: 6px 0 0; font-size: clamp(24px, 3vw, 33px); line-height: 1.15; letter-spacing: -.6px; }
+.hero p { max-width: 640px; margin: 8px 0 0; color: #7e899e; }
+
+.loading { display: block; margin: 96px auto; }
+.task-list { display: grid; gap: 18px; }
+.page .ant-alert { margin-bottom: 18px; }
+.page .ant-empty { padding: 72px 0; }
+
+/* ── 任务卡片 ───────────────────────────────────────────── */
+.ant-card {
+  border-color: var(--hy-border) !important;
+  background: rgba(20, 24, 35, .88) !important;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .18);
+  backdrop-filter: blur(8px);
+}
+.ant-card-head { min-height: 58px !important; border-bottom-color: var(--hy-border) !important; }
+
+.task-heading { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.task-heading > div:first-child { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.task-heading .ant-typography { margin: 0 !important; }
+.task-heading h4.ant-typography { font-size: 16px !important; }
+
+/* 两个场景等宽并列；窄屏下堆叠 */
+.scenario-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 1080px) {
+  .scenario-grid { grid-template-columns: minmax(0, 1fr); }
+  .hero { grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .header-stats { display: none !important; }
+}
+
+.scenario {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--hy-border);
+  border-radius: 12px;
+  background: var(--hy-panel);
+  /* 顶部一条 3px 色带就是场景标识，比图标更快辨认 */
+  border-top: 3px solid transparent;
+}
+.scenario.playback { border-top-color: var(--hy-info); background: linear-gradient(180deg, rgba(56, 189, 248, .07), transparent 120px), var(--hy-panel); }
+.scenario.cache { border-top-color: var(--hy-accent-2); background: linear-gradient(180deg, rgba(155, 123, 255, .07), transparent 120px), var(--hy-panel); }
+
+.scenario-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.scenario-title small { color: var(--hy-muted); font: 600 9px ui-monospace, monospace; letter-spacing: 1.6px; }
+.scenario-title h3 { margin: 3px 0 0; font-size: 16px; letter-spacing: -.2px; }
+.scenario-title p { margin: 5px 0 0; color: #7e899e; font-size: 12px; line-height: 1.5; }
+
+/* 关键读数用等宽数字，1s 轮询刷新时不会左右抖 */
+.scenario-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: auto; }
+.scenario-metrics span {
+  display: grid;
+  gap: 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--hy-border);
+  border-radius: 9px;
+  background: rgba(10, 13, 20, .55);
+}
+.scenario-metrics b { font-size: 14px; font-variant-numeric: tabular-nums; }
+.scenario-metrics small { color: var(--hy-muted); font-size: 10px; letter-spacing: .4px; }
+
+/* 主按钮吃掉剩余宽度，清理按钮保持图标大小，不挤出卡片 */
+.scenario-actions { display: flex; gap: 8px; }
+.scenario-actions > .ant-btn:first-child { flex: 1; }
+
+.proxy-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 4px 4px 11px;
+  border: 1px solid var(--hy-border);
+  border-radius: 9px;
+  background: #0e1119;
+}
+.proxy-link .ant-typography { flex: 1; min-width: 0; color: var(--hy-info) !important; font: 12px ui-monospace, SFMono-Regular, monospace; }
+
+.activity { display: flex; align-items: center; gap: 6px; color: var(--hy-good); font-size: 11px; }
+.error-line {
+  padding: 8px 11px;
+  border: 1px solid rgba(248, 113, 113, .35);
+  border-radius: 9px;
+  background: rgba(248, 113, 113, .08);
+  color: #fca5a5;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* 两列下方的通栏区域：强调两个场景写出的是同一份本地文件 */
+.shared-map { display: grid; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--hy-border); }
+.shared-map .field-heading span:first-child { color: #9fb0c9; font-size: 12px; }
+
+/* 缓存分布热力条：每格一个分片区间，越亮表示落盘越多 */
+.cache-heat { display: flex; gap: 1px; height: 22px; border-radius: 6px; overflow: hidden; background: #0e1119; }
+.cache-heat > span { flex: 1; min-width: 0; transition: background .3s ease; }
+.cache-heat.empty { border: 1px dashed var(--hy-border); background: transparent; }
+
+.plugin-collapse { margin-top: 4px; }
+
+/* ── 表单 / 抽屉 / 弹窗 ─────────────────────────────────── */
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 720px) {
+  .form-grid, .form-grid.three { grid-template-columns: minmax(0, 1fr); }
+}
+
+.volumes { display: grid; gap: 10px; margin-bottom: 20px; }
+.volumes .ant-card { background: rgba(14, 17, 25, .9) !important; }
+.field-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 13px; }
+
+.settings-cache {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--hy-border);
+  border-radius: 10px;
+  background: rgba(14, 17, 25, .7);
+}
+
+.plugin-card { margin-bottom: 14px; }
+.plugin-card p { color: #7e899e; font-size: 12px; }
+.plugin-note { margin: 10px 0 0; color: var(--hy-muted) !important; font-size: 11px !important; }
+
+.config-json {
+  max-height: 320px;
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid var(--hy-border);
+  border-radius: 10px;
+  background: #0e1119;
+  color: #9fb0c9;
+  font: 11.5px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/* ── antd 组件微调 ─────────────────────────────────────── */
+.ant-btn { box-shadow: none !important; }
+.ant-btn-primary { color: #09101a !important; font-weight: 650; background: linear-gradient(135deg, var(--hy-accent), var(--hy-accent-2)) !important; border: 0 !important; }
+.ant-input, .ant-input-affix-wrapper, .ant-select-selector, .ant-input-number, .ant-input-number-input { background: #0e1119 !important; }
+.ant-tag { border: 0 !important; border-radius: 999px !important; padding-inline: 9px !important; }
+.ant-progress-text { color: var(--hy-muted) !important; font-variant-numeric: tabular-nums; }
+.ant-descriptions-item-label { color: var(--hy-muted) !important; }
+.ant-drawer-body { display: grid; gap: 6px; align-content: start; }
+.ant-drawer-body h5.ant-typography { margin: 18px 0 8px !important; }

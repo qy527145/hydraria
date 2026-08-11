@@ -155,6 +155,10 @@ impl Engine {
     pub(crate) fn volumes(&self) -> Option<Arc<Vec<VolumeMeta>>> {
         self.volumes.clone()
     }
+    /// Immutable task configuration used by the shared cache coordinator.
+    pub(crate) fn config(&self) -> &TaskConfig {
+        &self.config
+    }
 
     /// Plug in the task-shared set of URLs known to reject HEAD requests.
     /// `probe_one` reads this on entry to skip the HEAD round-trip and writes

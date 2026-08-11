@@ -435,6 +435,7 @@ hydraria download https://cdn.example.com/file.iso \
 | `PATCH /api/tasks/:id` | 部分更新（任意 TaskConfig 字段） |
 | `DELETE /api/tasks/:id` | 删除任务（缓存保留） |
 | `POST /api/tasks/:id/pause` · `…/resume` | 暂停/恢复 |
+| `POST /api/tasks/:id/cache` · `…/cache/pause` | 开始/暂停把整个文件补齐到缓存 |
 | `DELETE /api/tasks/:id/cache` | 清空该任务的磁盘缓存 |
 | `GET /api/tasks/:id/export` | 下载任务配置 JSON |
 | `POST /api/probe` | 一次性探测，返回 `{filename, total_size, content_type, accepts_ranges}` |

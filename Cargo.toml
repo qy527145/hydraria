@@ -5,6 +5,18 @@ edition = "2024"
 description = "High-performance multi-threaded HTTP streaming proxy with web dashboard"
 license = "Apache-2.0"
 repository = "https://github.com/qy527145/hydraria"
+# The dashboard is embedded from web/dist, which is committed so that
+# `cargo install` (crates.io or --git) never needs node/npm. After changing
+# anything under web/src, run `npm run build` in web/ and commit web/dist.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/web/dist/**",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/LICENSE",
+    "/docs/**",
+]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["macros"] }

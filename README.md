@@ -149,10 +149,22 @@ Pause makes `GET /stream/:task_id` return `503 Service Unavailable` while the
 task config + cache remain intact. Resume flips it back. Both return the
 current `TaskInfo`.
 
+#### `POST /api/tasks/:task_id/cache` and `…/cache/pause`
+
+Fill the whole file into the local cache, and pause that whenever you like.
+Both share one sparse file and one worker pool with proxied playback: ranges
+playback already pulled are never fetched twice, and pausing the fill leaves
+live playback connections untouched. Both return the current `cache_job`
+(state, progress, speed, worker count, active readers).
+
+`POST …/cache` is idempotent: a no-op while a fill is running, and an immediate
+`done` once the file is complete.
+
 #### `DELETE /api/tasks/:task_id/cache`
 
 Wipe this task's on-disk cache (sparse file + bitmap + meta). The task itself
-is kept. Returns `204`.
+is kept. Returns `204`. The cache key is derived from the URL list, so any other
+task pointing at the same content stops writing to it too.
 
 #### `GET /api/settings` · `PUT /api/settings`
 

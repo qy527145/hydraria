@@ -342,8 +342,8 @@ pub struct TaskInfo {
     pub url_health: Vec<UrlHealth>,
     pub current_speed_bps: u64,
     pub speed_samples: Vec<u64>,
-    /// Active (or last) server-side download job for this task, if any.
-    pub download: Option<crate::download::DownloadInfo>,
+    /// Active (or last) whole-file cache job for this task, if any.
+    pub cache_job: Option<crate::download::CacheJobInfo>,
 }
 
 /// Holds a task's live-connection gauge up for exactly as long as the response
@@ -714,12 +714,8 @@ impl AppState {
 
     pub fn task_info(&self, id: &str, entry: &TaskEntry) -> TaskInfo {
         let cfg = entry.config_snapshot();
-        let cache = if cfg.cache {
-            let key = crate::cache::CacheStore::key_for_task(&cfg);
-            self.cache.stats(&key)
-        } else {
-            None
-        };
+        let key = crate::cache::CacheStore::key_for_task(&cfg);
+        let cache = self.cache.stats(&key);
         let url_health: Vec<UrlHealth> = {
             // Look up each URL's volume size from the cached probe (if any),
             // so the dashboard can show "this URL is for a 1.2 GB volume"
@@ -763,7 +759,7 @@ impl AppState {
             url_health,
             current_speed_bps: entry.throughput.current(),
             speed_samples: entry.throughput.snapshot(),
-            download: self.downloads.info(id),
+            cache_job: self.downloads.info(id),
         }
     }
 

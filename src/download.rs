@@ -1,681 +1,549 @@
-//! Server-side download jobs: multi-threaded, out-of-order, straight to a file.
+//! Task-level persistent cache coordinator.
 //!
-//! The proxy's `/stream/:id` endpoint has to deliver bytes in order — it *is* an
-//! HTTP response body — so the byte the client is waiting for gates everything
-//! behind it. That constraint is fundamental to streaming and fine for playback,
-//! but it is exactly the wrong shape for "finish this file as fast as possible":
-//! one slow request at the read head stalls visible progress even when every
-//! other worker is delivering.
+//! Playback and explicit whole-file caching share one sparse [`CacheEntry`] and
+//! one worker pool, so neither ever refetches what the other already wrote.
+//! The two scenarios differ only in how the shared [`Scheduler`] is tuned:
 //!
-//! A download job drops the constraint entirely. Workers claim ranges, fetch
-//! them in any order, and `pwrite` at absolute offsets. Nothing reads the file
-//! until it is complete, so there is no head, no reorder buffer, and no memory
-//! that scales with concurrency — the same shape a dedicated downloader uses.
+//! * A playback reader puts it in latency mode, pins the critical window to the
+//!   reader's position, and bounds the pool to [`PLAYBACK_HORIZON`] bytes ahead
+//!   — watching part of a file must not quietly download all of it.
+//! * An explicit cache request lifts that bound (and drops back to throughput
+//!   mode once no reader is left), so the whole file is fair game.
 //!
-//! Almost all of the machinery already existed:
-//!
-//! * [`crate::schedule::Scheduler`] with [`Strategy::Throughput`] — claims, work
-//!   stealing, adaptive sizing, volume clipping.
-//! * [`Engine::fetch_claim`] — one request per claim, resume-in-place on
-//!   mid-stream failure, yields when its tail is stolen.
-//! * [`CacheEntry`] — sparse file plus block bitmap, persisted on every
-//!   completed block. Pointing one at a `.part` directory gives resume across
-//!   restarts for free, and `staged_ranges` tells a resuming scheduler exactly
-//!   what not to fetch again.
-
-use crate::cache::{CacheEntry, CacheMeta};
+//! Both can be on at once: the reader's window keeps priority while spare
+//! workers fill the rest of the file.
+use crate::cache::CacheEntry;
 use crate::engine::Engine;
 use crate::error::{ProxyError, Result};
 use crate::models::ThroughputSampler;
-use crate::schedule::{Scheduler, Strategy};
+use crate::schedule::{DEFAULT_CRITICAL_WINDOW, Scheduler, Strategy};
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-
-/// Speed history kept per job, matching the dashboard's sparkline width.
 const SPEED_SAMPLES: usize = 60;
-
-/// Prefix of the working directory a job keeps beside its output file. Lives
-/// *inside* the output directory on purpose: completing the download is then a
-/// same-filesystem `rename`, not a multi-gigabyte copy.
-const PART_PREFIX: &str = ".hydraria-part-";
-
-/// Guard against a pathological loop when deduplicating output filenames.
-const MAX_NAME_ATTEMPTS: u32 = 9999;
-
+const READ_CHUNK: u64 = crate::cache::BLOCK_SIZE;
+/// How far ahead of a playback reader the pool may work while caching is *not*
+/// requested. Large enough that a fast link stays saturated and the reader keeps
+/// a comfortable buffer, small enough that opening a 20 GB file doesn't pull the
+/// whole thing down behind the user's back.
+pub const PLAYBACK_HORIZON: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
+    Idle,
     Running,
     Paused,
     Done,
     Failed(String),
 }
-
 impl JobState {
     fn label(&self) -> &'static str {
         match self {
-            JobState::Running => "running",
-            JobState::Paused => "paused",
-            JobState::Done => "done",
-            JobState::Failed(_) => "failed",
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Done => "done",
+            Self::Failed(_) => "failed",
         }
     }
 }
-
-/// What the dashboard needs to render a job, in one poll.
 #[derive(Debug, Clone, Serialize)]
-pub struct DownloadInfo {
+pub struct CacheJobInfo {
     pub state: &'static str,
     pub error: Option<String>,
-    pub out_dir: String,
-    pub filename: String,
-    /// Final path, set once the job completes (may differ from `filename` if a
-    /// file of that name already existed).
-    pub output_path: Option<String>,
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub current_speed_bps: u64,
     pub speed_samples: Vec<u64>,
     pub threads: usize,
-    /// Downsampled block bitmap — the UI renders it with the same heat strip it
-    /// already uses for cache coverage, which for an out-of-order download is a
-    /// genuinely useful picture of what's landed where.
+    pub active_readers: usize,
     pub bitmap_summary: Vec<u8>,
 }
-
-/// Everything needed to recreate a job after a restart. The bytes themselves
-/// are already on disk in the `.part` directory, so resuming costs nothing.
+/// Backward-compatible persisted shape. Old builds called these downloads and
+/// stored output fields; serde defaults let us read both forms while only the
+/// task id, worker count and running state matter to cache warming.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedDownload {
     pub task_id: String,
+    #[serde(default)]
     pub out_dir: String,
+    #[serde(default)]
     pub filename: String,
+    #[serde(default)]
     pub threads: usize,
-    /// Whether the job was running when we last saved. Paused jobs stay paused.
     #[serde(default)]
     pub was_running: bool,
 }
+/// The shared worker pool. One slot per configured thread; a slot stays
+/// occupied until its task retires, so a slot is never staffed twice and the
+/// scheduler can rely on one live claim per worker id.
+struct Workers {
+    /// Bumped to tell the current tasks to stop taking new claims.
+    generation: u64,
+    handles: Vec<Option<Slot>>,
+}
 
-pub struct DownloadJob {
+struct Slot {
+    /// Generation this task was started for; a task only clears its own slot.
+    generation: u64,
+    handle: AbortHandle,
+}
+
+impl Workers {
+    fn new(threads: usize) -> Self {
+        Self {
+            generation: 1,
+            handles: (0..threads).map(|_| None).collect(),
+        }
+    }
+}
+
+pub struct CacheJob {
     pub task_id: String,
-    pub out_dir: PathBuf,
-    pub filename: String,
-    pub total_size: u64,
-    pub threads: usize,
-    /// `.part` working file: sparse data + durable block bitmap.
-    part: Arc<CacheEntry>,
+    total_size: u64,
+    threads: usize,
     engine: Arc<Engine>,
+    entry: Arc<CacheEntry>,
     scheduler: Mutex<Scheduler>,
-    /// Abort handles rather than `JoinHandle`s: pausing has to cancel in-flight
-    /// requests (dropping the future is the only way to release the socket)
-    /// while a separate supervisor awaits the same tasks to detect completion.
-    aborts: Mutex<Vec<AbortHandle>>,
+    workers: Mutex<Workers>,
     state: Mutex<JobState>,
-    output_path: Mutex<Option<PathBuf>>,
-    /// Set by `pause`/`cancel` so a worker between claims exits promptly
-    /// instead of picking up more work.
-    stopping: AtomicBool,
+    cache_requested: AtomicBool,
+    /// Live playback readers by id, each holding its current read offset.
+    readers: RwLock<HashMap<u64, u64>>,
+    next_reader: AtomicU64,
     failures: AtomicUsize,
     failure_budget: usize,
-    /// Bumped by every `start`. A supervisor only acts on the generation it was
-    /// spawned for — otherwise a quick pause→resume could let the *previous*
-    /// supervisor wake up, see the freshly-set `Running`, find the file
-    /// incomplete, and wrongly fail a job that is running fine.
-    generation: AtomicU64,
-    /// `done_bytes()` as of the previous tick, so the speed gauge can be a
-    /// delta of bytes actually on disk. Counting only at claim completion made
-    /// the reading useless: mostly 0 B/s with a spike each time a large claim
-    /// landed (observed 0.00 / 0.00 / 63.85 MB/s on a job averaging ~4 MB/s).
     last_done_bytes: AtomicU64,
     current_speed_bps: AtomicU64,
     throughput: Arc<ThroughputSampler>,
     last_sample: Mutex<Instant>,
 }
-
-impl DownloadJob {
-    /// Working directory for `task_id` under `out_dir`.
-    pub fn part_dir(out_dir: &Path, task_id: &str) -> PathBuf {
-        out_dir.join(format!("{PART_PREFIX}{task_id}"))
-    }
-
-    /// Open (or reopen, after a restart) a job's `.part` file and build its
-    /// scheduler seeded with whatever is already on disk.
-    ///
-    /// `meta` carries the upstream's identity — a changed ETag or size makes
-    /// `CacheEntry::open_at` wipe the partial rather than stitch new bytes into
-    /// stale ones.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        engine: Arc<Engine>,
-        task_id: String,
-        out_dir: PathBuf,
-        filename: String,
-        meta: CacheMeta,
-        threads: usize,
-    ) -> Result<Arc<Self>> {
-        let total_size = meta.total_size;
+impl CacheJob {
+    pub fn new(task_id: String, engine: Arc<Engine>, entry: Arc<CacheEntry>) -> Result<Arc<Self>> {
+        let total_size = entry.meta.total_size;
         if total_size == 0 {
-            return Err(ProxyError::Internal(
-                "cannot download a zero-length or unknown-size upstream".into(),
-            ));
+            return Err(ProxyError::Internal("cannot cache an unknown-size upstream".into()));
         }
-        std::fs::create_dir_all(&out_dir).map_err(ProxyError::Io)?;
-        let part_dir = Self::part_dir(&out_dir, &task_id);
-        let part = CacheEntry::open_at(part_dir, &task_id, meta, false)?;
-
-        let threads = threads.max(1);
-        let resumed: u64 = part
-            .staged_ranges(0, total_size - 1)
-            .iter()
-            .map(|&(s, e)| e - s + 1)
-            .sum();
-        let scheduler = build_scheduler(&part, &engine, total_size, threads);
-        if resumed > 0 {
-            tracing::info!(
-                "download task={} resuming with {} of {} bytes already on disk",
-                task_id,
-                resumed,
-                total_size,
-            );
-        }
-
+        let threads = engine.config().max_threads.max(1);
+        let scheduler = build_scheduler(&entry, &engine, total_size, threads, Strategy::Throughput);
+        let complete = entry.contiguous_from(0, total_size) >= total_size;
+        let initial_done = entry.bytes_cached.load(Ordering::Relaxed);
         Ok(Arc::new(Self {
             task_id,
-            out_dir,
-            filename,
             total_size,
             threads,
-            part,
             engine,
+            entry,
             scheduler: Mutex::new(scheduler),
-            aborts: Mutex::new(Vec::new()),
-            state: Mutex::new(JobState::Paused),
-            output_path: Mutex::new(None),
-            stopping: AtomicBool::new(false),
+            workers: Mutex::new(Workers::new(threads)),
+            state: Mutex::new(if complete { JobState::Done } else { JobState::Idle }),
+            cache_requested: AtomicBool::new(false),
+            readers: RwLock::new(HashMap::new()),
+            next_reader: AtomicU64::new(1),
             failures: AtomicUsize::new(0),
             failure_budget: threads.saturating_mul(2).max(8),
-            generation: AtomicU64::new(0),
-            last_done_bytes: AtomicU64::new(0),
+            last_done_bytes: AtomicU64::new(initial_done),
             current_speed_bps: AtomicU64::new(0),
             throughput: Arc::new(ThroughputSampler::new(SPEED_SAMPLES)),
             last_sample: Mutex::new(Instant::now()),
         }))
     }
-
-    pub fn state(&self) -> JobState {
-        self.state.lock().clone()
+    pub fn entry(&self) -> Arc<CacheEntry> {
+        Arc::clone(&self.entry)
     }
-
-    pub fn done_bytes(&self) -> u64 {
-        self.part.bytes_cached.load(Ordering::Relaxed).min(self.total_size)
-    }
-
-    pub fn is_active(&self) -> bool {
-        matches!(self.state(), JobState::Running)
-    }
-
-    pub fn info(&self) -> DownloadInfo {
-        let st = self.state();
-        DownloadInfo {
-            state: st.label(),
-            error: match &st {
-                JobState::Failed(e) => Some(e.clone()),
-                _ => None,
-            },
-            out_dir: self.out_dir.to_string_lossy().into_owned(),
-            filename: self.filename.clone(),
-            output_path: self
-                .output_path
-                .lock()
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
+    pub fn info(&self) -> CacheJobInfo {
+        let state = self.state.lock().clone();
+        let stats = self.entry.stats();
+        CacheJobInfo {
+            state: state.label(),
+            error: match state { JobState::Failed(e) => Some(e), _ => None },
             total_bytes: self.total_size,
-            done_bytes: self.done_bytes(),
+            done_bytes: stats.bytes_cached.min(self.total_size),
             current_speed_bps: self.current_speed_bps.load(Ordering::Relaxed),
             speed_samples: self.throughput.snapshot(),
             threads: self.threads,
-            bitmap_summary: self.part.stats().bitmap_summary,
+            active_readers: self.readers.read().len(),
+            bitmap_summary: stats.bitmap_summary,
         }
     }
-
+    pub fn is_cache_active(&self) -> bool {
+        self.cache_requested.load(Ordering::Relaxed)
+    }
+    pub fn start_cache(self: &Arc<Self>) {
+        if self.entry.contiguous_from(0, self.total_size) >= self.total_size {
+            *self.state.lock() = JobState::Done;
+            self.cache_requested.store(false, Ordering::Relaxed);
+            return;
+        }
+        self.cache_requested.store(true, Ordering::Relaxed);
+        *self.state.lock() = JobState::Running;
+        self.failures.store(0, Ordering::Relaxed);
+        self.reset_speed_baseline();
+        self.retune();
+        self.ensure_workers();
+    }
+    /// Stop filling the rest of the file. Playback keeps running and keeps
+    /// filling around its own position, so the pool is re-bounded rather than
+    /// shut down whenever a reader is still attached.
+    pub fn pause_cache(self: &Arc<Self>) {
+        self.cache_requested.store(false, Ordering::Relaxed);
+        {
+            let mut state = self.state.lock();
+            if !matches!(*state, JobState::Done) {
+                *state = JobState::Paused;
+            }
+        }
+        if self.readers.read().is_empty() {
+            self.drain_workers();
+        } else {
+            // A reader is still attached: re-bound the pool to its horizon and
+            // let the in-flight claims land (their bytes are already paid for).
+            // The draining workers restaff themselves under the new bound.
+            self.retune();
+            self.drain_workers();
+            self.ensure_workers();
+        }
+    }
+    pub fn stop(&self) {
+        self.cache_requested.store(false, Ordering::Relaxed);
+        self.abort_workers();
+    }
     pub fn to_persisted(&self) -> PersistedDownload {
         PersistedDownload {
             task_id: self.task_id.clone(),
-            out_dir: self.out_dir.to_string_lossy().into_owned(),
-            filename: self.filename.clone(),
+            out_dir: String::new(),
+            filename: String::new(),
             threads: self.threads,
-            was_running: self.is_active(),
+            was_running: self.is_cache_active(),
         }
     }
-
-    /// Fold this second's bytes into the speed gauge. Driven by the app's
-    /// existing one-second ticker, same as `TaskEntry::tick_throughput`.
     pub fn tick_throughput(&self) {
         let now = Instant::now();
         let mut last = self.last_sample.lock();
         let elapsed = now.duration_since(*last).as_secs_f64().max(0.001);
         *last = now;
-        let done = self.done_bytes();
-        let prev = self.last_done_bytes.swap(done, Ordering::Relaxed);
-        // Block-granular (1 MiB) and monotonic, unlike a per-claim counter.
-        let bps = ((done.saturating_sub(prev)) as f64 / elapsed) as u64;
+        let done = self.entry.bytes_cached.load(Ordering::Relaxed).min(self.total_size);
+        let previous = self.last_done_bytes.swap(done, Ordering::Relaxed);
+        let bps = ((done.saturating_sub(previous)) as f64 / elapsed) as u64;
         self.throughput.push(bps);
-        // Report a short moving average, not the raw sample. Blocks complete in
-        // bursts — 16 workers each writing inside a 64 MiB claim finish blocks
-        // unevenly — so the instantaneous value alternates between 0 and large
-        // spikes on a job that is in fact moving steadily. The sparkline keeps
-        // the raw samples; the headline number should be readable.
-        self.current_speed_bps
-            .store(self.throughput.recent_mean(4), Ordering::Relaxed);
+        self.current_speed_bps.store(self.throughput.recent_mean(4), Ordering::Relaxed);
     }
-
-    /// Start (or restart) the worker pool. No-op when already running or
-    /// finished.
-    pub fn start(self: &Arc<Self>) {
-        {
-            let mut st = self.state.lock();
-            match &*st {
-                JobState::Running => return,
-                JobState::Done => return,
-                _ => *st = JobState::Running,
-            }
-        }
-        self.stopping.store(false, Ordering::Relaxed);
-        self.failures.store(0, Ordering::Relaxed);
-        // Seed the speed watermark with what's already present, so a resumed job
-        // doesn't report its entire recovered prefix as one tick of throughput.
-        self.last_done_bytes
-            .store(self.done_bytes(), Ordering::Relaxed);
-        *self.last_sample.lock() = Instant::now();
-        // Rebuild the scheduler from the bitmap on every start.
-        //
-        // Pausing aborts workers mid-claim, and an aborted worker never gets to
-        // hand its claim back — so its byte range would otherwise be stranded:
-        // neither unclaimed nor being fetched. A resumed job then runs out of
-        // work a few megabytes short and can never finish. The bitmap is the
-        // only authoritative answer to "what is actually on disk", so deriving
-        // the remaining work from it makes resume correct by construction,
-        // whether we're recovering from a pause, a crash, or a restart.
-        *self.scheduler.lock() = self.fresh_scheduler();
-
-        let mut handles = Vec::with_capacity(self.threads);
-        let mut aborts = Vec::with_capacity(self.threads);
-        for worker in 0..self.threads {
-            let me = Arc::clone(self);
-            let h = tokio::spawn(async move { me.run_worker(worker).await });
-            aborts.push(h.abort_handle());
-            handles.push(h);
-        }
-        *self.aborts.lock() = aborts;
-
-        // Supervisor: the workers all exit either because the file is complete,
-        // because they were aborted (pause/cancel), or because the failure
-        // budget blew. Joining them here is the only place that can tell those
-        // apart without racing.
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+    /// Add a playback reader. A fresh reader is a seek: point the scheduler at
+    /// the new position and hand back the in-flight requests that no longer
+    /// matter, so the pool converges on the reader within one request instead of
+    /// waiting out whatever it was already fetching.
+    pub fn stream(self: &Arc<Self>, start: u64, end: u64) -> mpsc::Receiver<Result<Bytes>> {
+        let id = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        self.readers.write().insert(id, start);
+        self.retune();
+        let stale = self
+            .scheduler
+            .lock()
+            .reclaim_outside_window(DEFAULT_CRITICAL_WINDOW);
+        self.respawn(&stale);
+        self.ensure_workers();
+        let (tx, rx) = mpsc::channel(8);
         let me = Arc::clone(self);
-        tokio::spawn(async move {
-            for h in handles {
-                let _ = h.await;
+        tokio::spawn(async move { me.run_reader(id, start, end, tx).await });
+        rx
+    }
+    /// Point the scheduler at whatever is currently going on: a reader present
+    /// means latency mode around the lowest read head, and the pool is bounded
+    /// to [`PLAYBACK_HORIZON`] unless the whole file was explicitly requested.
+    fn retune(&self) {
+        let head = self.readers.read().values().copied().min();
+        let mut scheduler = self.scheduler.lock();
+        match head {
+            Some(head) => {
+                scheduler.set_read_head(head);
+                scheduler.set_strategy(Strategy::latency_default());
+                scheduler.set_work_limit(if self.is_cache_active() {
+                    None
+                } else {
+                    Some(PLAYBACK_HORIZON)
+                });
             }
-            me.on_workers_finished(generation);
-        });
-        tracing::info!(
-            "download task={} started with {} workers ({} of {} bytes present)",
-            self.task_id,
-            self.threads,
-            self.done_bytes(),
-            self.total_size,
-        );
-    }
-
-    /// A scheduler covering exactly the bytes still missing from the `.part`
-    /// file, per its block bitmap.
-    fn fresh_scheduler(&self) -> Scheduler {
-        build_scheduler(&self.part, &self.engine, self.total_size, self.threads)
-    }
-
-    /// Stop fetching but keep the `.part` file so `start` can resume.
-    pub fn pause(&self) {
-        {
-            let mut st = self.state.lock();
-            if !matches!(&*st, JobState::Running) {
-                return;
-            }
-            *st = JobState::Paused;
-        }
-        self.abort_workers();
-        tracing::info!("download task={} paused", self.task_id);
-    }
-
-    /// Stop fetching and discard the partial data.
-    pub fn cancel(&self) {
-        *self.state.lock() = JobState::Paused;
-        self.abort_workers();
-        let dir = Self::part_dir(&self.out_dir, &self.task_id);
-        if dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                tracing::warn!("failed to remove part dir {}: {}", dir.display(), e);
+            None => {
+                scheduler.set_strategy(Strategy::Throughput);
+                scheduler.set_work_limit(None);
             }
         }
-        tracing::info!("download task={} cancelled, partial discarded", self.task_id);
     }
-
+    /// Fill every idle worker slot. Cheap and idempotent, so anything that
+    /// creates new work (a cache request, a reader that moved past its filled
+    /// horizon) can just call it. Slots still occupied by a draining task are
+    /// left alone — that task restaffs them when it retires.
+    fn ensure_workers(self: &Arc<Self>) {
+        if !self.is_cache_active() && self.readers.read().is_empty() {
+            return;
+        }
+        let mut workers = self.workers.lock();
+        let generation = workers.generation;
+        for worker in 0..self.threads {
+            if workers.handles[worker].is_some() {
+                continue;
+            }
+            let job = Arc::clone(self);
+            let handle = tokio::spawn(async move { job.run_worker(worker, generation).await });
+            workers.handles[worker] = Some(Slot {
+                generation,
+                handle: handle.abort_handle(),
+            });
+        }
+    }
+    /// Abort the listed workers' in-flight requests and start replacements.
+    /// Their claims must already have been handed back to the scheduler (see
+    /// [`Scheduler::reclaim_outside_window`]) — letting a worker keep writing a
+    /// range that is unclaimed again is exactly the duplicate work we're trying
+    /// to avoid, so here cancelling is the point.
+    fn respawn(self: &Arc<Self>, stale: &[usize]) {
+        if stale.is_empty() {
+            return;
+        }
+        let mut workers = self.workers.lock();
+        let generation = workers.generation;
+        for &worker in stale {
+            if let Some(slot) = workers.handles[worker].take() {
+                slot.handle.abort();
+            }
+            let job = Arc::clone(self);
+            let handle = tokio::spawn(async move { job.run_worker(worker, generation).await });
+            workers.handles[worker] = Some(Slot {
+                generation,
+                handle: handle.abort_handle(),
+            });
+        }
+    }
+    /// Stop handing out new claims, but let the requests already in flight land
+    /// in the cache.
+    ///
+    /// Those bytes are already paid for; cancelling the sockets throws away
+    /// everything that hadn't reached a block boundary and the next reader
+    /// fetches the same ranges again — measured at ~18 MB discarded per
+    /// disconnect with 8 workers. Bandwidth still stops within one claim, which
+    /// is what pausing has to mean in practice.
+    fn drain_workers(&self) {
+        let mut workers = self.workers.lock();
+        workers.generation = workers.generation.wrapping_add(1);
+    }
+    /// Hard cancel, for a job that is going away entirely (task deleted, cache
+    /// cleared, coordinator replaced) where landing more bytes is pointless.
     fn abort_workers(&self) {
-        self.stopping.store(true, Ordering::Relaxed);
-        for a in self.aborts.lock().drain(..) {
-            a.abort();
+        let mut workers = self.workers.lock();
+        workers.generation = workers.generation.wrapping_add(1);
+        for slot in workers.handles.iter_mut() {
+            if let Some(slot) = slot.take() {
+                slot.handle.abort();
+            }
         }
     }
-
-    async fn run_worker(self: Arc<Self>, worker: usize) {
+    /// Release the worker's slot on exit so it can be staffed again. Only the
+    /// task that owns the slot clears it, so a slot never holds two tasks.
+    fn retire(&self, worker: usize, generation: u64) {
+        let mut workers = self.workers.lock();
+        if workers.handles[worker]
+            .as_ref()
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            workers.handles[worker] = None;
+        }
+    }
+    fn reset_speed_baseline(&self) {
+        self.last_done_bytes.store(
+            self.entry.bytes_cached.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        *self.last_sample.lock() = Instant::now();
+    }
+    async fn run_worker(self: Arc<Self>, worker: usize, generation: u64) {
+        // `superseded` separates "a newer generation took over" from "nothing
+        // left to claim". Only the former restaffs the slot; doing it for the
+        // latter would spin, because the replacement finds nothing either.
+        let mut superseded = false;
         loop {
-            if self.stopping.load(Ordering::Relaxed) {
+            if self.workers.lock().generation != generation {
+                superseded = true;
                 break;
             }
             let claim = self.scheduler.lock().claim(worker);
             let Some(claim) = claim else { break };
-            // `transform_on_write = true`: the file on disk is the deliverable,
-            // so an encrypted task must land as plaintext.
-            let res = self
-                .engine
-                .fetch_claim(worker, &claim, &self.part, true)
-                .await;
+            let result = self.engine.fetch_claim(worker, &claim, &self.entry, false).await;
             self.scheduler.lock().finish(worker, claim.cursor());
-            match res {
+            match result {
                 Ok(()) => self.scheduler.lock().note_claim_outcome(true),
-                Err(e) => {
+                Err(error) => {
                     self.scheduler.lock().note_claim_outcome(false);
-                    let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::debug!(
-                        "download task={} worker={} claim failed ({}/{}): {}",
-                        self.task_id,
-                        worker,
-                        n,
-                        self.failure_budget,
-                        e,
-                    );
-                    if n >= self.failure_budget {
-                        *self.state.lock() = JobState::Failed(e.to_string());
-                        self.stopping.store(true, Ordering::Relaxed);
-                        break;
+                    let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if failures >= self.failure_budget {
+                        *self.state.lock() = JobState::Failed(error.to_string());
+                        self.cache_requested.store(false, Ordering::Relaxed);
+                        self.abort_workers();
+                        return;
                     }
                 }
             }
         }
-    }
-
-    /// Called once, after every worker of generation `generation` has exited.
-    fn on_workers_finished(&self, generation: u64) {
-        // A newer `start` has already superseded us — its own supervisor owns
-        // the outcome.
-        if self.generation.load(Ordering::Relaxed) != generation {
-            return;
-        }
-        // Pause / cancel / a blown failure budget already set the state; don't
-        // second-guess them.
-        if !matches!(&*self.state.lock(), JobState::Running) {
-            return;
-        }
-        let have = self.part.contiguous_from(0, self.total_size);
-        if have < self.total_size {
-            let msg = format!(
-                "workers exited with {have} of {} bytes fetched",
-                self.total_size
-            );
-            tracing::warn!("download task={} incomplete: {}", self.task_id, msg);
-            *self.state.lock() = JobState::Failed(msg);
-            return;
-        }
-        match self.finalize() {
-            Ok(path) => {
-                *self.output_path.lock() = Some(path.clone());
-                *self.state.lock() = JobState::Done;
-                tracing::info!(
-                    "download task={} complete → {}",
-                    self.task_id,
-                    path.display(),
-                );
+        self.retire(worker, generation);
+        if self.entry.contiguous_from(0, self.total_size) >= self.total_size {
+            self.cache_requested.store(false, Ordering::Relaxed);
+            let mut state = self.state.lock();
+            if !matches!(*state, JobState::Failed(_)) {
+                *state = JobState::Done;
             }
-            Err(e) => {
-                tracing::error!("download task={} finalize failed: {}", self.task_id, e);
-                *self.state.lock() = JobState::Failed(e.to_string());
-            }
+        } else if superseded {
+            // Demand may have outlived the generation we drained for — e.g. a
+            // reader arrived while this worker was landing its last claim.
+            self.ensure_workers();
         }
     }
-
-    /// Move the completed data file into place and tear down the `.part`
-    /// directory. The rename is within one filesystem (the part directory is a
-    /// child of the output directory), so it's atomic and instant regardless of
-    /// file size.
-    fn finalize(&self) -> Result<PathBuf> {
-        let dest = unique_path(&self.out_dir, &self.filename);
-        let src = self.part.data_path();
-        std::fs::rename(&src, &dest).map_err(ProxyError::Io)?;
-        let dir = Self::part_dir(&self.out_dir, &self.task_id);
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            // The payload is already safely in place; a leftover bookkeeping
-            // directory is worth a warning, not a failure.
-            tracing::warn!(
-                "download task={} left part dir behind ({}): {}",
-                self.task_id,
-                dir.display(),
-                e,
-            );
+    async fn run_reader(
+        self: Arc<Self>,
+        id: u64,
+        start: u64,
+        end: u64,
+        tx: mpsc::Sender<Result<Bytes>>,
+    ) {
+        let mut writes = self.entry.subscribe_progress();
+        let mut cursor = start;
+        while cursor <= end {
+            let want = (end - cursor + 1).min(READ_CHUNK);
+            let available = self.entry.contiguous_from(cursor, want);
+            if available == 0 {
+                // Nothing here yet. Aim the pool at this position and make sure
+                // it is running: a bounded playback pool retires its workers
+                // once the horizon is full, so the reader catching up is exactly
+                // what has to wake them again.
+                self.retune();
+                self.ensure_workers();
+                tokio::select! {
+                    changed = writes.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    _ = tx.closed() => break,
+                }
+                continue;
+            }
+            let entry = Arc::clone(&self.entry);
+            let lo = cursor;
+            let hi = cursor + available - 1;
+            let read = tokio::task::spawn_blocking(move || entry.read_range(lo, hi)).await;
+            let bytes = match read {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    let _ = tx.send(Err(ProxyError::Io(error))).await;
+                    break;
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(ProxyError::Internal(error.to_string()))).await;
+                    break;
+                }
+            };
+            let output = self.engine.transform_outgoing_public(cursor, bytes);
+            if tx.send(Ok(output)).await.is_err() {
+                break;
+            }
+            cursor += available;
+            self.readers.write().insert(id, cursor);
+            self.scheduler.lock().set_read_head(cursor);
         }
-        Ok(dest)
+        self.readers.write().remove(&id);
+        if self.readers.read().is_empty() {
+            if self.is_cache_active() {
+                // Last reader gone: back to sweeping the whole file at full width.
+                self.retune();
+                self.ensure_workers();
+            } else {
+                // Nobody is watching and nobody asked for the whole file. Stop
+                // taking new claims, but keep whatever is already on the wire —
+                // a player that reconnects (or a later cache request) reuses it.
+                self.drain_workers();
+            }
+        } else {
+            // Other readers remain; re-derive the head from the lowest of them.
+            self.retune();
+        }
     }
 }
-
-/// Scheduler covering the bytes `part` is still missing. The bitmap is the
-/// authority on what's on disk, which is what makes resume correct regardless
-/// of how the previous attempt ended.
 fn build_scheduler(
-    part: &CacheEntry,
+    entry: &CacheEntry,
     engine: &Engine,
     total_size: u64,
     threads: usize,
+    strategy: Strategy,
 ) -> Scheduler {
-    let already = part.staged_ranges(0, total_size - 1);
+    let already = entry.staged_ranges(0, total_size - 1);
     Scheduler::new(
-        0,
+       0,
         total_size - 1,
-        Strategy::Throughput,
+        strategy,
         engine.volumes(),
         threads,
-        threads,
-        None,
+        engine.config().max_per_volume.max(1),
+        Some(engine.config().max_split).filter(|value| *value > 0),
         &already,
     )
 }
-
 pub struct DownloadManager {
-    jobs: RwLock<HashMap<String, Arc<DownloadJob>>>,
+    jobs: RwLock<HashMap<String, Arc<CacheJob>>>,
 }
-
 impl Default for DownloadManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
-
 impl DownloadManager {
-    pub fn new() -> Self {
-        Self {
-            jobs: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn get(&self, task_id: &str) -> Option<Arc<DownloadJob>> {
+    pub fn new() -> Self { Self { jobs: RwLock::new(HashMap::new()) } }
+    pub fn get(&self, task_id: &str) -> Option<Arc<CacheJob>> {
         self.jobs.read().get(task_id).cloned()
     }
-
-    /// Register `job` for `task_id`, cancelling and replacing any predecessor.
-    pub fn insert(&self, job: Arc<DownloadJob>) {
-        let prev = self.jobs.write().insert(job.task_id.clone(), job);
-        if let Some(p) = prev {
-            p.pause();
+    pub fn insert(&self, job: Arc<CacheJob>) {
+        if let Some(previous) = self.jobs.write().insert(job.task_id.clone(), job) {
+            previous.stop();
         }
     }
-
-    /// Forget the job, leaving its `.part` data alone. Callers that want the
-    /// partial gone call `DownloadJob::cancel` first.
-    pub fn remove(&self, task_id: &str) -> Option<Arc<DownloadJob>> {
+    pub fn remove(&self, task_id: &str) -> Option<Arc<CacheJob>> {
         self.jobs.write().remove(task_id)
     }
-
-    pub fn info(&self, task_id: &str) -> Option<DownloadInfo> {
-        self.jobs.read().get(task_id).map(|j| j.info())
+    /// Detach every coordinator holding `key`, returning how many were stopped.
+    ///
+    /// The cache key is derived from a task's URL list, so two tasks pointing at
+    /// the same content share one entry — and clearing it has to stop *all* of
+    /// them. Stopping only the requesting task left the others writing into a
+    /// directory that no longer existed, which surfaced as the whole job failing
+    /// with ENOENT.
+    pub fn stop_for_key(&self, key: &str) -> usize {
+        let mut jobs = self.jobs.write();
+        let doomed: Vec<String> = jobs
+            .iter()
+            .filter(|(_, job)| job.entry().key == key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            if let Some(job) = jobs.remove(id) {
+                job.stop();
+            }
+        }
+        doomed.len()
     }
-
+    /// Detach every coordinator, for a global cache wipe.
+    pub fn stop_all(&self) {
+        for (_, job) in self.jobs.write().drain() {
+            job.stop();
+        }
+    }
+    pub fn info(&self, task_id: &str) -> Option<CacheJobInfo> {
+        self.jobs.read().get(task_id).map(|job| job.info())
+    }
     pub fn tick_throughput(&self) {
-        for j in self.jobs.read().values() {
-            j.tick_throughput();
-        }
+        for job in self.jobs.read().values() { job.tick_throughput(); }
     }
-
     pub fn persisted(&self) -> Vec<PersistedDownload> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|j| !matches!(j.state(), JobState::Done))
-            .map(|j| j.to_persisted())
+        self.jobs.read().values()
+            .filter(|job| job.is_cache_active() || matches!(*job.state.lock(), JobState::Paused))
+            .map(|job| job.to_persisted())
             .collect()
-    }
-}
-
-/// Split `name` into (stem, extension) for deduplication, treating a leading
-/// dot as part of the stem so `.bashrc` doesn't become `(1).bashrc`.
-fn split_ext(name: &str) -> (&str, Option<&str>) {
-    match name.rfind('.') {
-        Some(i) if i > 0 && i + 1 < name.len() => (&name[..i], Some(&name[i + 1..])),
-        _ => (name, None),
-    }
-}
-
-/// First free path for `filename` in `dir`, appending ` (1)`, ` (2)`, … as
-/// needed. Never returns a path that already exists — silently overwriting
-/// somebody's file is not an acceptable outcome of pressing "download".
-pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
-    let base = dir.join(filename);
-    if !base.exists() {
-        return base;
-    }
-    let (stem, ext) = split_ext(filename);
-    for n in 1..=MAX_NAME_ATTEMPTS {
-        let candidate = match ext {
-            Some(e) => dir.join(format!("{stem} ({n}).{e}")),
-            None => dir.join(format!("{stem} ({n})")),
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    // Pathological: ~10k collisions. Fall back to a name that can't collide
-    // with the numbered series rather than looping forever.
-    dir.join(format!("{stem}-{}", uuid::Uuid::new_v4().simple()))
-}
-
-/// Reduce a user- or upstream-supplied name to a single safe path component.
-/// Returns `None` when nothing usable is left.
-pub fn sanitize_filename(name: &str) -> Option<String> {
-    let cleaned: String = name
-        .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn scratch() -> PathBuf {
-        // Per-process counter rather than a timestamp — see the same note in
-        // `cache::tests::fresh_store`. Colliding scratch dirs made parallel
-        // tests delete each other's files.
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "hydraria-dl-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn unique_path_returns_the_plain_name_when_free() {
-        let d = scratch();
-        assert_eq!(unique_path(&d, "a.mkv"), d.join("a.mkv"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn unique_path_never_overwrites_an_existing_file() {
-        let d = scratch();
-        std::fs::write(d.join("movie.mkv"), b"x").unwrap();
-        assert_eq!(unique_path(&d, "movie.mkv"), d.join("movie (1).mkv"));
-        std::fs::write(d.join("movie (1).mkv"), b"x").unwrap();
-        assert_eq!(unique_path(&d, "movie.mkv"), d.join("movie (2).mkv"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn unique_path_handles_names_without_an_extension() {
-        let d = scratch();
-        std::fs::write(d.join("blob"), b"x").unwrap();
-        assert_eq!(unique_path(&d, "blob"), d.join("blob (1)"));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn split_ext_keeps_dotfiles_intact() {
-        assert_eq!(split_ext("a.mkv"), ("a", Some("mkv")));
-        assert_eq!(split_ext("archive.tar.gz"), ("archive.tar", Some("gz")));
-        assert_eq!(split_ext("blob"), ("blob", None));
-        // Leading dot is part of the stem, not an empty-stem extension.
-        assert_eq!(split_ext(".bashrc"), (".bashrc", None));
-        // Trailing dot has no extension after it.
-        assert_eq!(split_ext("weird."), ("weird.", None));
-    }
-
-    #[test]
-    fn sanitize_filename_strips_separators_and_traversal() {
-        assert_eq!(sanitize_filename("../../etc/passwd").as_deref(), Some("etcpasswd"));
-        assert_eq!(sanitize_filename("a/b\\c.mkv").as_deref(), Some("abc.mkv"));
-        assert_eq!(sanitize_filename("  spaced.mkv  ").as_deref(), Some("spaced.mkv"));
-        assert_eq!(sanitize_filename("..").as_deref(), None);
-        assert_eq!(sanitize_filename("   ").as_deref(), None);
-    }
-
-    #[test]
-    fn part_dir_is_a_child_of_the_output_dir() {
-        // Same-filesystem rename on completion depends on this.
-        let out = Path::new("/tmp/dls");
-        let p = DownloadJob::part_dir(out, "abc123");
-        assert_eq!(p.parent(), Some(out));
-        assert!(
-            p.file_name().unwrap().to_string_lossy().starts_with('.'),
-            "part dir should be hidden",
-        );
-    }
-
-    #[test]
-    fn job_state_labels_are_stable_for_the_api() {
-        assert_eq!(JobState::Running.label(), "running");
-        assert_eq!(JobState::Paused.label(), "paused");
-        assert_eq!(JobState::Done.label(), "done");
-        assert_eq!(JobState::Failed("x".into()).label(), "failed");
     }
 }
