@@ -210,7 +210,7 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 
 1. **Probe** — when a client connects, Hydraria first issues a `HEAD` for cheap metadata (Content-Type, Content-Length, ETag, Last-Modified) and then a `Range: bytes=0-0` `GET`. The 206 response from the GET is the only reliable signal that an origin actually supports byte ranges (many CDNs serve ranges but don't advertise `Accept-Ranges` on HEAD).
 2. **Cache check (if enabled)** — Hydraria opens (or rewires) the cache entry keyed by the SHA-256 of the URL list. A stored meta with a non-matching ETag/size is treated as stale and the on-disk state is wiped.
-3. **Claim** — the effective range `[start, end]` goes to the scheduler whole; there is no pre-computed plan, and a worker carves a range only when it asks for one. How big is adaptive (8 MiB to start, doubling on success and halving on failure, capped at 64 MiB); a non-zero `max_split` is a hard ceiling on top of that.
+3. **Claim** — the effective range `[start, end]` goes to the scheduler whole; there is no pre-computed plan, and a worker carves a range only when it asks for one. How big depends on the scenario: a download takes an even share of the work left (remaining ÷ free workers, largest-first, no probing), while playback sizes each claim by its distance from the read head — 2 MiB right at it, doubling outwards. Sizing only shrinks on evidence: a claim that times out having delivered nothing (the "materialize the whole range before sending a byte" relay shape) drops it to 8 MiB and records the ceiling. A non-zero `max_split` is a hard ceiling on every claim.
 4. **Pull** — one request per worker per range, written to the local file at its absolute offset. A shared end-watermark is the only preemption mechanism: when someone moves it inward, the worker retires cleanly at its next stream item, so no byte is ever fetched twice.
 5. **Stitch** — the ordered reader reads from that local file and drags the critical window along as it goes. Write order is irrelevant; only the reader cares about order.
 6. **Cache writeback** — for cache-enabled tasks, every byte received from upstream is `pwrite`-ed to the sparse cache file at its absolute offset. Block-completion is tracked via a per-block byte-counter; when a block is fully covered, its bit is flipped in the bitmap (which is fsync-rotated to disk).
@@ -222,7 +222,7 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 | --- | --- | --- | --- |
 | `urls` | `string[]` | required | Origin URLs. The same content must be available on each. |
 | `max_threads` | `int` | `8` | Maximum concurrent chunk fetchers per client connection. |
-| `max_split` | `int` or human string | `5M` | Size of each chunk. Smaller = faster failover & seek, more overhead. |
+| `max_split` | `int` or human string | `0` (auto) | Hard ceiling on one range request. `0` lets the scheduler size claims itself; a non-zero value caps every claim. |
 | `cache` | `bool` | `false` | Reserved for future on-disk caching. |
 | `headers` | `object<string,string>` | `{}` | Headers to attach to every upstream request. |
 | `name` | `string?` | `null` | Optional friendly name shown in the dashboard. |

@@ -383,7 +383,7 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
       <Form.Item
         name="max_split"
         label="分片大小"
-        tooltip="留空＝自适应：从 8 MiB 起步，一次成功翻倍、一次失败减半，上限 64 MiB。只有上游对单个 Range 的长度有特殊要求时才需要手填。"
+        tooltip="留空＝自动：下载按线程均分剩余量（大分片优先，不做试探），播放按离读头的距离从 2 MiB 起逐级翻倍。只有源站要攒齐整段才发第一个字节时才自动降到 8 MiB。手填则是所有分片的硬上限，只在上游对单个 Range 的长度有特殊要求时才需要。"
         extra="留空即可，除非源站对单次 Range 请求的长度有硬性要求"
         rules={[sizeRule(MIN_SPLIT, `手填时不能小于 ${formatBytes(MIN_SPLIT)}（留空表示自动）`)]}
       >

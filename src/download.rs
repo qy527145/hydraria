@@ -265,9 +265,11 @@ impl CacheJob {
         self.respawn(&dead);
     }
     /// Add a playback reader. A fresh reader is a seek: point the scheduler at
-    /// the new position and hand back the in-flight requests that no longer
-    /// matter, so the pool converges on the reader within one request instead of
-    /// waiting out whatever it was already fetching.
+    /// the new position and re-aim the whole pool at it — in-flight requests
+    /// that no longer matter (including the one the reader is stuck behind) are
+    /// handed back, and over-long ones are shortened. The pool converges on the
+    /// reader within one request instead of waiting out whatever a
+    /// throughput-sized claim was already fetching.
     pub fn stream(self: &Arc<Self>, start: u64, end: u64) -> mpsc::Receiver<Result<Bytes>> {
         let id = self.next_reader.fetch_add(1, Ordering::Relaxed);
         self.readers.write().insert(id, start);
@@ -275,7 +277,7 @@ impl CacheJob {
         let stale = self
             .scheduler
             .lock()
-            .reclaim_outside_window(DEFAULT_CRITICAL_WINDOW);
+            .refocus_on_reader(DEFAULT_CRITICAL_WINDOW);
         self.respawn(&stale);
         self.ensure_workers();
         let (tx, rx) = mpsc::channel(8);
@@ -329,7 +331,7 @@ impl CacheJob {
     }
     /// Abort the listed workers' in-flight requests and start replacements.
     /// Their claims must already have been handed back to the scheduler (see
-    /// [`Scheduler::reclaim_outside_window`]) — letting a worker keep writing a
+    /// [`Scheduler::refocus_on_reader`]) — letting a worker keep writing a
     /// range that is unclaimed again is exactly the duplicate work we're trying
     /// to avoid, so here cancelling is the point.
     fn respawn(self: &Arc<Self>, stale: &[usize]) {
@@ -406,15 +408,20 @@ impl CacheJob {
             let result = self.engine.fetch_claim(worker, &claim, &self.entry, false).await;
             self.scheduler.lock().finish(worker, claim.cursor());
             match result {
-                Ok(()) => self.scheduler.lock().note_claim_outcome(true),
+                Ok(()) => {
+                    self.scheduler.lock().note_claim_outcome(true, &claim);
+                }
                 Err(error) => {
-                    self.scheduler.lock().note_claim_outcome(false);
-                    let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    if failures >= self.failure_budget {
-                        *self.state.lock() = JobState::Failed(error.to_string());
-                        self.cache_requested.store(false, Ordering::Relaxed);
-                        self.abort_workers();
-                        return;
+                    // A failure the scheduler answers by cutting smaller claims
+                    // is its own to absorb — see `Scheduler::note_claim_outcome`.
+                    if self.scheduler.lock().note_claim_outcome(false, &claim) {
+                        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        if failures >= self.failure_budget {
+                            *self.state.lock() = JobState::Failed(error.to_string());
+                            self.cache_requested.store(false, Ordering::Relaxed);
+                            self.abort_workers();
+                            return;
+                        }
                     }
                 }
             }

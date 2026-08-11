@@ -1958,23 +1958,26 @@ impl StagedRun {
                 // Feed the failure into automatic claim sizing before anything
                 // else: an oversized claim against a staging relay shows up
                 // here as a read timeout, and shrinking is the only way out.
-                self.scheduler.lock().note_claim_outcome(false);
-                let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(
-                    "claim worker={} failed ({}/{}), auto_target now {} B: {}",
-                    worker,
-                    n,
-                    self.failure_budget,
-                    self.scheduler.lock().auto_target(),
-                    e,
-                );
-                if n >= self.failure_budget {
-                    *self.fatal.lock() = Some(e.to_string());
-                    self.bump();
-                    break;
+                // A failure the scheduler answers by cutting smaller claims is
+                // its own to absorb, so it doesn't reach the budget.
+                if self.scheduler.lock().note_claim_outcome(false, &claim) {
+                    let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::debug!(
+                        "claim worker={} failed ({}/{}), next claim now {} B: {}",
+                        worker,
+                        n,
+                        self.failure_budget,
+                        self.scheduler.lock().auto_claim_len(),
+                        e,
+                    );
+                    if n >= self.failure_budget {
+                        *self.fatal.lock() = Some(e.to_string());
+                        self.bump();
+                        break;
+                    }
                 }
             } else {
-                self.scheduler.lock().note_claim_outcome(true);
+                self.scheduler.lock().note_claim_outcome(true, &claim);
             }
             self.bump();
         }

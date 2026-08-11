@@ -46,10 +46,12 @@ pub struct TaskConfig {
     pub max_per_volume: usize,
     /// Upper bound on one upstream range request, or **0 for automatic**.
     ///
-    /// Automatic lets the scheduler size claims from the work remaining and the
-    /// number of free workers, with no ceiling — which is what allows a single
-    /// worker to pull hundreds of megabytes in one request and amortize a
-    /// multi-second per-request latency the way a dedicated downloader does.
+    /// Automatic lets the scheduler size claims per scenario: an even share of
+    /// the work remaining for a download — which is what allows a single worker
+    /// to pull hundreds of megabytes in one request and amortize a multi-second
+    /// per-request latency the way a dedicated downloader does — and a ladder
+    /// that grows with distance from the read head for playback. Neither has a
+    /// ceiling until an upstream earns one.
     /// A non-zero value is a hard cap, kept for upstreams that dislike long
     /// ranges (and so that pre-existing tasks behave exactly as before).
     #[serde(default = "default_split", deserialize_with = "deserialize_size")]

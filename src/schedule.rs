@@ -17,9 +17,10 @@
 //! * [`Strategy::Throughput`] — order-agnostic. Claims cover the request in
 //!   roughly `max_threads` equal parts, so every worker finishes around the
 //!   same time and the file is done as early as possible.
-//! * [`Strategy::Latency`] — a small critical window ahead of the reader gets
-//!   priority and deliberately *small* claims (short time-to-first-byte);
-//!   spare workers prefetch further out with large ones.
+//! * [`Strategy::Latency`] — the region ahead of the reader gets priority, and
+//!   claim size grows with distance from it: the shortest request we know how
+//!   to make right at the read head, doubling outwards as the runway in front
+//!   of the reader grows.
 //!
 //! Assignment follows the three-tier escalation from `design.md` §6.1, in cost
 //! order — each tier is only reached when the one above it has nothing to give:
@@ -100,41 +101,31 @@ const DUP_BUDGET_MAX: u64 = 32 * 1024 * 1024;
 /// reader we treat bytes as "needed now" rather than "nice to have".
 pub const DEFAULT_CRITICAL_WINDOW: u64 = 32 * 1024 * 1024;
 
-/// Default claim size inside the critical window. Small on purpose — the
-/// window's job is to get bytes to the player quickly, and a short range comes
-/// back sooner than a long one on essentially every upstream.
+/// Shortest claim [`Strategy::Latency`] will cut, used right at the read head.
+/// Small on purpose — the byte the player is waiting for is in this claim, and
+/// a short range comes back sooner than a long one on essentially every
+/// upstream. Claims further out grow with their distance from the head
+/// ([`Scheduler::claim_len`]).
 pub const DEFAULT_HEAD_CLAIM: u64 = 2 * 1024 * 1024;
 
-/// Where automatic claim sizing starts before anything is known about the
-/// upstream. See [`Scheduler::note_claim_outcome`] for why it starts modest
-/// instead of jumping straight to an even split of the request.
-pub const INITIAL_AUTO_CLAIM: u64 = 8 * 1024 * 1024;
-
-/// Ceiling on automatically-sized claims, in **both** strategies.
+/// Where automatic sizing lands once an upstream has shown it cannot take a
+/// full-size range.
 ///
-/// Two independent reasons, and it took a regression to establish that the
-/// second one applies to downloads as much as to playback:
+/// This is a *recovery* size, not a starting point. Sizing starts at whatever
+/// the strategy asks for — an even split of the work for a download, a
+/// distance ladder for playback — because "how big a request is worth making"
+/// is overwhelmingly "as big as the policy says", and probing up to it wastes
+/// a round trip plus slow start plus origin seek on every step of the ramp.
 ///
-/// 1. A playback client receives in order, so one claim's latency is a lower
-///    bound on how long the reader can stall at the head.
-/// 2. Some upstreams — staging relays that materialize an entire requested
-///    range before emitting a byte — have per-request latency that grows *with*
-///    the range. An even split of a multi-gigabyte file is then a request that
-///    never returns, and no amount of parallelism helps.
-///
-/// Reason 2 has nothing to do with delivery order, so lifting the ceiling for
-/// `Strategy::Throughput` (on the theory that a download has no reader to
-/// starve) went badly: against such a relay, unbounded claims stalled a download
-/// at 176 MB in 180 s where the 64 MiB ceiling moved 768 MB in the same window.
-///
-/// Bounding growth also keeps halve-on-failure responsive — left unbounded,
-/// `auto_target` saturates at astronomical values after a handful of successes
-/// and then needs dozens of failures to come back down (observed as a run that
-/// stalled 45 s and then dumped 256 MB at once).
-///
-/// 64 MiB still amortizes per-request overhead ~13× better than the 5 MiB that
-/// used to be the fixed default, which is where most of the win lives.
-pub const MAX_AUTO_CLAIM: u64 = 64 * 1024 * 1024;
+/// The exception is real, though: some upstreams — staging relays that
+/// materialize an entire requested range before emitting a byte — have
+/// per-request latency that grows *with* the range, so an even split of a
+/// multi-gigabyte file is a request that never returns. That shape is not
+/// knowable up front, only observable, and it announces itself unmistakably:
+/// a claim that times out having delivered *nothing*. The response is to drop
+/// here in one step rather than halve repeatedly, because every wrong guess
+/// costs a full read timeout. See [`Scheduler::note_claim_outcome`].
+pub const RECOVERY_CLAIM: u64 = 8 * 1024 * 1024;
 
 /// How the scheduler prioritizes and sizes claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +136,11 @@ pub enum Strategy {
     /// Minimize time-to-playable around the reader's position, and only then
     /// use spare capacity to prefetch elsewhere. The default.
     Latency {
+        /// Floor on the priority region ahead of the reader. The region is
+        /// normally wider — see [`Scheduler::critical_span`].
         critical_window: u64,
+        /// Length of the claim that starts at the read head itself; claims
+        /// further out double outwards from it.
         head_claim: u64,
     },
 }
@@ -181,6 +176,10 @@ impl Strategy {
 pub struct Claim {
     pub start: u64,
     pub volume: usize,
+    /// Length this claim was cut to when it was handed out. Fixed, unlike
+    /// [`Claim::end`], which a thief may move inward — automatic sizing needs
+    /// to know what was *asked* of the upstream, not what survived.
+    issued: u64,
     end: Arc<AtomicU64>,
     cursor: Arc<AtomicU64>,
     /// Bytes the worker has *committed* to writing — advanced before the write
@@ -195,6 +194,16 @@ impl Claim {
     /// Current inclusive end. May shrink between calls.
     pub fn end(&self) -> u64 {
         self.end.load(Ordering::Acquire)
+    }
+
+    /// How long this claim was when it was handed out.
+    pub fn issued_len(&self) -> u64 {
+        self.issued
+    }
+
+    /// Bytes this claim has actually delivered so far.
+    pub fn delivered(&self) -> u64 {
+        self.cursor().saturating_sub(self.start)
     }
 
     /// Next byte this claim still owes.
@@ -291,9 +300,16 @@ pub struct Scheduler {
     /// whole file" action meaningless. `None` (caching) means the whole request
     /// is fair game.
     work_limit: Option<u64>,
-    /// Current ceiling for automatically-sized claims, grown on success and
-    /// halved on failure. See [`Scheduler::note_claim_outcome`].
-    auto_target: u64,
+    /// Ceiling automatic sizing is currently holding itself to, or `None` while
+    /// no upstream has given a reason for one — the normal case, in which the
+    /// strategy's own size (an even split, or the distance ladder) governs.
+    /// See [`Scheduler::note_claim_outcome`].
+    auto_limit: Option<u64>,
+    /// Half the smallest range this upstream has been seen to swallow whole
+    /// without delivering a byte. Recovery never grows back past it, so a
+    /// relay that dies above ~20 MiB is probed at most twice, not on every
+    /// other claim forever. `u64::MAX` until something actually fails.
+    auto_wall: u64,
     /// Duplicate bytes the endgame may still spend. Charged on every hedge and
     /// never refilled, so a pathological tail can't turn into a request storm
     /// against the origin (`design.md` §6.1).
@@ -329,7 +345,8 @@ impl Scheduler {
             req_end,
             read_head: req_start,
             work_limit: None,
-            auto_target: INITIAL_AUTO_CLAIM,
+            auto_limit: None,
+            auto_wall: u64::MAX,
             dup_budget: (req_end.saturating_sub(req_start).saturating_add(1)
                 / DUP_BUDGET_DIVISOR)
                 .min(DUP_BUDGET_MAX),
@@ -442,38 +459,120 @@ impl Scheduler {
         }
     }
 
-    /// Take back the live claims the reader won't reach soon, returning the
-    /// workers whose requests the caller should abort.
+    /// How far ahead of the reader the priority region reaches, in
+    /// [`Strategy::Latency`]. Zero in throughput mode, which has no reader.
     ///
-    /// A seek makes every in-flight request outside the new critical window
-    /// uninteresting: waiting for a 64 MiB throughput claim to come back before
-    /// the pool can serve the reader is exactly the stall latency mode exists to
-    /// avoid. Reclaiming at each claim's *cursor* keeps the bytes that already
-    /// landed — the earlier approach of aborting the whole pool and rebuilding
-    /// from the on-disk bitmap discarded everything still in flight, which
-    /// measured as roughly a fifth of a transfer being fetched twice.
-    pub fn reclaim_outside_window(&mut self, window: u64) -> Vec<usize> {
-        let hi = self.read_head.saturating_add(window.max(1));
+    /// It has to be deep enough to hold the whole worker pool. A window
+    /// shallower than that leaves most workers with nothing prioritized, so
+    /// they wander off to prefetch regions the reader won't reach for a long
+    /// time and *starve the read head*: measured, a fixed 32 MiB window against
+    /// 16 workers held playback to 1.7 MB/s while the upstream as a whole was
+    /// doing ~12 MB/s on speculative prefetch.
+    ///
+    /// The pool's reach follows from the distance ladder in
+    /// [`Scheduler::claim_len`]: claims double outwards, so `n` workers tile
+    /// `head_claim × 2ⁿ⁻¹` bytes. For any realistic pool that saturates, and
+    /// the region becomes "everything ahead of the reader" — which is the
+    /// intent. Workers crowd around the seek point nearest-first, and it is
+    /// claim *size*, not claim placement, that relaxes with distance.
+    /// `critical_window` stays a floor for one- and two-worker pools.
+    fn critical_span(&self) -> u64 {
+        let Strategy::Latency {
+            critical_window,
+            head_claim,
+        } = self.strategy
+        else {
+            return 0;
+        };
+        let steps = self.max_threads.saturating_sub(1).min(63) as u32;
+        let reach = head_claim.max(1).saturating_mul(1u64 << steps);
+        critical_window.max(reach).max(1)
+    }
+
+    /// Re-aim the whole pool at a reader that just arrived or seeked, and
+    /// return the workers whose in-flight requests the caller must abort and
+    /// restart.
+    ///
+    /// Playback wins outright here. A pool that was serving a download is
+    /// carrying claims sized for throughput, and three separate things about it
+    /// are wrong the instant somebody presses play:
+    ///
+    /// * **Nowhere near the reader.** Work nobody is waiting for. Hand it back
+    ///   and put the worker next to the reader instead.
+    /// * **Straddling the read head.** The reader is blocked on a byte inside
+    ///   a claim whose cursor is still *behind* it, so the only way it gets
+    ///   that byte is to wait out every byte in between — up to a full claim's
+    ///   length of data nobody wants. This is the one that turns "press play on
+    ///   a running download" into a multi-second stall, and it gets worse the
+    ///   larger claims are allowed to be. Hand it back too; the pool re-cuts
+    ///   the range starting *at* the read head, in a short head claim.
+    /// * **Ahead of the reader but over-committed.** A claim longer than the
+    ///   distance ladder would allow at its position holds a stretch the pool
+    ///   should be covering in several small claims. Shorten it in place — the
+    ///   zero-cost cancellation of `design.md` §4.2, where the worker simply
+    ///   retires early — and the tail goes back for re-cutting.
+    ///
+    /// Only the first two abort anything, and both hand their range back at the
+    /// claim's *cursor*, so bytes already delivered are kept. The earlier
+    /// approach of aborting the whole pool and rebuilding from the on-disk
+    /// bitmap discarded everything still in flight, which measured as roughly a
+    /// fifth of a transfer being fetched twice.
+    ///
+    /// `window` is how far ahead of the reader a claim may sit and still count
+    /// as relevant. It is deliberately tighter than
+    /// [`Scheduler::critical_span`]: the point of a seek is to pull workers
+    /// *back* to the reader, not to bless wherever they already are.
+    ///
+    /// No-op in [`Strategy::Throughput`], which has no reader to focus on.
+    pub fn refocus_on_reader(&mut self, window: u64) -> Vec<usize> {
+        let Strategy::Latency { head_claim, .. } = self.strategy else {
+            return Vec::new();
+        };
+        let head = self.read_head;
+        let hi = head.saturating_add(window.max(1));
+        // How far behind the read head a claim may be and still be worth
+        // waiting for. Below this, catching up costs less than a fresh request
+        // would, and killing the claim would throw away a warm connection.
+        let grace = head_claim.max(MIN_CLAIM);
         let mut reclaimed = Vec::new();
         let mut i = 0;
         while i < self.live.len() {
             let cursor = self.live[i].cursor.load(Ordering::Acquire);
             let end = self.live[i].end.load(Ordering::Acquire);
-            // Keep claims that are finished (the worker is about to report in)
-            // or that overlap the window the reader cares about.
-            let done = cursor > end;
-            let overlaps = cursor < hi && end >= self.read_head;
-            if done || overlaps {
+            if cursor > end {
+                // Finished; the worker is about to report in.
                 i += 1;
                 continue;
             }
-            let live = self.live.remove(i);
-            reclaimed.push(live.worker);
-            // A hedge owns nothing: the claim it was racing still holds this
-            // range, so handing it back would queue it for a second fetch.
-            if live.hedge_of.is_none() {
-                self.insert_unclaimed(cursor, end);
+            let irrelevant = cursor >= hi || end < head;
+            let blocks_the_reader = end >= head && cursor.saturating_add(grace) < head;
+            if irrelevant || blocks_the_reader {
+                let live = self.live.remove(i);
+                reclaimed.push(live.worker);
+                // A hedge owns nothing: the claim it was racing still holds
+                // this range, so handing it back would queue a second fetch.
+                if live.hedge_of.is_none() {
+                    self.insert_unclaimed(cursor, end);
+                }
+                continue;
             }
+            if self.live[i].hedge_of.is_none() {
+                let keep = cursor.saturating_add(self.claim_len(cursor).saturating_sub(1));
+                if keep < end {
+                    self.live[i].end.store(keep, Ordering::Release);
+                    // The worker clamps each write to the end it read just
+                    // before writing, so it may already have committed to bytes
+                    // past the cut. Give back only what starts after whatever
+                    // it reserved, exactly as the steal path does.
+                    let give_back = keep
+                        .saturating_add(1)
+                        .max(self.live[i].reserved.load(Ordering::Acquire));
+                    if give_back <= end {
+                        self.insert_unclaimed(give_back, end);
+                    }
+                }
+            }
+            i += 1;
         }
         reclaimed
     }
@@ -518,32 +617,75 @@ impl Scheduler {
         dead
     }
 
-    /// Feed a completed claim's outcome back into automatic sizing.
+    /// Feed a completed claim's outcome back into automatic sizing, and say
+    /// whether the caller should charge a failure against its failure budget.
     ///
-    /// Bigger claims amortize per-request overhead, which is the whole reason
-    /// to allow unlimited ones. But on some upstreams — staging relays that
-    /// materialize the entire requested range before emitting a byte — latency
-    /// grows *with* the range, so an even split of a multi-gigabyte file is a
-    /// request that never returns. Neither "always small" nor "always huge" is
-    /// right, and which one applies isn't knowable up front.
+    /// Sizing does **not** probe upwards. The strategy's own size — an even
+    /// split of the work for a download, the distance ladder for playback — is
+    /// the answer for every upstream that behaves like an HTTP server, and
+    /// ramping up to it just buys extra round trips. Only evidence to the
+    /// contrary moves the ceiling, and only downwards.
     ///
-    /// So this probes for it, TCP-slow-start style: double the ceiling after a
-    /// success, halve it after a failure. An upstream that streams promptly
-    /// converges within a few claims to an even split of the request (the
-    /// dedicated-downloader shape); a staging relay settles just under whatever
-    /// size still completes. `MIN_CLAIM` floors the descent so a flaky upstream
-    /// can't collapse into a request storm.
-    pub fn note_claim_outcome(&mut self, ok: bool) {
-        self.auto_target = if ok {
-            self.auto_target.saturating_mul(2).min(MAX_AUTO_CLAIM)
-        } else {
-            (self.auto_target / 2).max(MIN_CLAIM)
-        };
+    /// The evidence is specific: a claim that timed out having delivered
+    /// *nothing at all*. That is the signature of a staging relay materializing
+    /// the whole requested range before emitting a byte, and it is the one
+    /// shape for which a big request is worse than several small ones. A claim
+    /// that moved real bytes and then broke is a transport failure — the size
+    /// was fine, so sizing stays put and the failure is charged normally.
+    ///
+    /// Two rules keep the descent from costing more than it saves, both of
+    /// which matter because every wrong guess costs a full read timeout:
+    ///
+    /// * The first such failure drops straight to [`RECOVERY_CLAIM`] instead of
+    ///   halving, and records `issued / 2` as [`Scheduler::auto_wall`] — the
+    ///   ceiling recovery may climb back to, never past.
+    /// * Failures of claims that were already bigger than the current limit
+    ///   were cut *before* that drop. They re-prove what the first one already
+    ///   established, so they neither shrink the limit further nor count: with
+    ///   `max_threads` workers in flight, one bad round would otherwise both
+    ///   collapse the size to [`MIN_CLAIM`] and exhaust a failure budget of
+    ///   `2 × max_threads` on its own.
+    pub fn note_claim_outcome(&mut self, ok: bool, claim: &Claim) -> bool {
+        if ok {
+            // Recovery: climb back towards the strategy's size, but never past
+            // what this upstream has been shown to swallow.
+            if let Some(limit) = self.auto_limit {
+                self.auto_limit = Some(limit.saturating_mul(2).min(self.auto_wall));
+            }
+            return false;
+        }
+        if claim.delivered() >= MIN_FRAGMENT {
+            // It carried real bytes and then broke. Nothing about the size was
+            // the problem, so leave it alone and let the budget see this.
+            return true;
+        }
+        let issued = claim.issued_len();
+        match self.auto_limit {
+            Some(limit) if issued > limit => false,
+            Some(limit) => {
+                let cut = (limit / 2).max(MIN_CLAIM);
+                self.auto_wall = self.auto_wall.min(cut);
+                self.auto_limit = Some(cut);
+                true
+            }
+            None => {
+                self.auto_wall = (issued / 2).max(MIN_CLAIM);
+                self.auto_limit = Some(RECOVERY_CLAIM.min(self.auto_wall));
+                false
+            }
+        }
     }
 
-    /// Current automatic-sizing ceiling — exposed for logging and tests.
-    pub fn auto_target(&self) -> u64 {
-        self.auto_target
+    /// The ceiling automatic sizing is currently holding itself to, if any —
+    /// exposed for logging and tests.
+    pub fn auto_limit(&self) -> Option<u64> {
+        self.auto_limit
+    }
+
+    /// How long a claim starting at the read head would be right now — the
+    /// single number that summarizes automatic sizing, for logging and tests.
+    pub fn auto_claim_len(&self) -> u64 {
+        self.claim_len(self.read_head)
     }
 
     #[cfg(test)]
@@ -566,21 +708,11 @@ impl Scheduler {
         let floor = self.floor();
         let regions: Vec<(u64, u64)> = match self.strategy {
             Strategy::Throughput => vec![(floor, horizon)],
-            Strategy::Latency {
-                critical_window, ..
-            } => {
-                // The window must be at least as deep as the whole worker pool
-                // can usefully work ahead — `max_threads` claims' worth.
-                // Otherwise a window smaller than that leaves most workers with
-                // nothing prioritized to do, so they wander off to prefetch
-                // regions the reader won't reach for a long time and *starve
-                // the read head*. Measured: a fixed 32 MiB window against 16
-                // workers held playback to 1.7 MB/s while the upstream as a
-                // whole was doing ~12 MB/s on speculative prefetch.
-                let depth = (self.max_threads as u64)
-                    .saturating_mul(self.auto_target.max(MIN_CLAIM));
-                let window = critical_window.max(depth).max(1);
-                let hi = self.read_head.saturating_add(window - 1).min(horizon);
+            Strategy::Latency { .. } => {
+                let hi = self
+                    .read_head
+                    .saturating_add(self.critical_span().saturating_sub(1))
+                    .min(horizon);
                 if self.read_head <= hi {
                     vec![(self.read_head, hi), (floor, horizon)]
                 } else {
@@ -707,7 +839,7 @@ impl Scheduler {
         let vol_end = self.volume_end(seg_start).unwrap_or(seg_end);
         let hard_end = seg_end.min(vol_end);
 
-        let want = self.claim_len(in_critical && self.near_read_head(seg_start));
+        let want = self.claim_len(seg_start);
         let end = hard_end.min(seg_start.saturating_add(want.saturating_sub(1)));
 
         self.subtract(seg_start, end);
@@ -755,6 +887,7 @@ impl Scheduler {
         let claim = Claim {
             start,
             volume,
+            issued: end.saturating_sub(start).saturating_add(1),
             end: Arc::new(AtomicU64::new(end)),
             cursor: Arc::new(AtomicU64::new(start)),
             reserved: Arc::new(AtomicU64::new(start)),
@@ -912,64 +1045,65 @@ impl Scheduler {
         Some(self.register(worker, lo, hi, volume, Some(primary_start)))
     }
 
-    /// True when `offset` sits in the stretch immediately ahead of the reader,
-    /// where a short request measurably shortens time-to-first-byte.
+    /// An even share of the work still to do: what one worker should take so
+    /// that everybody finishes at the same time.
     ///
-    /// Only that stretch gets the small `head_claim`. Sizing the *whole*
-    /// critical window small costs real throughput for no latency benefit: the
-    /// reader can't consume byte 30 MiB-ahead any sooner than the bytes before
-    /// it, so a short claim out there just buys another round of per-request
-    /// overhead. Measured against a high-per-request-latency relay, uniformly
-    /// small window claims held sustained throughput to ~1.7 MB/s where
-    /// auto-sized ones reached ~12 MB/s.
-    fn near_read_head(&self, offset: u64) -> bool {
-        let head = match self.strategy {
-            Strategy::Latency { head_claim, .. } => head_claim.max(1),
-            Strategy::Throughput => return false,
-        };
-        offset < self.read_head.saturating_add(head)
+    /// Dividing by *free slots* rather than `max_threads` is what makes the
+    /// first round come out even: with 4 threads the claims are 100/4, 75/3,
+    /// 50/2, 25/1 — four equal quarters. Dividing by `max_threads` throughout
+    /// would shrink each successive claim geometrically and never cover the
+    /// request.
+    ///
+    /// Later, once every slot is busy, the divisor reaches 1 and a returning
+    /// worker sweeps up all remaining unclaimed work in one claim. That is
+    /// deliberate and self-correcting: the next worker to free up steals half
+    /// of it. Same dynamic as gopeed's "one connection owns the tail, others
+    /// split it".
+    fn even_share(&self) -> u64 {
+        let free_slots = self.max_threads.saturating_sub(self.live.len()).max(1) as u64;
+        self.unclaimed_bytes()
+            .div_ceil(free_slots)
+            .max(self.min_frag())
     }
 
-    /// How long the next claim should be.
-    fn claim_len(&self, in_critical: bool) -> u64 {
-        if in_critical {
-            let head = match self.strategy {
-                Strategy::Latency { head_claim, .. } => head_claim.max(1),
-                Strategy::Throughput => MIN_CLAIM,
-            };
-            return match self.split_cap {
-                Some(cap) => head.min(cap),
-                None => head,
-            };
-        }
-        // Automatic sizing: split what's left evenly among the workers that
-        // still need something to do, so they finish together instead of the
-        // early claimants hogging the file.
-        //
-        // Dividing by *free slots* rather than `max_threads` is what makes the
-        // first round come out even: with 4 threads the claims are 100/4,
-        // 75/3, 50/2, 25/1 — four equal quarters. Dividing by `max_threads`
-        // throughout would shrink each successive claim geometrically and never
-        // cover the request.
-        //
-        // Later, once every slot is busy, the divisor reaches 1 and a
-        // returning worker sweeps up all remaining unclaimed work in one
-        // claim. That is deliberate and self-correcting: the next worker to
-        // free up steals half of it. Same dynamic as gopeed's
-        // "one connection owns the tail, others split it".
-        let free_slots = self.max_threads.saturating_sub(self.live.len()).max(1) as u64;
-        let even = self
-            .unclaimed_bytes()
-            .div_ceil(free_slots)
-            .max(self.min_frag());
-        // The probed ceiling caps the even split: `even` says how much work a
-        // worker *should* take to finish alongside its peers, `auto_target`
-        // says how much this upstream has actually proven it can deliver in one
-        // request.
-        let auto = even.min(self.auto_target.max(MIN_CLAIM));
+    /// How long a claim starting at `offset` should be.
+    ///
+    /// Both strategies size claims as large as their policy allows, because
+    /// every extra claim costs a round trip, another slow start, and whatever
+    /// the origin spends seeking. They differ only in what bounds "as large as
+    /// allowed":
+    ///
+    /// * [`Strategy::Throughput`] — an even share of the remaining work. No
+    ///   ordered reader exists, so the only thing worth optimizing is that all
+    ///   workers finish together, and the largest claim that does that is
+    ///   `remaining / free workers`.
+    /// * [`Strategy::Latency`] — the distance from the read head. The reader
+    ///   has `offset - read_head` bytes of runway to get through before it
+    ///   needs this claim's first byte, so the claim may be exactly that long:
+    ///   `head_claim` right at the head (the shortest request we make, because
+    ///   the viewer is waiting on it *now*), doubling outwards — 2, 2, 4, 8,
+    ///   16 MiB… — as the runway grows. That keeps the pool crowded around a
+    ///   seek in short requests while still amortizing overhead further out,
+    ///   which uniformly-small window claims do not: measured against a
+    ///   high-per-request-latency relay, they held sustained throughput to
+    ///   ~1.7 MB/s where large ones reached ~12 MB/s. It is also bounded by the
+    ///   even share, so a small file still spreads across the whole pool.
+    ///
+    /// [`Scheduler::auto_limit`] then caps whatever the policy asked for, but
+    /// only once an upstream has proven it needs capping, and an explicit
+    /// `max_split` caps everything unconditionally.
+    fn claim_len(&self, offset: u64) -> u64 {
+        let policy = match self.strategy {
+            Strategy::Throughput => self.even_share(),
+            Strategy::Latency { head_claim, .. } => offset
+                .saturating_sub(self.read_head)
+                .max(head_claim.max(1))
+                .min(self.even_share()),
+        };
+        let bounded = policy.min(self.auto_limit.unwrap_or(u64::MAX));
         match self.split_cap {
-            Some(cap) => auto.min(cap).max(1),
-            None => auto,
+            Some(cap) => bounded.min(cap).max(1),
+            None => bounded.max(1),
         }
     }
 
@@ -1056,61 +1190,36 @@ mod tests {
         Scheduler::new(0, 100 * MIN_CLAIM - 1, strategy, None, threads, threads, cap, &[])
     }
 
-    /// Lift the slow-start ceiling as far as `bytes` (or as far as
-    /// [`MAX_AUTO_CLAIM`] allows) so a test can exercise the even-split /
-    /// volume-clip / steal paths without automatic sizing being the binding
-    /// constraint. Stops when growth saturates rather than spinning.
-    fn warm_to(s: &mut Scheduler, bytes: u64) {
-        while s.auto_target() < bytes {
-            let before = s.auto_target();
-            s.note_claim_outcome(true);
-            if s.auto_target() == before {
-                break;
-            }
-        }
+    /// Hand out a claim, deliver nothing, and report the failure the way a
+    /// worker would — the staging-relay signature. Returns the claim's issued
+    /// length and whether the failure was charged to the caller's budget.
+    fn fail_empty(s: &mut Scheduler, worker: usize) -> (u64, bool) {
+        let c = s.claim(worker).expect("a claim to fail");
+        s.finish(worker, c.cursor());
+        (c.issued_len(), s.note_claim_outcome(false, &c))
+    }
+
+    /// Hand out a claim, deliver all of it, and report success.
+    fn succeed(s: &mut Scheduler, worker: usize) -> u64 {
+        let c = s.claim(worker).expect("a claim to run");
+        c.advance_to(c.end() + 1);
+        s.finish(worker, c.cursor());
+        s.note_claim_outcome(true, &c);
+        c.issued_len()
     }
 
     #[test]
-    fn auto_sizing_starts_modest_and_grows_on_success() {
-        // The probe exists because "even split of the request" is a request
-        // that never returns against a staging relay. Start small, earn the
-        // right to go bigger.
+    fn the_first_claim_is_already_a_full_even_split() {
+        // No slow start. Sizing opens at what the policy asks for, because for
+        // every upstream that behaves like an HTTP server that is the right
+        // answer, and ramping up to it pays a round trip per step.
         let mut s = sched(Strategy::Throughput, 4, None);
         let first = s.claim(0).unwrap();
         assert_eq!(
-            first.end() - first.start + 1,
-            INITIAL_AUTO_CLAIM,
-            "first claim must be the probe size, not an even split",
+            first.issued_len(),
+            25 * MIN_CLAIM,
+            "100 MiB over 4 workers is 25 MiB each, from the very first claim",
         );
-        s.finish(0, first.end() + 1);
-        s.note_claim_outcome(true);
-        let second = s.claim(0).unwrap();
-        assert_eq!(second.end() - second.start + 1, 2 * INITIAL_AUTO_CLAIM);
-    }
-
-    #[test]
-    fn auto_sizing_halves_on_failure_and_floors_at_min_claim() {
-        let mut s = sched(Strategy::Throughput, 4, None);
-        s.note_claim_outcome(false);
-        assert_eq!(s.auto_target(), INITIAL_AUTO_CLAIM / 2);
-        // Keep failing: it must bottom out rather than collapse to zero and
-        // produce a request storm.
-        for _ in 0..20 {
-            s.note_claim_outcome(false);
-        }
-        assert_eq!(s.auto_target(), MIN_CLAIM);
-        let c = s.claim(0).unwrap();
-        assert_eq!(c.end() - c.start + 1, MIN_CLAIM);
-    }
-
-    #[test]
-    fn auto_sizing_converges_to_an_even_split() {
-        // Once the upstream has proven itself, claims stop growing at the point
-        // where the workers would finish together — no reason to go past that.
-        let mut s = sched(Strategy::Throughput, 4, None);
-        warm_to(&mut s, 1000 * MIN_CLAIM);
-        let a = s.claim(0).unwrap();
-        assert_eq!(a.end() - a.start + 1, 25 * MIN_CLAIM, "capped by even split");
     }
 
     #[test]
@@ -1118,7 +1227,6 @@ mod tests {
         // 100 MiB over 4 workers → ~25 MiB each, covering the whole file with
         // no leftovers once all four have claimed.
         let mut s = sched(Strategy::Throughput, 4, None);
-        warm_to(&mut s, 100 * MIN_CLAIM);
         let a = s.claim(0).unwrap();
         assert_eq!(a.start, 0);
         assert_eq!(a.end() - a.start + 1, 25 * MIN_CLAIM);
@@ -1136,79 +1244,142 @@ mod tests {
     #[test]
     fn explicit_split_cap_is_honoured() {
         let mut s = sched(Strategy::Throughput, 4, Some(4 * MIN_CLAIM));
-        warm_to(&mut s, 100 * MIN_CLAIM);
         let a = s.claim(0).unwrap();
         assert_eq!(a.end() - a.start + 1, 4 * MIN_CLAIM);
     }
 
     #[test]
-    fn auto_sizing_stops_growing_at_the_ceiling() {
-        // Growth is bounded so a single claim can't stall the ordered reader for
-        // minutes, and so halve-on-failure stays responsive.
+    fn an_explicit_split_cap_bounds_playback_claims_too() {
+        // A hand-set `max_split` is a hard ceiling on *every* claim, so the
+        // distance ladder must flatten out at it rather than run past.
         let mut s = Scheduler::new(
             0,
-            10_000 * MIN_CLAIM,
-            Strategy::latency_default(),
+            1000 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 8 * MIN_CLAIM,
+                head_claim: 2 * MIN_CLAIM,
+            },
             None,
-            1,
-            1,
-            None,
+            8,
+            8,
+            Some(3 * MIN_CLAIM),
             &[],
         );
-        for _ in 0..40 {
-            s.note_claim_outcome(true);
+        s.set_read_head(500 * MIN_CLAIM);
+        for w in 0..6 {
+            let c = s.claim(w).unwrap();
+            assert!(
+                c.issued_len() <= 3 * MIN_CLAIM,
+                "claim {} ran past the configured ceiling at {} B",
+                w,
+                c.issued_len(),
+            );
         }
-        assert_eq!(s.auto_target(), MAX_AUTO_CLAIM);
-        // One failure must produce a real step down, not a rounding error off
-        // some astronomical value.
-        s.note_claim_outcome(false);
-        assert_eq!(s.auto_target(), MAX_AUTO_CLAIM / 2);
     }
 
     #[test]
-    fn the_claim_ceiling_applies_to_downloads_too() {
-        // Regression guard. Lifting this for throughput mode — reasoning that a
-        // download has no ordered reader to starve — stalled a real download at
-        // 176 MB in 180 s where the ceiling moved 768 MB. The ceiling also
-        // guards against upstreams whose per-request latency scales with range
-        // size, which is order-agnostic.
-        let mut s = Scheduler::new(
-            0,
-            10_000 * MIN_CLAIM - 1,
-            Strategy::Throughput,
-            None,
-            4,
-            4,
-            None,
-            &[],
+    fn a_claim_that_delivers_nothing_drops_sizing_in_one_step() {
+        // The one shape a big request gets wrong: a staging relay that
+        // materializes the whole range before emitting a byte. It announces
+        // itself as a timeout with zero bytes delivered, and the answer is to
+        // land on a size that works everywhere immediately — halving toward it
+        // would cost a full read timeout per step.
+        let mut s = sched(Strategy::Throughput, 4, None);
+        let (issued, charged) = fail_empty(&mut s, 0);
+        assert_eq!(issued, 25 * MIN_CLAIM);
+        assert_eq!(s.auto_limit(), Some(RECOVERY_CLAIM));
+        assert_eq!(s.claim(0).unwrap().issued_len(), RECOVERY_CLAIM);
+        assert!(
+            !charged,
+            "a failure the scheduler answers by resizing is its own to absorb",
         );
-        for _ in 0..40 {
-            s.note_claim_outcome(true);
+    }
+
+    #[test]
+    fn one_bad_round_neither_compounds_nor_exhausts_the_budget() {
+        // Regression guard for the reason sizing may open at a full share at
+        // all. Every worker cuts its claim before any of them reports back, so
+        // a relay that swallows big ranges fails all of them at once. Those
+        // later failures were sized before the drop: they re-prove what the
+        // first one established, so they must neither shrink sizing further
+        // (down to MIN_CLAIM, a request storm) nor spend a failure budget of
+        // `2 × max_threads` in a single round (a task marked failed before it
+        // ever got to try the smaller size).
+        let mut s = sched(Strategy::Throughput, 4, None);
+        let claims: Vec<Claim> = (0..4).map(|w| s.claim(w).unwrap()).collect();
+        let mut charged = 0;
+        for (worker, c) in claims.iter().enumerate() {
+            s.finish(worker, c.cursor());
+            if s.note_claim_outcome(false, c) {
+                charged += 1;
+            }
         }
-        assert_eq!(s.auto_target(), MAX_AUTO_CLAIM);
+        assert_eq!(charged, 0);
+        assert_eq!(s.auto_limit(), Some(RECOVERY_CLAIM));
+    }
+
+    #[test]
+    fn recovery_climbs_back_but_never_past_the_wall() {
+        // Growth after a drop is bounded by what the upstream was seen to
+        // swallow, so a relay is probed twice, not on every other claim
+        // forever — the oscillation that showed up as a run stalling for 45 s
+        // and then dumping 256 MB at once.
+        let mut s = sched(Strategy::Throughput, 4, None);
+        let (issued, _) = fail_empty(&mut s, 0);
+        let wall = issued / 2;
+        assert_eq!(s.auto_limit(), Some(RECOVERY_CLAIM));
+        for _ in 0..3 {
+            succeed(&mut s, 0);
+        }
+        assert_eq!(s.auto_limit(), Some(wall));
+    }
+
+    #[test]
+    fn repeated_empty_failures_bottom_out_at_min_claim() {
+        let mut s = sched(Strategy::Throughput, 4, None);
+        for _ in 0..20 {
+            fail_empty(&mut s, 0);
+        }
+        assert_eq!(s.auto_limit(), Some(MIN_CLAIM));
+        assert_eq!(s.claim(0).unwrap().issued_len(), MIN_CLAIM);
+    }
+
+    #[test]
+    fn a_failure_after_real_progress_is_charged_and_leaves_sizing_alone() {
+        // A claim that carried bytes and then broke says nothing about how big
+        // a request this upstream can take. Shrinking would be the wrong fix,
+        // and swallowing the failure would let a flapping connection retry
+        // forever.
+        let mut s = sched(Strategy::Throughput, 4, None);
         let c = s.claim(0).unwrap();
-        assert_eq!(c.end() - c.start + 1, MAX_AUTO_CLAIM);
+        c.advance_to(c.start + MIN_FRAGMENT);
+        s.finish(0, c.cursor());
+        assert!(s.note_claim_outcome(false, &c));
+        assert_eq!(s.auto_limit(), None);
     }
 
     #[test]
     fn unlimited_split_can_exceed_any_fixed_size() {
         // The point of "no max split" is that the *configuration* stops
-        // dictating the size — a warmed-up worker claims far more than the
-        // 5 MiB that used to be the default.
+        // dictating the size — one worker with the whole request takes the
+        // whole request, not some fraction the code picked.
         let mut s = sched(Strategy::Throughput, 1, None);
-        warm_to(&mut s, MAX_AUTO_CLAIM);
         let a = s.claim(0).unwrap();
         assert_eq!(a.start, 0);
         let len = a.end() - a.start + 1;
-        assert_eq!(len, MAX_AUTO_CLAIM);
+        assert_eq!(len, 100 * MIN_CLAIM);
         assert!(len > 5 * 1024 * 1024 * 10, "must dwarf the old 5 MiB default");
     }
 
     #[test]
-    fn latency_prioritizes_the_critical_window_with_small_claims() {
+    fn latency_claims_grow_with_distance_from_the_read_head() {
+        // The reader has to get through everything between it and a claim
+        // before that claim's first byte matters, so the runway ahead of it is
+        // exactly how long the claim may be. Right at the head: the shortest
+        // request we make. Then doubling outwards.
         let mut s = Scheduler::new(
             0,
-            100 * MIN_CLAIM - 1,
+            1000 * MIN_CLAIM - 1,
             Strategy::Latency {
                 critical_window: 8 * MIN_CLAIM,
                 head_claim: 2 * MIN_CLAIM,
@@ -1219,34 +1390,26 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 100 * MIN_CLAIM);
-        s.set_read_head(50 * MIN_CLAIM);
-        // The claim at the read head is deliberately short: that's the one whose
-        // latency the viewer actually feels.
-        let a = s.claim(0).unwrap();
-        assert_eq!(a.start, 50 * MIN_CLAIM);
-        assert_eq!(a.end() - a.start + 1, 2 * MIN_CLAIM);
-        // Beyond the head, claims are sized for throughput — a short request out
-        // there buys latency nobody can observe.
-        let b = s.claim(1).unwrap();
-        assert_eq!(b.start, 52 * MIN_CLAIM);
-        assert!(
-            b.end() - b.start + 1 > 2 * MIN_CLAIM,
-            "beyond the head, claims must be throughput-sized, got {}",
-            b.end() - b.start + 1,
-        );
-        // Both claims are ahead of the reader. (How *many* workers the window
-        // can keep ahead is covered by
-        // `latency_window_is_at_least_as_deep_as_the_worker_pool`; here the
-        // forward region is only 50 MiB, so it legitimately runs out.)
-        assert!(a.start >= 50 * MIN_CLAIM && b.start >= 50 * MIN_CLAIM);
+        s.set_read_head(500 * MIN_CLAIM);
+        let mut at = 500 * MIN_CLAIM;
+        for (worker, expected) in [2u64, 2, 4, 8, 16].into_iter().enumerate() {
+            let c = s.claim(worker).unwrap();
+            assert_eq!(c.start, at, "claims must tile forward from the read head");
+            assert_eq!(
+                c.issued_len(),
+                expected * MIN_CLAIM,
+                "claim at +{} MiB",
+                (at - 500 * MIN_CLAIM) / MIN_CLAIM,
+            );
+            at = c.end() + 1;
+        }
     }
 
     #[test]
     fn latency_window_is_at_least_as_deep_as_the_worker_pool() {
-        // A window shallower than `max_threads × auto_target` leaves most
-        // workers with nothing prioritized, so they prefetch far-away regions
-        // and starve the read head. The window must scale with the pool.
+        // A window too shallow to hold the pool leaves most workers with
+        // nothing prioritized, so they prefetch far-away regions and starve the
+        // read head. The window must scale with the pool.
         let threads = 8;
         let mut s = Scheduler::new(
             0,
@@ -1262,7 +1425,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, MAX_AUTO_CLAIM);
         s.set_read_head(500 * MIN_CLAIM);
         for w in 0..threads {
             let c = s.claim(w).unwrap();
@@ -1293,15 +1455,18 @@ mod tests {
             &[],
         );
         s.set_read_head(50 * MIN_CLAIM);
-        // Window = max(4 MiB, 1 worker × 8 MiB probe) = 8 MiB.
+        // Window = max(4 MiB, one worker's ladder reach of 1 MiB) = 4 MiB, and
+        // the ladder fills it in three claims: 1, 1, 2 MiB.
         let a = s.claim(0).unwrap();
         assert_eq!(a.start, 50 * MIN_CLAIM);
         let b = s.claim(1).unwrap();
         assert_eq!(b.start, 51 * MIN_CLAIM);
-        assert_eq!(b.end(), 58 * MIN_CLAIM - 1, "fills out the window");
-        // Window exhausted → opportunistic prefetch from the earliest gap.
         let c = s.claim(2).unwrap();
-        assert_eq!(c.start, 0, "prefetch starts at the earliest gap");
+        assert_eq!(c.start, 52 * MIN_CLAIM);
+        assert_eq!(c.end(), 54 * MIN_CLAIM - 1, "fills out the window");
+        // Window exhausted → opportunistic prefetch from the earliest gap.
+        let d = s.claim(3).unwrap();
+        assert_eq!(d.start, 0, "prefetch starts at the earliest gap");
     }
 
     /// Playback-only: the pool must stay inside the horizon ahead of the reader
@@ -1351,13 +1516,30 @@ mod tests {
         assert_eq!(s.claim(1).unwrap().start, 0);
     }
 
+    /// A latency-mode scheduler over a 1000 MiB request with a 4 MiB head
+    /// claim, for the seek-refocus tests.
+    fn playback_sched(threads: usize, cap: Option<u64>) -> Scheduler {
+        Scheduler::new(
+            0,
+            1000 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 8 * MIN_CLAIM,
+                head_claim: 4 * MIN_CLAIM,
+            },
+            None,
+            threads,
+            threads,
+            cap,
+            &[],
+        )
+    }
+
     /// A seek hands back the requests the reader won't reach, and keeps the
     /// bytes those requests already delivered — that difference is what stops a
     /// seek from re-fetching data the pool had already paid for.
     #[test]
-    fn reclaiming_outside_the_window_keeps_delivered_bytes() {
-        let mut s = sched(Strategy::Throughput, 4, Some(4 * MIN_CLAIM));
-        warm_to(&mut s, 4 * MIN_CLAIM);
+    fn refocusing_keeps_delivered_bytes() {
+        let mut s = playback_sched(4, Some(4 * MIN_CLAIM));
         let far = s.claim(0).unwrap();
         let near = s.claim(1).unwrap();
         assert_eq!(far.start, 0);
@@ -1365,7 +1547,7 @@ mod tests {
         far.advance_to(MIN_CLAIM);
 
         s.set_read_head(near.start);
-        let stale = s.reclaim_outside_window(MIN_CLAIM);
+        let stale = s.refocus_on_reader(MIN_CLAIM);
         assert_eq!(stale, vec![0], "only the far worker is reclaimed");
 
         // The delivered megabyte is not back on the unclaimed list; the rest of
@@ -1381,15 +1563,104 @@ mod tests {
     }
 
     #[test]
-    fn reclaiming_leaves_the_reader_s_own_requests_alone() {
-        let mut s = sched(Strategy::Throughput, 4, Some(4 * MIN_CLAIM));
-        warm_to(&mut s, 4 * MIN_CLAIM);
+    fn refocusing_leaves_the_reader_s_own_request_alone() {
+        let mut s = playback_sched(4, Some(4 * MIN_CLAIM));
         let first = s.claim(0).unwrap();
         s.set_read_head(first.start);
         assert!(
-            s.reclaim_outside_window(8 * MIN_CLAIM).is_empty(),
-            "a claim overlapping the window must not be cancelled",
+            s.refocus_on_reader(8 * MIN_CLAIM).is_empty(),
+            "a claim the reader is sitting on must not be cancelled",
         );
+    }
+
+    /// A download already in flight: a throughput-sized claim handed out before
+    /// any reader existed. Returns the scheduler with the strategy flipped to
+    /// playback, exactly as a coordinator's `retune` does when somebody presses
+    /// play. The claim is *not* re-cut by that flip — only
+    /// [`Scheduler::refocus_on_reader`] does that, which is the point.
+    fn downloading_then_playing(threads: usize) -> (Scheduler, Claim) {
+        let mut s = Scheduler::new(
+            0,
+            1000 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            threads,
+            threads,
+            None,
+            &[],
+        );
+        let big = s.claim(0).unwrap();
+        s.set_strategy(Strategy::Latency {
+            critical_window: 8 * MIN_CLAIM,
+            head_claim: 4 * MIN_CLAIM,
+        });
+        (s, big)
+    }
+
+    #[test]
+    fn a_reader_never_waits_out_the_claim_it_is_stuck_behind() {
+        // Press play in the middle of a running download. The read head lands
+        // inside a throughput-sized claim whose cursor is still far behind it,
+        // so the byte the viewer is waiting for arrives only after the worker
+        // has streamed everything in between. Handing that claim back is the
+        // whole point: the pool re-cuts it *at* the read head.
+        let (mut s, big) = downloading_then_playing(4);
+        assert_eq!(big.issued_len(), 250 * MIN_CLAIM, "a full even share");
+        big.advance_to(200 * MIN_CLAIM);
+
+        s.set_read_head(220 * MIN_CLAIM);
+        assert_eq!(s.refocus_on_reader(32 * MIN_CLAIM), vec![0]);
+
+        // Everything the worker had not delivered is available again, and the
+        // next claim starts exactly where the viewer is waiting — short.
+        let next = s.claim(0).unwrap();
+        assert_eq!(next.start, 220 * MIN_CLAIM);
+        assert_eq!(next.issued_len(), 4 * MIN_CLAIM, "a head claim, not a slab");
+    }
+
+    #[test]
+    fn a_claim_the_reader_is_about_to_reach_is_left_running() {
+        // The mirror image: cutting a claim whose cursor is a hair behind the
+        // read head would throw away a warm connection to save less than one
+        // request's worth of bytes.
+        let (mut s, big) = downloading_then_playing(4);
+        big.advance_to(199 * MIN_CLAIM);
+        s.set_read_head(200 * MIN_CLAIM);
+        assert!(
+            s.refocus_on_reader(32 * MIN_CLAIM).is_empty(),
+            "a claim within a head claim's reach of the reader must keep going",
+        );
+    }
+
+    #[test]
+    fn over_long_claims_ahead_of_the_reader_are_shortened_not_killed() {
+        // A claim that starts ahead of the reader is legitimate work, but a
+        // throughput-sized one covers a stretch the pool should be splitting
+        // into several short claims. Shorten it in place — no abort, no lost
+        // bytes, and the tail comes back for re-cutting.
+        let (mut s, big) = downloading_then_playing(4);
+        let before = big.end();
+        big.advance_to(4 * MIN_CLAIM);
+        s.set_read_head(0);
+
+        assert!(
+            s.refocus_on_reader(32 * MIN_CLAIM).is_empty(),
+            "shortening must not abort the worker",
+        );
+        // 4 MiB past the read head, the ladder allows a 4 MiB claim.
+        assert_eq!(big.end(), 8 * MIN_CLAIM - 1);
+        assert!(
+            s.unclaimed_ranges()
+                .iter()
+                .any(|&(start, end)| start == 8 * MIN_CLAIM && end >= before),
+            "the surrendered tail must be claimable again (merged with the gap \
+             behind it); unclaimed = {:?}",
+            s.unclaimed_ranges(),
+        );
+        // And the freed range is immediately re-cut by the ladder.
+        let next = s.claim(1).unwrap();
+        assert_eq!(next.start, 8 * MIN_CLAIM);
+        assert_eq!(next.issued_len(), 8 * MIN_CLAIM);
     }
 
     #[test]
@@ -1429,7 +1700,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 100 * MIN_CLAIM);
         // A single worker would otherwise claim all 20 MiB; the volume
         // boundary clips it at 10 MiB.
         let a = s.claim(0).unwrap();
@@ -1488,7 +1758,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 32 * MIN_CLAIM);
         let victim = s.claim(0).unwrap();
         assert_eq!(s.unclaimed_bytes(), 0, "one worker took everything");
         let original_end = victim.end();
@@ -1516,7 +1785,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 32 * MIN_CLAIM);
         let victim = s.claim(0).unwrap();
         let end = victim.end();
         victim.advance_to(end - 10 * MIN_CLAIM + 1); // 10 MiB left
@@ -1555,7 +1823,6 @@ mod tests {
     #[test]
     fn finish_returns_undelivered_tail_to_the_pool() {
         let mut s = sched(Strategy::Throughput, 4, None);
-        warm_to(&mut s, 100 * MIN_CLAIM);
         let a = s.claim(0).unwrap();
         let end = a.end();
         // Worker died after delivering 1 MiB.
@@ -1570,7 +1837,6 @@ mod tests {
     #[test]
     fn finish_after_full_delivery_adds_nothing_back() {
         let mut s = sched(Strategy::Throughput, 4, None);
-        warm_to(&mut s, 100 * MIN_CLAIM);
         let a = s.claim(0).unwrap();
         let before = s.unclaimed_bytes();
         s.finish(0, a.end() + 1);
@@ -1656,7 +1922,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 32 * MIN_CLAIM);
         let victim = s.claim(0).unwrap();
         victim.advance_to(victim.end() - 12 * MIN_CLAIM + 1);
         assert!(s.in_tail(), "32 MiB left is inside the endgame threshold");
@@ -1712,7 +1977,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 32 * MIN_CLAIM);
         let victim = s.claim(0).unwrap();
         let split = victim.end() - victim.remaining() / 2;
         // In-flight write that will land past where the thief would cut.
@@ -1762,7 +2026,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, MAX_AUTO_CLAIM);
         let mut primary = s.claim(0).unwrap();
         while s.unclaimed_bytes() > 0 {
             s.finish(0, u64::MAX);
@@ -1801,7 +2064,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, 32 * MIN_CLAIM);
         let only = s.claim(0).unwrap();
         only.advance_to(only.end() - MIN_CLAIM + 1);
         assert!(s.in_tail());
@@ -1831,7 +2093,6 @@ mod tests {
             None,
             &[],
         );
-        warm_to(&mut s, MAX_AUTO_CLAIM);
         let mut last = s.claim(0).unwrap();
         while s.unclaimed_bytes() > 0 {
             s.finish(0, u64::MAX);
