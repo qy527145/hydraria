@@ -62,7 +62,11 @@ export default function App() {
           </span>
         </div>
         <div className="header-stats">
-          <Statistic title="实时吞吐" value={formatSpeed(global?.current_speed_bps ?? 0)} />
+          {/* 出与入分开报。合成一个数字的话，「缓存整个文件」跑满带宽时概览
+              仍然显示 0（那条流一个客户端都没有），而边播边缓存时又会把同一批
+              字节数两遍。 */}
+          <Statistic title="发给客户端" value={formatSpeed(global?.current_speed_bps ?? 0)} />
+          <Statistic title="缓存拉取" value={formatSpeed(global?.cache_fill_speed_bps ?? 0)} />
           <Statistic title="活跃连接" value={global?.active_connections ?? 0} />
           <Statistic title="持久缓存" value={formatBytes(global?.cache_total_bytes ?? 0)} />
         </div>

@@ -113,6 +113,9 @@ pub enum ContentDispositionMode {
     Attachment,
 }
 
+/// 线程总数的硬上限。与校验里历史沿用的 128 一致。
+pub const MAX_THREADS: usize = 128;
+
 fn default_threads() -> usize {
     8
 }
@@ -464,6 +467,21 @@ impl TaskConfig {
     /// assume every entry is non-empty.
     pub fn normalize(&mut self) {
         self.volumes = self.effective_volumes();
+        self.max_threads = Self::derive_threads(self.max_per_volume, self.volumes.len());
+    }
+
+    /// 线程总数 = 单卷并发上限 × 卷数，不再单独配置。
+    ///
+    /// 两个数字各配一份时它们总在打架，而且哪一个赢完全取决于任务形状：单卷
+    /// 文件配 16 线程实际只能跑 `max_per_volume` 条（调度器不会为了凑线程数
+    /// 去超订同一个源），8 卷任务配 4 线程则让大半卷根本没人认领。既然真正
+    /// 决定并发的永远是「一个源能同时开几条」，就只留这一个旋钮，总数由它
+    /// 和卷数推出来。
+    pub fn derive_threads(max_per_volume: usize, volumes: usize) -> usize {
+        max_per_volume
+            .max(1)
+            .saturating_mul(volumes.max(1))
+            .clamp(1, MAX_THREADS)
     }
 }
 
@@ -554,11 +572,10 @@ impl TaskEntry {
             *self.probe_cache.lock() = None;
             self.head_unsupported.write().clear();
         }
-        if let Some(t) = upd.max_threads {
-            if t == 0 {
-                return Err("max_threads must be >= 1".into());
-            }
-            cfg.max_threads = t;
+        // `max_threads` 是派生值，PATCH 里带上也只会被下面重新算出来 —— 保留
+        // 这个字段只为兼容老客户端的请求体，不让它报错。
+        if upd.max_threads == Some(0) {
+            return Err("max_threads must be >= 1".into());
         }
         if let Some(p) = upd.max_per_volume {
             if p == 0 {
@@ -566,6 +583,7 @@ impl TaskEntry {
             }
             cfg.max_per_volume = p;
         }
+        cfg.max_threads = TaskConfig::derive_threads(cfg.max_per_volume, cfg.volumes.len());
         if let Some(s) = upd.max_split {
             // 0 = automatic: the scheduler sizes claims from the remaining work
             // and the thread count, with no ceiling.
@@ -670,6 +688,10 @@ pub struct GlobalSettingsUpdate {
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalState {
     pub settings: GlobalSettings,
+    /// 所有缓存填充任务的合计拉取速率。与 `current_speed_bps`（发给客户端的
+    /// 速率）是方向相反的两条流，分开报而不是相加 —— 见
+    /// [`crate::download::DownloadManager::fill_speed_bps`]。
+    pub cache_fill_speed_bps: u64,
     pub current_speed_bps: u64,
     pub speed_samples: Vec<u64>,
     pub cache_total_bytes: u64,
@@ -816,6 +838,7 @@ impl AppState {
         }
         GlobalState {
             settings,
+            cache_fill_speed_bps: self.downloads.fill_speed_bps(),
             current_speed_bps: self.global_throughput.current(),
             speed_samples: self.global_throughput.snapshot(),
             cache_total_bytes: self.cache.total_bytes_on_disk(),
@@ -1151,5 +1174,49 @@ mod tests {
             edited - 60,
             "a rejected edit must not reorder the list",
         );
+    }
+
+    /// `max_threads` 是派生值：单卷并发上限 × 卷数。用户只配前者。
+    ///
+    /// 这两个数字曾经各配一份，于是总有一个会输 —— 单卷文件配 16 线程实际只
+    /// 跑 `max_per_volume` 条，多卷任务配小线程数则让大半卷没人认领。
+    #[test]
+    fn threads_are_derived_from_per_volume_and_volume_count() {
+        let two_volumes = vec![
+            vec!["http://a/1".to_string()],
+            vec!["http://a/2".to_string()],
+        ];
+        let mut cfg = config("derive");
+        cfg.volumes = two_volumes.clone();
+        cfg.max_threads = 999;
+        cfg.max_per_volume = 4;
+        cfg.normalize();
+        assert_eq!(cfg.max_threads, 8, "4 × 2 卷");
+
+        // 单卷：总数就是单卷上限，不会虚报一个跑不出来的数字。
+        cfg.volumes = vec![vec!["http://a/1".to_string()]];
+        cfg.normalize();
+        assert_eq!(cfg.max_threads, 4);
+
+        // 编辑单卷上限后要重新派生，PATCH 里带的 max_threads 不作数。
+        let mut seed = config("derive");
+        seed.volumes = two_volumes;
+        seed.max_per_volume = 4;
+        let entry = TaskEntry::new(seed);
+        entry
+            .apply_update(TaskUpdate {
+                max_per_volume: Some(8),
+                max_threads: Some(3),
+                ..Default::default()
+            })
+            .expect("valid");
+        assert_eq!(entry.config.read().max_threads, 16, "8 × 2 卷，忽略 PATCH 的 3");
+
+        // 硬上限守住 128。
+        let mut huge = config("derive");
+        huge.volumes = (0..100).map(|i| vec![format!("http://a/{i}")]).collect();
+        huge.max_per_volume = 8;
+        huge.normalize();
+        assert_eq!(huge.max_threads, MAX_THREADS);
     }
 }

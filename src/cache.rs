@@ -134,7 +134,14 @@ pub struct CacheEntry {
     /// **Lock order:** whenever both are needed, `bitmap` is taken before
     /// `partial`. Never the other way round.
     partial: Mutex<Vec<Vec<(u32, u32)>>>,
+    /// 已补齐的完整块字节数 —— 回答「有多少能直接读」，进度条用它。
     pub bytes_cached: AtomicU64,
+    /// 累计**写入**的字节，不按块取整。
+    ///
+    /// 速率不能拿 `bytes_cached` 算：它只在整块补齐的那一刻跳一次，于是慢链路
+    /// 上刚开始的几秒读出 0（第一块还没齐），之后以 1 MiB 为单位跳变，曲线在
+    /// 0.75 和 1.25 之间来回抖，而真实速率是平稳的 1.0。
+    pub bytes_written: AtomicU64,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     /// Monotonic write counter. Bumped after every `write_range` so an
@@ -338,6 +345,7 @@ impl CacheEntry {
             bitmap: Mutex::new(bm),
             partial: Mutex::new(vec![Vec::new(); block_count as usize]),
             bytes_cached: AtomicU64::new(bytes_cached),
+            bytes_written: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             progress: tokio::sync::watch::Sender::new(0),
@@ -390,6 +398,8 @@ impl CacheEntry {
             return Ok(());
         }
         pwrite_all(&self.file, data, start)?;
+        self.bytes_written
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         let end = start + data.len() as u64 - 1;
         let first_block = start / self.meta.block_size;

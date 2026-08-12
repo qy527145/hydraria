@@ -504,12 +504,13 @@ async fn prepare_engine(
             let probe_t0 = Instant::now();
             let fresh = engine.probe().await?;
             tracing::info!(
-                "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} ({}ms)",
+                "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} unreachable={:?} ({}ms)",
                 task_id,
                 fresh.total_size.map(|t| t.to_string()).unwrap_or_else(|| "unknown".into()),
                 fresh.volumes.as_ref().map(|v| v.len()).unwrap_or(0),
                 fresh.accepts_ranges,
                 fresh.etag,
+                fresh.probe_error,
                 probe_t0.elapsed().as_millis(),
             );
             *entry.probe_cache.lock() = Some((Arc::new(fresh.clone()), Instant::now()));
@@ -593,6 +594,15 @@ async fn ensure_cache_job(
         return Ok(job);
     }
     let (cfg, probe, engine) = prepare_engine(state, task_id, entry).await?;
+    // Report why we can't cache in the user's terms. A probe that failed
+    // outright comes back looking exactly like "the origin works but has no
+    // range support" — telling someone whose URL is dead that their server
+    // doesn't do byte ranges sends them debugging the wrong thing.
+    if let Some(reason) = probe.probe_error {
+        return Err(ProxyError::Internal(format!(
+            "cannot reach the upstream: {reason}"
+        )));
+    }
     if !probe.accepts_ranges {
         return Err(ProxyError::Internal(
             "upstream does not support byte ranges; full caching needs ranges".into(),

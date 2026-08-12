@@ -99,6 +99,8 @@ export interface GlobalSettings {
 
 export interface GlobalState {
   settings: GlobalSettings;
+  /** 所有缓存填充任务的合计拉取速率。与 current_speed_bps 是方向相反的两条流。 */
+  cache_fill_speed_bps: number;
   current_speed_bps: number;
   speed_samples: number[];
   cache_total_bytes: number;

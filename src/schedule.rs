@@ -18,9 +18,9 @@
 //!   roughly `max_threads` equal parts, so every worker finishes around the
 //!   same time and the file is done as early as possible.
 //! * [`Strategy::Latency`] — the region ahead of the reader gets priority, and
-//!   claim size grows with distance from it: the shortest request we know how
-//!   to make right at the read head, doubling outwards as the runway in front
-//!   of the reader grows.
+//!   the pool packs into it in short, equal claims, so the ordered prefix
+//!   advances at the pool's aggregate rate rather than one connection's.
+//!   Claims lengthen only once the reader has buffer to spare.
 //!
 //! Assignment follows the three-tier escalation from `design.md` §6.1, in cost
 //! order — each tier is only reached when the one above it has nothing to give:
@@ -101,11 +101,14 @@ const DUP_BUDGET_MAX: u64 = 32 * 1024 * 1024;
 /// reader we treat bytes as "needed now" rather than "nice to have".
 pub const DEFAULT_CRITICAL_WINDOW: u64 = 32 * 1024 * 1024;
 
-/// Shortest claim [`Strategy::Latency`] will cut, used right at the read head.
-/// Small on purpose — the byte the player is waiting for is in this claim, and
-/// a short range comes back sooner than a long one on essentially every
-/// upstream. Claims further out grow with their distance from the head
-/// ([`Scheduler::claim_len`]).
+/// Default claim length for [`Strategy::Latency`] before the reader has built
+/// up any buffer, and the floor it never goes below.
+///
+/// Short on purpose, and *uniform* on purpose: every worker takes one of these
+/// packed consecutively behind the read head, so a round of the whole pool
+/// advances the ordered prefix by `max_threads × head_claim` at once. See
+/// [`Scheduler::claim_len`] for why sizing these by distance instead caps
+/// delivery at a single connection's rate.
 pub const DEFAULT_HEAD_CLAIM: u64 = 2 * 1024 * 1024;
 
 /// Where automatic sizing lands once an upstream has shown it cannot take a
@@ -113,7 +116,7 @@ pub const DEFAULT_HEAD_CLAIM: u64 = 2 * 1024 * 1024;
 ///
 /// This is a *recovery* size, not a starting point. Sizing starts at whatever
 /// the strategy asks for — an even split of the work for a download, a
-/// distance ladder for playback — because "how big a request is worth making"
+/// buffer-sized claim for playback — because "how big a request is worth making"
 /// is overwhelmingly "as big as the policy says", and probing up to it wastes
 /// a round trip plus slow start plus origin seek on every step of the ramp.
 ///
@@ -139,8 +142,8 @@ pub enum Strategy {
         /// Floor on the priority region ahead of the reader. The region is
         /// normally wider — see [`Scheduler::critical_span`].
         critical_window: u64,
-        /// Length of the claim that starts at the read head itself; claims
-        /// further out double outwards from it.
+        /// Claim length before the reader has buffer to spare, and the floor
+        /// below which claims never shrink.
         head_claim: u64,
     },
 }
@@ -291,6 +294,12 @@ pub struct Scheduler {
     req_end: u64,
     /// Where the ordered reader is. Drives the [`Strategy::Latency`] window.
     read_head: u64,
+    /// Bytes the ordered reader can already consume without blocking, as last
+    /// reported by [`Scheduler::set_reader_buffer`]. Zero — the default, and
+    /// what a fresh seek resets to — means claims stay at their shortest.
+    /// See [`Scheduler::claim_len`] for why this, and not distance from the
+    /// read head, is what latency-mode claim size grows out of.
+    buffered: u64,
     /// How far past `read_head` claims may reach, when set.
     ///
     /// Playback and whole-file caching share one scheduler, and the only thing
@@ -344,6 +353,7 @@ impl Scheduler {
             req_start,
             req_end,
             read_head: req_start,
+            buffered: 0,
             work_limit: None,
             auto_limit: None,
             auto_wall: u64::MAX,
@@ -418,8 +428,25 @@ impl Scheduler {
     }
 
     /// Move the reader position; re-derives the priority window.
+    ///
+    /// A move is treated as a seek unless the caller says otherwise: the
+    /// buffer estimate resets to zero, so claims go back to their shortest
+    /// until [`Scheduler::set_reader_buffer`] reports runway again. That is
+    /// the safe direction — short claims cost overhead, long ones cost stalls.
     pub fn set_read_head(&mut self, offset: u64) {
         self.read_head = offset.clamp(self.req_start, self.req_end.saturating_add(1));
+        self.buffered = 0;
+    }
+
+    /// Report how many bytes the reader can consume from `read_head` without
+    /// blocking. Call it right after [`Scheduler::set_read_head`] from the
+    /// reader loop, which has the number in hand already.
+    ///
+    /// This is what lets latency-mode claims grow (see
+    /// [`Scheduler::claim_len`]). Leaving it unset is safe and merely
+    /// conservative.
+    pub fn set_reader_buffer(&mut self, bytes: u64) {
+        self.buffered = bytes;
     }
     /// Switch scheduling policy without rebuilding live claims. A task-level
     /// cache coordinator uses throughput mode while only background caching is
@@ -462,31 +489,22 @@ impl Scheduler {
     /// How far ahead of the reader the priority region reaches, in
     /// [`Strategy::Latency`]. Zero in throughput mode, which has no reader.
     ///
-    /// It has to be deep enough to hold the whole worker pool. A window
-    /// shallower than that leaves most workers with nothing prioritized, so
-    /// they wander off to prefetch regions the reader won't reach for a long
-    /// time and *starve the read head*: measured, a fixed 32 MiB window against
-    /// 16 workers held playback to 1.7 MB/s while the upstream as a whole was
-    /// doing ~12 MB/s on speculative prefetch.
-    ///
-    /// The pool's reach follows from the distance ladder in
-    /// [`Scheduler::claim_len`]: claims double outwards, so `n` workers tile
-    /// `head_claim × 2ⁿ⁻¹` bytes. For any realistic pool that saturates, and
-    /// the region becomes "everything ahead of the reader" — which is the
-    /// intent. Workers crowd around the seek point nearest-first, and it is
-    /// claim *size*, not claim placement, that relaxes with distance.
-    /// `critical_window` stays a floor for one- and two-worker pools.
+    /// It has to be deep enough to hold the whole worker pool — one claim per
+    /// worker, packed consecutively behind the read head. A window shallower
+    /// than that leaves the surplus workers with nothing prioritized, so they
+    /// wander off to prefetch regions the reader won't reach for a long time
+    /// and *starve the read head*: measured, a fixed 32 MiB window against 16
+    /// workers held playback to 1.7 MB/s while the upstream as a whole was
+    /// doing ~12 MB/s on speculative prefetch. `critical_window` is the floor.
     fn critical_span(&self) -> u64 {
         let Strategy::Latency {
-            critical_window,
-            head_claim,
+            critical_window, ..
         } = self.strategy
         else {
             return 0;
         };
-        let steps = self.max_threads.saturating_sub(1).min(63) as u32;
-        let reach = head_claim.max(1).saturating_mul(1u64 << steps);
-        critical_window.max(reach).max(1)
+        let depth = (self.max_threads as u64).saturating_mul(self.claim_len());
+        critical_window.max(depth).max(1)
     }
 
     /// Re-aim the whole pool at a reader that just arrived or seeked, and
@@ -557,7 +575,7 @@ impl Scheduler {
                 continue;
             }
             if self.live[i].hedge_of.is_none() {
-                let keep = cursor.saturating_add(self.claim_len(cursor).saturating_sub(1));
+                let keep = cursor.saturating_add(self.claim_len().saturating_sub(1));
                 if keep < end {
                     self.live[i].end.store(keep, Ordering::Release);
                     // The worker clamps each write to the end it read just
@@ -685,7 +703,7 @@ impl Scheduler {
     /// How long a claim starting at the read head would be right now — the
     /// single number that summarizes automatic sizing, for logging and tests.
     pub fn auto_claim_len(&self) -> u64 {
-        self.claim_len(self.read_head)
+        self.claim_len()
     }
 
     #[cfg(test)]
@@ -839,7 +857,7 @@ impl Scheduler {
         let vol_end = self.volume_end(seg_start).unwrap_or(seg_end);
         let hard_end = seg_end.min(vol_end);
 
-        let want = self.claim_len(seg_start);
+        let want = self.claim_len();
         let end = hard_end.min(seg_start.saturating_add(want.saturating_sub(1)));
 
         self.subtract(seg_start, end);
@@ -1066,37 +1084,47 @@ impl Scheduler {
             .max(self.min_frag())
     }
 
-    /// How long a claim starting at `offset` should be.
+    /// How long a claim should be right now.
     ///
-    /// Both strategies size claims as large as their policy allows, because
+    /// Both strategies want claims as large as their policy allows, because
     /// every extra claim costs a round trip, another slow start, and whatever
-    /// the origin spends seeking. They differ only in what bounds "as large as
+    /// the origin spends seeking. They differ in what bounds "as large as
     /// allowed":
     ///
     /// * [`Strategy::Throughput`] — an even share of the remaining work. No
     ///   ordered reader exists, so the only thing worth optimizing is that all
     ///   workers finish together, and the largest claim that does that is
     ///   `remaining / free workers`.
-    /// * [`Strategy::Latency`] — the distance from the read head. The reader
-    ///   has `offset - read_head` bytes of runway to get through before it
-    ///   needs this claim's first byte, so the claim may be exactly that long:
-    ///   `head_claim` right at the head (the shortest request we make, because
-    ///   the viewer is waiting on it *now*), doubling outwards — 2, 2, 4, 8,
-    ///   16 MiB… — as the runway grows. That keeps the pool crowded around a
-    ///   seek in short requests while still amortizing overhead further out,
-    ///   which uniformly-small window claims do not: measured against a
-    ///   high-per-request-latency relay, they held sustained throughput to
-    ///   ~1.7 MB/s where large ones reached ~12 MB/s. It is also bounded by the
-    ///   even share, so a small file still spreads across the whole pool.
+    /// * [`Strategy::Latency`] — small and **uniform**, so the pool packs tight
+    ///   behind the read head. This is the one that decides whether ordered
+    ///   delivery runs at the pool's aggregate rate or at one connection's.
+    ///   The ordered reader can only emit its contiguous prefix, so its speed
+    ///   is the speed of whichever single claim covers the byte it wants next.
+    ///   Give that claim a length proportional to its distance from the head
+    ///   — the obvious "the reader has runway before it needs this" argument —
+    ///   and the prefix advances at exactly one connection's rate while the
+    ///   other fifteen workers pour bytes into regions the reader won't reach
+    ///   for a minute. Measured: 25 MB/s pulled from upstream, 3.2 MB/s
+    ///   delivered to the client. Equal claims packed consecutively make the
+    ///   whole pool finish a round together, so the prefix jumps
+    ///   `max_threads × claim` at once — aggregate rate, which is the point.
+    ///
+    /// The runway argument only becomes true once the runway actually exists,
+    /// so that is exactly when latency claims are allowed to grow: with
+    /// `buffered` bytes already readable ahead of the reader and `max_threads`
+    /// workers, a claim of `buffered / max_threads` is one the whole pool can
+    /// turn over in the time the reader drains what it already has. A player
+    /// that has built up a buffer therefore gets big, cheap claims; a cold
+    /// start or a fresh seek gets short ones until it has earned otherwise.
     ///
     /// [`Scheduler::auto_limit`] then caps whatever the policy asked for, but
     /// only once an upstream has proven it needs capping, and an explicit
     /// `max_split` caps everything unconditionally.
-    fn claim_len(&self, offset: u64) -> u64 {
+    fn claim_len(&self) -> u64 {
         let policy = match self.strategy {
             Strategy::Throughput => self.even_share(),
-            Strategy::Latency { head_claim, .. } => offset
-                .saturating_sub(self.read_head)
+            Strategy::Latency { head_claim, .. } => (self.buffered
+                / (self.max_threads as u64))
                 .max(head_claim.max(1))
                 .min(self.even_share()),
         };
@@ -1372,11 +1400,15 @@ mod tests {
     }
 
     #[test]
-    fn latency_claims_grow_with_distance_from_the_read_head() {
-        // The reader has to get through everything between it and a claim
-        // before that claim's first byte matters, so the runway ahead of it is
-        // exactly how long the claim may be. Right at the head: the shortest
-        // request we make. Then doubling outwards.
+    fn latency_packs_the_pool_into_equal_claims_behind_the_reader() {
+        // The regression this sizing rule exists for. An ordered reader can
+        // only emit its contiguous prefix, so the prefix advances at the speed
+        // of whichever single claim covers the byte it wants next. Equal
+        // claims packed consecutively make the whole pool finish a round
+        // together and the prefix jump `max_threads × claim` at once — the
+        // aggregate rate. Sizing them by distance from the head instead caps
+        // delivery at one connection: measured, 25 MB/s pulled from upstream
+        // and 3.2 MB/s handed to the client.
         let mut s = Scheduler::new(
             0,
             1000 * MIN_CLAIM - 1,
@@ -1392,17 +1424,58 @@ mod tests {
         );
         s.set_read_head(500 * MIN_CLAIM);
         let mut at = 500 * MIN_CLAIM;
-        for (worker, expected) in [2u64, 2, 4, 8, 16].into_iter().enumerate() {
+        for worker in 0..5 {
             let c = s.claim(worker).unwrap();
             assert_eq!(c.start, at, "claims must tile forward from the read head");
             assert_eq!(
                 c.issued_len(),
-                expected * MIN_CLAIM,
-                "claim at +{} MiB",
-                (at - 500 * MIN_CLAIM) / MIN_CLAIM,
+                2 * MIN_CLAIM,
+                "every worker takes the same short claim, not a longer one \
+                 further out",
             );
             at = c.end() + 1;
         }
+    }
+
+    #[test]
+    fn latency_claims_grow_with_the_readers_buffer() {
+        // Once runway exists, the "the reader won't need this for a while"
+        // argument becomes true and claims may lengthen to amortize per-request
+        // overhead. The measure is the reader's buffer, not the claim's
+        // distance: with `buffered` bytes readable and `n` workers, a claim of
+        // `buffered / n` is one the whole pool turns over in the time the
+        // reader drains what it has.
+        let threads = 8;
+        let mut s = Scheduler::new(
+            0,
+            1000 * MIN_CLAIM - 1,
+            Strategy::Latency {
+                critical_window: 8 * MIN_CLAIM,
+                head_claim: 2 * MIN_CLAIM,
+            },
+            None,
+            threads,
+            threads,
+            None,
+            &[],
+        );
+        s.set_read_head(100 * MIN_CLAIM);
+        assert_eq!(s.claim(0).unwrap().issued_len(), 2 * MIN_CLAIM, "no buffer");
+
+        s.set_reader_buffer(80 * MIN_CLAIM);
+        assert_eq!(
+            s.claim(1).unwrap().issued_len(),
+            10 * MIN_CLAIM,
+            "80 MiB of runway over 8 workers is a 10 MiB claim each",
+        );
+
+        // A seek is a fresh start: the runway it was earned on is gone.
+        s.set_read_head(300 * MIN_CLAIM);
+        assert_eq!(
+            s.claim(2).unwrap().issued_len(),
+            2 * MIN_CLAIM,
+            "moving the read head must reset sizing to the short claim",
+        );
     }
 
     #[test]
@@ -1455,17 +1528,15 @@ mod tests {
             &[],
         );
         s.set_read_head(50 * MIN_CLAIM);
-        // Window = max(4 MiB, one worker's ladder reach of 1 MiB) = 4 MiB, and
-        // the ladder fills it in three claims: 1, 1, 2 MiB.
-        let a = s.claim(0).unwrap();
-        assert_eq!(a.start, 50 * MIN_CLAIM);
-        let b = s.claim(1).unwrap();
-        assert_eq!(b.start, 51 * MIN_CLAIM);
-        let c = s.claim(2).unwrap();
-        assert_eq!(c.start, 52 * MIN_CLAIM);
-        assert_eq!(c.end(), 54 * MIN_CLAIM - 1, "fills out the window");
+        // Window = max(4 MiB, one worker × a 1 MiB claim) = 4 MiB, filled by
+        // four uniform 1 MiB claims.
+        for (i, worker) in (0..4).enumerate() {
+            let c = s.claim(worker).unwrap();
+            assert_eq!(c.start, (50 + i as u64) * MIN_CLAIM);
+            assert_eq!(c.issued_len(), MIN_CLAIM);
+        }
         // Window exhausted → opportunistic prefetch from the earliest gap.
-        let d = s.claim(3).unwrap();
+        let d = s.claim(4).unwrap();
         assert_eq!(d.start, 0, "prefetch starts at the earliest gap");
     }
 
@@ -1647,7 +1718,7 @@ mod tests {
             s.refocus_on_reader(32 * MIN_CLAIM).is_empty(),
             "shortening must not abort the worker",
         );
-        // 4 MiB past the read head, the ladder allows a 4 MiB claim.
+        // Shortened to one claim's worth from the cursor.
         assert_eq!(big.end(), 8 * MIN_CLAIM - 1);
         assert!(
             s.unclaimed_ranges()
@@ -1657,10 +1728,10 @@ mod tests {
              behind it); unclaimed = {:?}",
             s.unclaimed_ranges(),
         );
-        // And the freed range is immediately re-cut by the ladder.
+        // And the freed range is immediately re-cut into a short claim.
         let next = s.claim(1).unwrap();
         assert_eq!(next.start, 8 * MIN_CLAIM);
-        assert_eq!(next.issued_len(), 8 * MIN_CLAIM);
+        assert_eq!(next.issued_len(), 4 * MIN_CLAIM);
     }
 
     #[test]

@@ -30,6 +30,7 @@ import type {
 import { api } from '../../api/client';
 import { useDashboard } from '../../stores/dashboard';
 import { formatBytes, parseSize, sizeInput } from '../../utils/format';
+import HeadersEditor from './HeadersEditor';
 import VolumeEditor from './VolumeEditor';
 
 const DRAFT_KEY = 'hydraria.createDraft.v2';
@@ -40,7 +41,8 @@ const MIN_SPLIT = 64 * 1024;
 /** 新任务的初始配置。`cache: true` 让播放与缓存默认落在同一份持久文件上。 */
 const newTaskConfig: TaskConfig = {
   volumes: [[]],
-  max_threads: 16,
+  // 派生值：保存时按「单卷并发 × 卷数」重算，这里只是让类型完整。
+  max_threads: 4,
   max_per_volume: 4,
   max_split: 0,
   cache: true,
@@ -60,7 +62,6 @@ const newTaskConfig: TaskConfig = {
  * 提交时统一转回 TaskConfig，这样草稿存取和校验都只面对一种形状。
  */
 interface FormValues {
-  max_threads: number;
   max_per_volume: number;
   max_split: string;
   rate_limit_bps: string;
@@ -81,7 +82,6 @@ type PluginFieldValue = string | number | boolean | null;
 
 function toFormValues(config: TaskConfig): FormValues {
   return {
-    max_threads: config.max_threads,
     max_per_volume: config.max_per_volume,
     max_split: sizeInput(config.max_split),
     rate_limit_bps: sizeInput(config.rate_limit_bps),
@@ -129,15 +129,26 @@ function toPluginConfigs(
   return [...merged, ...leftovers.values()];
 }
 
+/**
+ * 线程总数 = 单卷并发上限 × 卷数，和后端 `TaskConfig::normalize` 同一条规则。
+ *
+ * 前端也算一遍不是重复：保存后界面要立刻显示对的读数，而不是等下一轮轮询。
+ * 后端仍会重新派生，这里算错了也不会写进配置。
+ */
+export function deriveThreads(maxPerVolume: number, volumes: number): number {
+  return Math.min(128, Math.max(1, (maxPerVolume || 1) * Math.max(1, volumes)));
+}
+
 function toTaskConfig(
   values: FormValues,
   volumes: string[][],
   plugins: PluginEntry[],
   existing: TaskPluginConfig[],
 ): TaskConfig {
+  const filled = volumes.filter(volume => volume.length > 0);
   return {
-    volumes: volumes.filter(volume => volume.length > 0),
-    max_threads: values.max_threads,
+    volumes: filled,
+    max_threads: deriveThreads(values.max_per_volume, filled.length),
     max_per_volume: values.max_per_volume,
     max_split: values.max_split ? parseSize(values.max_split) : 0,
     cache: values.cache,
@@ -241,6 +252,12 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
   // 提交前就能看到，而不是按下保存才弹一条红色 message。
   const volumeIssue = useMemo(() => checkVolumes(volumes), [volumes]);
 
+  // 线程总数是派生值，不再是一个可填的字段 —— 但用户仍然需要看见它，否则
+  // 「单卷并发上限」就成了一个不知道会放大多少倍的旋钮。
+  const perVolume = Form.useWatch('max_per_volume', form) ?? 1;
+  const filledVolumes = volumes.filter(volume => volume.length > 0).length;
+  const derivedThreads = deriveThreads(perVolume, filledVolumes);
+
   useEffect(() => {
     if (!open) return;
     void loadPlugins();
@@ -327,8 +344,8 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
 
       <Form.Item
         name="headers"
-        label="自定义请求头 JSON"
-        tooltip="每个上游请求都会带上。放 Cookie / Referer / Authorization 这类源站要求的头。"
+        label="自定义请求头"
+        tooltip="每个上游请求都会带上。常用的三个（Referer / Cookie / User-Agent）可以直接填表单，其余的切到 raw JSON 写。"
         rules={[
           {
             validator: (_, value: string) => {
@@ -346,7 +363,7 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
           },
         ]}
       >
-        <Input.TextArea rows={4} placeholder={'{\n  "Cookie": "…"\n}'} />
+        <HeadersEditor />
       </Form.Item>
 
       <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -362,28 +379,19 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
 
   const transfer = (
     <>
-      <div className="form-grid">
-        <Form.Item
-          name="max_threads"
-          label="最大并发线程"
-          tooltip="这个任务最多同时开多少个上游请求。调度器优先把它们分到最大的未下载区间上；开太多会被源站限流（429 / 503）。"
-          rules={[{ required: true, message: '至少 1 个线程' }]}
-        >
-          <InputNumber min={1} max={128} style={{ width: '100%' }} />
-        </Form.Item>
-        <Form.Item
-          name="max_per_volume"
-          label="单卷并发上限"
-          tooltip="单个分卷最多几个并发请求，按源站的单 IP 连接限制来填（常见是 4）。播放卡在某一卷上时会临时突破它，避免整卷退化成单线程。"
-        >
-          <InputNumber min={1} max={128} style={{ width: '100%' }} />
-        </Form.Item>
-      </div>
+      <Form.Item
+        name="max_per_volume"
+        label="单卷并发上限"
+        tooltip="单个分卷最多几个并发请求，按源站的单 IP / 单对象连接限制来填（常见是 4）。这是唯一需要你判断的并发数字 —— 它取决于源站，而总线程数只是它乘以卷数。"
+        extra={`总线程数 = 单卷并发 × ${filledVolumes} 卷 = ${derivedThreads}`}
+      >
+        <InputNumber min={1} max={128} style={{ width: '100%' }} />
+      </Form.Item>
 
       <Form.Item
         name="max_split"
         label="分片大小"
-        tooltip="留空＝自动：下载按线程均分剩余量（大分片优先，不做试探），播放按离读头的距离从 2 MiB 起逐级翻倍。只有源站要攒齐整段才发第一个字节时才自动降到 8 MiB。手填则是所有分片的硬上限，只在上游对单个 Range 的长度有特殊要求时才需要。"
+        tooltip="留空＝自动：下载按线程均分剩余量（大分片优先，不做试探），播放紧贴读头铺等长小分片（2 MiB），攒出余量后再放大。只有源站要攒齐整段才发第一个字节时才自动降到 8 MiB。手填则是所有分片的硬上限，只在上游对单个 Range 的长度有特殊要求时才需要。"
         extra="留空即可，除非源站对单次 Range 请求的长度有硬性要求"
         rules={[sizeRule(MIN_SPLIT, `手填时不能小于 ${formatBytes(MIN_SPLIT)}（留空表示自动）`)]}
       >
@@ -512,7 +520,7 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
 /** 表单字段 → 它所在的分组，用于校验失败时自动切过去。 */
 function tabOfField(name: string): string {
   if (name === 'headers') return 'source';
-  if (['max_threads', 'max_per_volume', 'max_split', 'rate_limit_bps', 'rate_limit_algorithm', 'cache'].includes(name)) {
+  if (['max_per_volume', 'max_split', 'rate_limit_bps', 'rate_limit_algorithm', 'cache'].includes(name)) {
     return 'transfer';
   }
   if (name.startsWith('plugin_')) return 'plugins';

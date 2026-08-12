@@ -13,7 +13,7 @@
 //! Both can be on at once: the reader's window keeps priority while spare
 //! workers fill the rest of the file.
 use crate::cache::CacheEntry;
-use crate::engine::Engine;
+use crate::engine::{Engine, READER_BUFFER_PROBE};
 use crate::error::{ProxyError, Result};
 use crate::models::ThroughputSampler;
 use crate::schedule::{DEFAULT_CRITICAL_WINDOW, Scheduler, Strategy};
@@ -132,7 +132,9 @@ impl CacheJob {
         let threads = engine.config().max_threads.max(1);
         let scheduler = build_scheduler(&entry, &engine, total_size, threads, Strategy::Throughput);
         let complete = entry.contiguous_from(0, total_size) >= total_size;
-        let initial_done = entry.bytes_cached.load(Ordering::Relaxed);
+        // 速率基线要和 `tick_throughput` 采的是同一个计数器，否则第一拍会拿
+        // 「已补齐块数」减「本次写入量」，得到一个负值（saturating 成 0）。
+        let initial_done = entry.bytes_written.load(Ordering::Relaxed);
         Ok(Arc::new(Self {
             task_id,
             total_size,
@@ -187,9 +189,22 @@ impl CacheJob {
         self.retune();
         self.ensure_workers();
     }
-    /// Stop filling the rest of the file. Playback keeps running and keeps
-    /// filling around its own position, so the pool is re-bounded rather than
-    /// shut down whenever a reader is still attached.
+    /// Stop filling the rest of the file — **now**, not when the in-flight
+    /// requests happen to finish.
+    ///
+    /// The gentle version (bump the generation and let live claims land, on the
+    /// theory that their bytes are already paid for) reads as a broken button:
+    /// press stop on a 16-thread fill and the network keeps running for as long
+    /// as the longest claim takes, which with automatic sizing is a share of the
+    /// whole file. So the requests are aborted outright.
+    ///
+    /// Nothing is lost by that. Bytes are written to the sparse file as they
+    /// arrive, so whatever already landed stays on disk and stays in the bitmap;
+    /// only the not-yet-received tail of each claim is dropped. The scheduler is
+    /// then rebuilt from what is actually on disk — the aborted workers never
+    /// ran [`Scheduler::finish`], so their ranges would otherwise stay marked
+    /// live and never be handed out again — and the next start re-derives the
+    /// holes and picks up exactly where the disk left off.
     pub fn pause_cache(self: &Arc<Self>) {
         self.cache_requested.store(false, Ordering::Relaxed);
         {
@@ -198,16 +213,36 @@ impl CacheJob {
                 *state = JobState::Paused;
             }
         }
-        if self.readers.read().is_empty() {
-            self.drain_workers();
-        } else {
-            // A reader is still attached: re-bound the pool to its horizon and
-            // let the in-flight claims land (their bytes are already paid for).
-            // The draining workers restaff themselves under the new bound.
+        self.abort_workers();
+        self.rebuild_scheduler();
+        if !self.readers.read().is_empty() {
+            // A reader is still attached: playback is a separate concern from
+            // the whole-file fill and must not stop with it. Restaff around the
+            // reader immediately.
             self.retune();
-            self.drain_workers();
             self.ensure_workers();
         }
+    }
+
+    /// Re-derive the work plan from what is on disk right now.
+    ///
+    /// Build the replacement *before* taking the scheduler lock: reading the
+    /// staged ranges touches the cache entry's bitmap, and the two locks should
+    /// never be held at once.
+    fn rebuild_scheduler(&self) {
+        let strategy = if self.readers.read().is_empty() {
+            Strategy::Throughput
+        } else {
+            Strategy::latency_default()
+        };
+        let fresh = build_scheduler(
+            &self.entry,
+            &self.engine,
+            self.total_size,
+            self.threads,
+            strategy,
+        );
+        *self.scheduler.lock() = fresh;
     }
     pub fn stop(&self) {
         self.cache_requested.store(false, Ordering::Relaxed);
@@ -227,7 +262,9 @@ impl CacheJob {
         let mut last = self.last_sample.lock();
         let elapsed = now.duration_since(*last).as_secs_f64().max(0.001);
         *last = now;
-        let done = self.entry.bytes_cached.load(Ordering::Relaxed).min(self.total_size);
+        // 用真实写入量而不是已补齐的块数：后者按 1 MiB 取整，慢链路上开头读 0、
+        // 之后跳变。见 `CacheEntry::bytes_written`。
+        let done = self.entry.bytes_written.load(Ordering::Relaxed);
         let previous = self.last_done_bytes.swap(done, Ordering::Relaxed);
         let bps = ((done.saturating_sub(previous)) as f64 / elapsed) as u64;
         self.throughput.push(bps);
@@ -388,7 +425,7 @@ impl CacheJob {
     }
     fn reset_speed_baseline(&self) {
         self.last_done_bytes.store(
-            self.entry.bytes_cached.load(Ordering::Relaxed),
+            self.entry.bytes_written.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         *self.last_sample.lock() = Instant::now();
@@ -487,7 +524,15 @@ impl CacheJob {
             }
             cursor += available;
             self.readers.write().insert(id, cursor);
-            self.scheduler.lock().set_read_head(cursor);
+            // Report the runway along with the position: an unbuffered reader
+            // needs the pool packed behind it in short claims, a buffered one
+            // can afford long ones. See `Scheduler::claim_len`.
+            let ahead = self.entry.contiguous_from(cursor, READER_BUFFER_PROBE);
+            {
+                let mut sched = self.scheduler.lock();
+                sched.set_read_head(cursor);
+                sched.set_reader_buffer(ahead);
+            }
         }
         self.readers.write().remove(&id);
         if self.readers.read().is_empty() {
@@ -580,6 +625,21 @@ impl DownloadManager {
             job.tick_throughput();
             job.sweep_stalled();
         }
+    }
+    /// 所有正在填充的缓存任务的合计速率。
+    ///
+    /// 概览里的「实时吞吐」只数 `bytes_served`（发出去给客户端的字节），缓存
+    /// 填充是「从源站拉进磁盘」，一个客户端都没有 —— 于是按下「缓存整个文件」
+    /// 之后，面板上 250 MB/s 的下载显示成 0。这个数把那条流单独报出来，而不是
+    /// 混进 `bytes_served`：两者是方向相反的两条流，加在一起既会重复计数（边播
+    /// 边缓存时同一批字节两头都算），也让「累计发给客户端」不再是它字面的意思。
+    pub fn fill_speed_bps(&self) -> u64 {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| job.is_cache_active())
+            .map(|job| job.current_speed_bps.load(Ordering::Relaxed))
+            .sum()
     }
     pub fn persisted(&self) -> Vec<PersistedDownload> {
         self.jobs.read().values()

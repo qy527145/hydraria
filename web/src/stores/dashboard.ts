@@ -1,3 +1,4 @@
+import { message } from 'antd';
 import { create } from 'zustand';
 import { api, type GlobalState, type PluginEntry, type TaskInfo } from '../api/client';
 
@@ -11,7 +12,13 @@ interface DashboardState {
   error: string | null;
   refresh: () => Promise<void>;
   loadPlugins: () => Promise<void>;
-  /** 执行一个写操作，成功后立刻刷新，让卡片上的状态马上跟上。 */
+  /**
+   * 执行一个写操作，成功后立刻刷新，让卡片上的状态马上跟上。
+   *
+   * 失败必须**说出来**。调用点几乎都是 `void mutate(...)`，异常抛出去就变成
+   * 一个没人处理的 rejected promise —— 用户按下「缓存整个文件」、源站连不上，
+   * 界面却毫无反应，看起来像按钮坏了。这里统一弹一条错误并记进 store。
+   */
   mutate: (action: () => Promise<unknown>) => Promise<void>;
 }
 
@@ -41,6 +48,11 @@ export const useDashboard = create<DashboardState>((set, get) => ({
   mutate: async action => {
     try {
       await action();
+      set({ error: null });
+    } catch (error) {
+      const text = describe(error);
+      message.error(text);
+      set({ error: text });
     } finally {
       await get().refresh();
     }

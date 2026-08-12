@@ -28,6 +28,12 @@ const MIN_FETCH_ATTEMPTS: usize = 4;
 /// and the page cache.
 const READ_CHUNK: u64 = crate::cache::BLOCK_SIZE;
 
+/// How far ahead of the reader we look when measuring its buffer for the
+/// scheduler. Bounded because the probe walks the staging bitmap block by
+/// block, and because the answer only has to distinguish "no runway" from
+/// "plenty" — see [`crate::schedule::Scheduler::claim_len`].
+pub(crate) const READER_BUFFER_PROBE: u64 = 64 * 1024 * 1024;
+
 /// Ceiling on how far ahead of the serializer the in-memory fallback path
 /// (`stream_range`) may spawn fetchers, in chunks.
 ///
@@ -60,6 +66,13 @@ pub struct UpstreamProbe {
     /// before probing, and never `None` afterwards: even a single-volume
     /// task gets one `VolumeMeta` covering the whole file.
     pub volumes: Option<Vec<VolumeMeta>>,
+    /// Why the probe gave up, when it did. A single-volume task whose mirrors
+    /// all fail still returns a probe (so streaming can fall back to
+    /// passthrough), and that probe is indistinguishable from "the origin
+    /// answered, it just doesn't do ranges" — which is a wrong and confusing
+    /// thing to tell someone whose origin is simply unreachable. Callers that
+    /// can't fall back (whole-file caching) report this instead.
+    pub probe_error: Option<String>,
 }
 
 pub struct Engine {
@@ -465,6 +478,10 @@ impl Engine {
         let mut per_volume_filenames: Vec<Option<String>> = Vec::with_capacity(layout.len());
         let mut representative_urls: Vec<String> = Vec::with_capacity(layout.len());
         let mut accepts_ranges_all = true;
+        // 单卷任务探测彻底失败时会回落成「无 size、无 range」的空探测（好让
+        // 流式路径退到直通模式）。原因必须一路带到最外层，否则不能回落的调用方
+        // （整盘缓存）只能看到一个和「源站活着但不支持 Range」一模一样的结果。
+        let mut probe_error: Option<String> = None;
         let mut total_size: u64 = 0;
         let mut size_known_all = true;
         let mut offset: u64 = 0;
@@ -525,6 +542,10 @@ impl Engine {
             let (working_url, p) = match probe_result {
                 Some(v) => v,
                 None => {
+                    let reason = last_err
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no mirror answered the probe".to_string());
                     let base = last_err.unwrap_or(ProxyError::NoUpstream);
                     if multi_volume {
                         // Volumes need to be stitched in known sizes; we
@@ -559,6 +580,7 @@ impl Engine {
                             last_modified: None,
                             filename: None,
                             volumes: None,
+                            probe_error: Some(reason),
                         },
                     )
                 }
@@ -569,6 +591,9 @@ impl Engine {
             // `working_url` is guaranteed acceptable. Single-volume tasks
             // tolerate a non-Range probe by falling back to passthrough; the
             // engine just records the lack so the caller can decide.
+            if probe_error.is_none() {
+                probe_error = p.probe_error.clone();
+            }
             if !p.accepts_ranges {
                 accepts_ranges_all = false;
             }
@@ -640,6 +665,7 @@ impl Engine {
         Ok(UpstreamProbe {
             total_size: total,
             accepts_ranges: accepts_ranges_all,
+            probe_error,
             content_type,
             etag,
             last_modified,
@@ -784,8 +810,12 @@ impl Engine {
             }
         }
 
-        if head.is_none() && range_get.is_err() {
-            return Err(ProxyError::NoUpstream);
+        // 两步探测都没拿回任何响应 —— 把**真实原因**带出去。这里原本返回一个
+        // 笼统的 `NoUpstream`，它的文案是「no upstream URL available」，读起来
+        // 像「你没配 URL」，而真实情况是 DNS 解不出来 / 连接被拒 / TLS 握手失败。
+        // 调用方（整盘缓存）会把这句话原样念给用户听，笼统就等于把人指错方向。
+        if let (None, Err(error)) = (&head, range_get) {
+            return Err(ProxyError::Upstream(error));
         }
 
         if filename.is_none() {
@@ -795,6 +825,7 @@ impl Engine {
         Ok(UpstreamProbe {
             total_size,
             accepts_ranges,
+            probe_error: None,
             content_type,
             etag,
             last_modified,
@@ -2078,8 +2109,20 @@ impl StagedRun {
                 return;
             }
             cursor += n;
-            // Let a latency-first scheduler move its critical window with us.
-            self.scheduler.lock().set_read_head(cursor);
+            // Let a latency-first scheduler move its critical window with us,
+            // and tell it how much runway we already have: that is what
+            // decides whether the pool packs in short claims (nothing
+            // buffered — the prefix has to advance at aggregate rate) or
+            // stretches out (buffered — overhead amortization wins).
+            let ahead = self
+                .staging
+                .entry()
+                .contiguous_from(cursor, READER_BUFFER_PROBE);
+            {
+                let mut sched = self.scheduler.lock();
+                sched.set_read_head(cursor);
+                sched.set_reader_buffer(ahead);
+            }
             self.bump();
         }
         tracing::debug!("staged stream delivered [{}, {}] in full", start, end);

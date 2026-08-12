@@ -1,5 +1,4 @@
 import {
-  CopyOutlined,
   DeleteOutlined,
   EditOutlined,
   EllipsisOutlined,
@@ -58,8 +57,11 @@ function sourceHint(config: TaskConfig) {
 }
 
 /**
- * 一张卡片 = 一个任务。上半是密集的读数区（地址、吞吐、落盘分布、六格指标），
- * 下半是按两个场景分组的操作条。
+ * 一张卡片 = 一个任务。上半是密集的读数区（吞吐、落盘分布、四格指标），下半是
+ * 按两个场景分组的操作条。
+ *
+ * 代理地址**只**出现在「代理播放」那条操作条上。它既是读数又是动作入口，放两份
+ * 的结果是同一个 URL 在一张卡上出现两次、两个复制按钮，用户还得猜它们有没有区别。
  *
  * 读数在上、动作在下，而不是按场景切成左右两栏：`served`、`conns`、`split`
  * 这些数字对播放和缓存都成立，硬塞进某一栏只会被复制两遍或被丢掉一份。真正
@@ -73,11 +75,6 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
     await navigator.clipboard.writeText(JSON.stringify(task.config, null, 2));
     message.success('配置 JSON 已复制');
   };
-  const copyUrl = async () => {
-    await navigator.clipboard.writeText(task.proxy_url);
-    message.success('代理地址已复制');
-  };
-
   const menu: MenuProps['items'] = [
     { key: 'details', icon: <InfoCircleOutlined />, label: '源看板 / 任务详情', onClick: () => setDetailsOpen(true) },
     { key: 'edit', icon: <EditOutlined />, label: '编辑完整配置', onClick: () => onEdit(task) },
@@ -96,6 +93,8 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
 
   const job = task.cache_job;
   const cache = task.cache;
+  // 缓存填充进行中：曲线该跟着它走，而不是跟着一个没人连的 bytes_served。
+  const filling = job?.state === 'running';
   const total = job?.total_bytes ?? cache?.total_size ?? 0;
   const done = Math.min(job?.done_bytes ?? cache?.bytes_cached ?? 0, total || Number.MAX_SAFE_INTEGER);
   const pct = percent(done, total);
@@ -113,7 +112,7 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
       label: 'sources',
       value: `${sourceCount(task.config)}`,
       sub: `· ${task.config.max_threads} thr`,
-      title: `${sourceCount(task.config)} 个去重后的源 URL · 最多 ${task.config.max_threads} 个并发线程`,
+      title: `${sourceCount(task.config)} 个去重后的源 URL · ${task.config.max_threads} 个并发线程（单卷 ${task.config.max_per_volume} × ${task.config.volumes.length} 卷）`,
     },
     { label: 'served', value: formatBytes(task.bytes_served), title: '累计发给客户端的字节' },
     {
@@ -166,16 +165,25 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
         </Popconfirm>
       </header>
 
-      <div className="tc-url" onClick={() => void copyUrl()} title={`点击复制 ${task.proxy_url}`}>
-        <span>{task.proxy_url}</span>
-        <CopyOutlined />
-      </div>
-
-      <div className="tc-spark">
-        <span className="tc-cap">实时吞吐</span>
-        <Sparkline samples={task.speed_samples} />
-        <b>{formatSpeed(task.current_speed_bps)}</b>
-      </div>
+      {/* 一张卡片上其实有两条方向相反的流：发给客户端的（bytes_served）和从
+          源站拉进磁盘的（缓存填充）。曲线只有一条，所以显示**正在发生的那条**
+          并如实标注 —— 早先固定显示前者，于是按下「缓存整个文件」后，250 MB/s
+          的下载在卡片上写着 0 B/s。两者相加不是办法：边播边缓存时同一批字节会
+          被数两遍。 */}
+      <Tooltip
+        title={
+          <>
+            <div>发给客户端：{formatSpeed(task.current_speed_bps)}</div>
+            <div>从源站拉取：{formatSpeed(job?.current_speed_bps ?? 0)}</div>
+          </>
+        }
+      >
+        <div className="tc-spark">
+          <span className="tc-cap">{filling ? '缓存拉取' : '实时吞吐'}</span>
+          <Sparkline samples={filling ? (job?.speed_samples ?? []) : task.speed_samples} />
+          <b>{formatSpeed(filling ? (job?.current_speed_bps ?? 0) : task.current_speed_bps)}</b>
+        </div>
+      </Tooltip>
 
       {/* 进度条和分布条即使没有本地数据也占位。同一行里有的卡片有、有的没有的话，
           卡片高度就参差不齐；空态本身也是信息（"这个任务还没落过盘"）。 */}

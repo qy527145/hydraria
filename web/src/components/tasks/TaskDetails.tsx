@@ -23,7 +23,11 @@ export default function TaskDetails({ task, open, onClose }: Props) {
         bordered
         items={[
           { key: 'id', label: '任务 ID', children: task.task_id },
-          { key: 'threads', label: '线程', children: `${config.max_threads} / 单卷 ${config.max_per_volume}` },
+          {
+            key: 'threads',
+            label: '线程',
+            children: `${config.max_threads}（单卷 ${config.max_per_volume} × ${config.volumes.length} 卷）`,
+          },
           { key: 'split', label: '分片', children: config.max_split ? formatBytes(config.max_split) : '自动' },
           {
             key: 'sources',
