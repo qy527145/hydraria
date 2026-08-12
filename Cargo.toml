@@ -1,9 +1,10 @@
 [package]
 name = "hydraria"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 description = "High-performance multi-threaded HTTP streaming proxy with web dashboard"
 license = "Apache-2.0"
+authors = ["wmymz"]
 repository = "https://github.com/qy527145/hydraria"
 # The dashboard is embedded from web/dist, which is committed so that
 # `cargo install` (crates.io or --git) never needs node/npm. After changing
@@ -17,6 +18,12 @@ include = [
     "/LICENSE",
     "/docs/**",
 ]
+
+[package.metadata.wix]
+upgrade-guid = "6C6688C5-58D4-4F06-BA74-98D129AD95FC"
+path-guid = "304E1F44-EE75-4EF8-BD12-ABF2FF88678D"
+license = false
+eula = false
 
 [dependencies]
 axum = { version = "0.8.9", features = ["macros"] }
@@ -51,3 +58,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
