@@ -296,7 +296,9 @@ pub struct TransformPipeline {
 
 impl TransformPipeline {
     pub fn new() -> Self {
-        Self { transforms: Vec::new() }
+        Self {
+            transforms: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, t: Arc<dyn ByteTransform>) {
@@ -365,7 +367,10 @@ impl PluginRegistry {
             .filter_map(|id| {
                 let p = self.by_id.get(id)?;
                 let default_global = p.default_global_config();
-                let _ = globals.get(id).cloned().unwrap_or_else(|| default_global.clone());
+                let _ = globals
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| default_global.clone());
                 Some(PluginInfo {
                     id: p.id().to_string(),
                     name: p.name().to_string(),
@@ -398,10 +403,7 @@ impl PluginRegistry {
             let plugin = match self.by_id.get(&pc.id) {
                 Some(p) => p,
                 None => {
-                    tracing::warn!(
-                        "task references unknown plugin id '{}'; skipping",
-                        pc.id
-                    );
+                    tracing::warn!("task references unknown plugin id '{}'; skipping", pc.id);
                     continue;
                 }
             };

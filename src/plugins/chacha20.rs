@@ -252,10 +252,7 @@ impl ProxyPlugin for ChaCha20Plugin {
                 key: "max_volume_size".into(),
                 label: "分卷最大大小".into(),
                 kind: FieldKind::Size,
-                hint: Some(
-                    "留空或 0 = 单文件;支持 5M / 512K / 1G 这种写法"
-                        .into(),
-                ),
+                hint: Some("留空或 0 = 单文件;支持 5M / 512K / 1G 这种写法".into()),
                 required: false,
                 generate_random_bytes: None,
                 default_filename: None,
@@ -266,10 +263,7 @@ impl ProxyPlugin for ChaCha20Plugin {
                 key: "split_mode".into(),
                 label: "分卷策略".into(),
                 kind: FieldKind::Select,
-                hint: Some(
-                    "随机大小适合伪装分发;固定大小最后一卷为余数"
-                        .into(),
-                ),
+                hint: Some("随机大小适合伪装分发;固定大小最后一卷为余数".into()),
                 required: false,
                 generate_random_bytes: None,
                 default_filename: None,
@@ -290,8 +284,7 @@ impl ProxyPlugin for ChaCha20Plugin {
                 label: "启用 ChaCha20 加密".into(),
                 kind: FieldKind::Boolean,
                 hint: Some(
-                    "取消勾选 = 仅按规则切分输入文件,不加密 (此时密钥/Nonce 字段被忽略)"
-                        .into(),
+                    "取消勾选 = 仅按规则切分输入文件,不加密 (此时密钥/Nonce 字段被忽略)".into(),
                 ),
                 required: false,
                 generate_random_bytes: None,
@@ -330,8 +323,8 @@ impl ProxyPlugin for ChaCha20Plugin {
     }
 
     fn validate_global_config(&self, config: &serde_json::Value) -> Result<(), String> {
-        let g: GlobalCfg = serde_json::from_value(config.clone())
-            .map_err(|e| format!("global config: {e}"))?;
+        let g: GlobalCfg =
+            serde_json::from_value(config.clone()).map_err(|e| format!("global config: {e}"))?;
         if let Some(raw) = g.buffer_size {
             let b = coerce_size(&raw, "buffer_size")?;
             if b < 4 * 1024 || b > 64 * 1024 * 1024 {
@@ -346,8 +339,8 @@ impl ProxyPlugin for ChaCha20Plugin {
         _global: &serde_json::Value,
         task: &serde_json::Value,
     ) -> Result<(), String> {
-        let t: TaskCfg = serde_json::from_value(task.clone())
-            .map_err(|e| format!("task config: {e}"))?;
+        let t: TaskCfg =
+            serde_json::from_value(task.clone()).map_err(|e| format!("task config: {e}"))?;
         let _ = resolve_secret(&t)?;
         Ok(())
     }
@@ -357,8 +350,8 @@ impl ProxyPlugin for ChaCha20Plugin {
         _global: &serde_json::Value,
         task: &serde_json::Value,
     ) -> Result<Arc<dyn ByteTransform>, String> {
-        let t: TaskCfg = serde_json::from_value(task.clone())
-            .map_err(|e| format!("task config: {e}"))?;
+        let t: TaskCfg =
+            serde_json::from_value(task.clone()).map_err(|e| format!("task config: {e}"))?;
         let (key, nonce) = resolve_secret(&t)?;
         Ok(Arc::new(ChaCha20Transform { key, nonce }))
     }
@@ -370,12 +363,12 @@ impl ProxyPlugin for ChaCha20Plugin {
         params: &serde_json::Value,
         progress: crate::plugins::ProgressSender,
     ) -> Result<ForwardResult, String> {
-        let g: GlobalCfg = serde_json::from_value(global.clone())
-            .map_err(|e| format!("global config: {e}"))?;
-        let mut t: TaskCfg = serde_json::from_value(task.clone())
-            .map_err(|e| format!("task config: {e}"))?;
-        let p: ForwardParams = serde_json::from_value(params.clone())
-            .map_err(|e| format!("forward params: {e}"))?;
+        let g: GlobalCfg =
+            serde_json::from_value(global.clone()).map_err(|e| format!("global config: {e}"))?;
+        let mut t: TaskCfg =
+            serde_json::from_value(task.clone()).map_err(|e| format!("task config: {e}"))?;
+        let p: ForwardParams =
+            serde_json::from_value(params.clone()).map_err(|e| format!("forward params: {e}"))?;
 
         // Resolve / generate secrets first — fail fast before any disk IO.
         // Only relevant when actually encrypting; pure-split mode skips this
@@ -531,8 +524,8 @@ impl ProxyPlugin for ChaCha20Plugin {
                 substitute_volume_marker(&suffix_template, idx + 1, pad_width)
             };
             let path = output_dir.join(format!("{}{}", prefix, suffix));
-            let out_file = File::create(&path)
-                .map_err(|e| format!("create '{}': {}", path.display(), e))?;
+            let out_file =
+                File::create(&path).map_err(|e| format!("create '{}': {}", path.display(), e))?;
             let mut writer = BufWriter::with_capacity(buffer_size, out_file);
 
             let mut remaining = *vol_size;
@@ -613,10 +606,7 @@ impl ProxyPlugin for ChaCha20Plugin {
         let bytes_in = total_size;
         let bytes_out = written.iter().map(|v| v.size).sum();
         let message = if !p.encrypt {
-            Some(format!(
-                "已切分为 {} 个分卷 (未加密)。",
-                written.len()
-            ))
+            Some(format!("已切分为 {} 个分卷 (未加密)。", written.len()))
         } else if generated_secret {
             Some(
                 "已加密。新生成的合并密钥 (secret) 见下方,请立即复制保存,关闭后无法找回。"
@@ -791,7 +781,8 @@ fn apply_keystream_parallel(
         if let Err(e) = cipher.try_seek(merged_offset) {
             tracing::warn!(
                 "chacha20 forward seek to offset {} failed: {}",
-                merged_offset, e,
+                merged_offset,
+                e,
             );
             return;
         }
@@ -825,10 +816,7 @@ fn apply_keystream_parallel(
             handles.push(s.spawn(move || {
                 let mut cipher = ChaCha20::new(key.into(), nonce.into());
                 if let Err(e) = cipher.try_seek(off) {
-                    tracing::warn!(
-                        "chacha20 forward seek to offset {} failed: {}",
-                        off, e,
-                    );
+                    tracing::warn!("chacha20 forward seek to offset {} failed: {}", off, e,);
                     return;
                 }
                 cipher.apply_keystream(head);
@@ -877,7 +865,8 @@ impl ByteTransform for ChaCha20Transform {
         if let Err(e) = cipher.try_seek(merged_offset) {
             tracing::warn!(
                 "chacha20 seek to offset {} failed: {}; bytes will not be decrypted",
-                merged_offset, e
+                merged_offset,
+                e
             );
             return;
         }
@@ -899,9 +888,7 @@ fn resolve_secret(t: &TaskCfg) -> Result<([u8; KEY_LEN], [u8; NONCE_LEN]), Strin
 /// Same as `resolve_secret`, but returns `None` instead of erroring when the
 /// task carries no secret material at all — used by the forward tool, which
 /// can also generate fresh secrets when asked.
-fn resolve_secret_opt(
-    t: &TaskCfg,
-) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
+fn resolve_secret_opt(t: &TaskCfg) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
     if let Some(pair) = parse_secret_opt(t.secret.as_deref())? {
         return Ok(Some(pair));
     }
@@ -919,9 +906,7 @@ fn resolve_secret_opt(
 
 /// Parse the combined `secret` hex string into a (key, nonce) pair. Empty /
 /// absent → `Ok(None)` (caller decides whether that's an error).
-fn parse_secret_opt(
-    s: Option<&str>,
-) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
+fn parse_secret_opt(s: Option<&str>) -> Result<Option<([u8; KEY_LEN], [u8; NONCE_LEN])>, String> {
     let trimmed = s.map(|s| s.trim()).filter(|s| !s.is_empty());
     let s = match trimmed {
         Some(v) => v,
@@ -1090,8 +1075,12 @@ mod tests {
         let secret = "0".repeat((KEY_LEN + NONCE_LEN) * 2);
         let combined = serde_json::json!({ "secret": secret });
         let legacy = serde_json::json!({ "key": fixed_key(), "nonce": fixed_nonce() });
-        let t1 = plugin.build_transform(&serde_json::Value::Null, &combined).unwrap();
-        let t2 = plugin.build_transform(&serde_json::Value::Null, &legacy).unwrap();
+        let t1 = plugin
+            .build_transform(&serde_json::Value::Null, &combined)
+            .unwrap();
+        let t2 = plugin
+            .build_transform(&serde_json::Value::Null, &legacy)
+            .unwrap();
         let mut a = b"some plaintext payload".to_vec();
         let mut b = a.clone();
         t1.transform(0, &mut a);
@@ -1125,8 +1114,12 @@ mod tests {
             "nonce": fixed_nonce(),
         });
         let combined_only = serde_json::json!({ "secret": "f".repeat((KEY_LEN + NONCE_LEN) * 2) });
-        let t1 = plugin.build_transform(&serde_json::Value::Null, &task).unwrap();
-        let t2 = plugin.build_transform(&serde_json::Value::Null, &combined_only).unwrap();
+        let t1 = plugin
+            .build_transform(&serde_json::Value::Null, &task)
+            .unwrap();
+        let t2 = plugin
+            .build_transform(&serde_json::Value::Null, &combined_only)
+            .unwrap();
         let mut a = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let mut b = a.clone();
         t1.transform(0, &mut a);
@@ -1161,7 +1154,9 @@ mod tests {
                     assert!(
                         s >= max / 2,
                         "non-final volume {} below lower bound: {} < {}",
-                        i, s, max / 2
+                        i,
+                        s,
+                        max / 2
                     );
                 }
             }
@@ -1205,8 +1200,14 @@ mod tests {
 
     #[test]
     fn substitute_volume_marker_pads_correctly() {
-        assert_eq!(substitute_volume_marker(".part{N}.enc", 1, 2), ".part01.enc");
-        assert_eq!(substitute_volume_marker(".part{N}.enc", 12, 2), ".part12.enc");
+        assert_eq!(
+            substitute_volume_marker(".part{N}.enc", 1, 2),
+            ".part01.enc"
+        );
+        assert_eq!(
+            substitute_volume_marker(".part{N}.enc", 12, 2),
+            ".part12.enc"
+        );
         assert_eq!(substitute_volume_marker("{N}_blob", 7, 3), "007_blob");
     }
 
@@ -1251,7 +1252,10 @@ mod tests {
         let mut b = a.clone();
         apply_keystream_parallel(&key, &nonce, 0, &mut a);
         single_threaded_keystream(&key, &nonce, 0, &mut b);
-        assert_eq!(a, b, "parallel result must match single-threaded byte-for-byte");
+        assert_eq!(
+            a, b,
+            "parallel result must match single-threaded byte-for-byte"
+        );
     }
 
     #[test]

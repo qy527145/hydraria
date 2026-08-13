@@ -85,14 +85,10 @@ fn pick_inner(req: PickRequest) -> Result<Option<PathBuf>, String> {
         .unwrap_or_default();
 
     let script = match req.kind {
-        PickKind::OpenFile => format!(
-            r#"POSIX path of (choose file with prompt "{}")"#,
-            title
-        ),
-        PickKind::OpenDirectory => format!(
-            r#"POSIX path of (choose folder with prompt "{}")"#,
-            title
-        ),
+        PickKind::OpenFile => format!(r#"POSIX path of (choose file with prompt "{}")"#, title),
+        PickKind::OpenDirectory => {
+            format!(r#"POSIX path of (choose folder with prompt "{}")"#, title)
+        }
         PickKind::SaveFile => {
             if default_name.is_empty() {
                 format!(
