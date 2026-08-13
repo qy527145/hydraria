@@ -142,6 +142,71 @@ pub const DEFAULT_HEAD_CLAIM: u64 = 2 * 1024 * 1024;
 /// costs a full read timeout. See [`Scheduler::note_claim_outcome`].
 pub const RECOVERY_CLAIM: u64 = 8 * 1024 * 1024;
 
+/// How long a learned claim-size wall stays valid.
+///
+/// The wall is learned from a single observation — one claim that timed out
+/// having delivered nothing — so it can also be learned from a one-off network
+/// blip. Inside a request that is self-correcting (the request ends); once the
+/// wall outlives the request it needs its own expiry, or one bad moment would
+/// hold a task at recovery-sized claims forever.
+///
+/// Ten minutes is the same order as the profile TTLs aria2 (`24h`) and
+/// safedrive (`10min`) use, and it turns the worst case from "pay a read
+/// timeout on every seek" into "pay one every ten minutes".
+const CLAIM_WALL_TTL: Duration = Duration::from_secs(600);
+
+/// Cross-request memory of the largest range an origin will actually swallow.
+///
+/// Without this, [`Scheduler::auto_wall`] resets to `u64::MAX` for every new
+/// [`Scheduler`] — and a staged stream builds one per client request, so a
+/// player that reconnects on every seek re-learns the wall each time, paying a
+/// full read timeout to do it.
+///
+/// Only ever tightens while a learned value is live: the wall records "this
+/// origin failed above N", and a second, larger failure says nothing new.
+/// Expiry is what lets it widen again.
+#[derive(Debug, Default)]
+pub struct ClaimWall {
+    inner: parking_lot::Mutex<Option<(u64, Instant)>>,
+}
+
+impl ClaimWall {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The remembered wall, or `None` if nothing was learned or it has expired.
+    pub fn get(&self) -> Option<u64> {
+        let mut slot = self.inner.lock();
+        match *slot {
+            Some((bytes, at)) if at.elapsed() < CLAIM_WALL_TTL => Some(bytes),
+            Some(_) => {
+                // Expired: drop it so a recovered origin gets full-size claims
+                // again instead of being pinned by an old bad minute.
+                *slot = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remember that this origin could not swallow ranges above `bytes`.
+    pub fn record(&self, bytes: u64) {
+        let mut slot = self.inner.lock();
+        let tightened = match *slot {
+            Some((prev, at)) if at.elapsed() < CLAIM_WALL_TTL => prev.min(bytes),
+            _ => bytes,
+        };
+        *slot = Some((tightened, Instant::now()));
+    }
+
+    /// Forget everything learned — used when the task's URLs change, since the
+    /// wall describes an origin that may no longer be in the list.
+    pub fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+}
+
 /// How the scheduler prioritizes and sizes claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -348,6 +413,14 @@ pub struct Scheduler {
     /// ending one is not. Successful claims work strikes back off, so a
     /// transient 429 costs a short stagger, not a permanently narrower pool.
     overload_strikes: u32,
+    /// The longest `Retry-After` the origin has asked for and we have not yet
+    /// served. Cleared once a claim succeeds, so a stale hint cannot keep
+    /// inflating the pause after the origin has recovered.
+    overload_hint: Option<Duration>,
+    /// Cross-request memory of [`Scheduler::auto_wall`], when the caller has
+    /// one to share. `None` keeps the scheduler self-contained (what the tests
+    /// use): everything learned dies with this instance.
+    wall_memory: Option<Arc<ClaimWall>>,
 }
 
 impl Scheduler {
@@ -385,11 +458,28 @@ impl Scheduler {
             dup_budget: (req_end.saturating_sub(req_start).saturating_add(1) / DUP_BUDGET_DIVISOR)
                 .min(DUP_BUDGET_MAX),
             overload_strikes: 0,
+            overload_hint: None,
+            wall_memory: None,
         };
         for &(s0, e0) in already_staged {
             s.subtract(s0, e0);
         }
         s
+    }
+
+    /// Share a cross-request [`ClaimWall`] with this scheduler.
+    ///
+    /// Seeds sizing from whatever the origin already taught us, so a fresh
+    /// request does not have to re-discover an oversized-range wall by paying
+    /// another read timeout. Recovery still climbs back towards the strategy's
+    /// size on every successful claim — the wall is a ceiling, not a target.
+    pub fn with_claim_wall(mut self, wall: Arc<ClaimWall>) -> Self {
+        if let Some(remembered) = wall.get() {
+            self.auto_wall = remembered;
+            self.auto_limit = Some(RECOVERY_CLAIM.min(remembered));
+        }
+        self.wall_memory = Some(wall);
+        self
     }
 
     /// Total bytes nobody is working on yet.
@@ -694,6 +784,11 @@ impl Scheduler {
             // so work off one strike. Additive recovery against multiplicative
             // backoff — the same shape TCP uses, and for the same reason.
             self.overload_strikes = self.overload_strikes.saturating_sub(1);
+            if self.overload_strikes == 0 {
+                // Fully recovered: drop the origin's old wait request, or it
+                // would keep padding every future pause.
+                self.overload_hint = None;
+            }
             // Recovery: climb back towards the strategy's size, but never past
             // what this upstream has been shown to swallow.
             if let Some(limit) = self.auto_limit {
@@ -707,7 +802,7 @@ impl Scheduler {
             return true;
         }
         let issued = claim.issued_len();
-        match self.auto_limit {
+        let counts = match self.auto_limit {
             Some(limit) if issued > limit => false,
             Some(limit) => {
                 let cut = (limit / 2).max(MIN_CLAIM);
@@ -720,7 +815,13 @@ impl Scheduler {
                 self.auto_limit = Some(RECOVERY_CLAIM.min(self.auto_wall));
                 false
             }
+        };
+        // Hand what we just learned to the next request against this task, so
+        // it does not have to buy the same lesson with another read timeout.
+        if let Some(wall) = &self.wall_memory {
+            wall.record(self.auto_wall);
         }
+        counts
     }
 
     /// The ceiling automatic sizing is currently holding itself to, if any —
@@ -736,8 +837,19 @@ impl Scheduler {
     /// answer here: on a single-origin task there is nowhere to rotate to, so
     /// the retry lands on the same rate limiter and burns the task's failure
     /// budget at full speed.
-    pub fn note_overload(&mut self) {
+    ///
+    /// `retry_after` is the origin's own `Retry-After`, already sanity-checked
+    /// and clamped by the caller. It is treated as a *floor*, not a
+    /// replacement: honouring a server that keeps answering "wait 1s" while it
+    /// keeps refusing us would hammer it once a second forever, so the strike
+    /// ladder still escalates underneath.
+    pub fn note_overload(&mut self, retry_after: Option<Duration>) {
         self.overload_strikes = (self.overload_strikes + 1).min(OVERLOAD_STRIKES_MAX);
+        if let Some(hint) = retry_after {
+            // Keep the longest outstanding request; a shorter later hint must
+            // not shrink a wait we already committed to.
+            self.overload_hint = Some(self.overload_hint.map_or(hint, |cur| cur.max(hint)));
+        }
     }
 
     /// How long `worker` should wait before taking its next claim.
@@ -746,6 +858,11 @@ impl Scheduler {
     /// everything down: an unjittered pause is served by every worker at once,
     /// so they resynchronise and hit the origin in the same bursts that earned
     /// the 429. Spreading them across the window staggers the requests instead.
+    ///
+    /// A `Retry-After` from the origin raises the floor but never lowers it, so
+    /// a server asking for less time than our own escalation says gets our
+    /// escalation. Jitter is applied on top either way — even a server-dictated
+    /// wait must not release the whole pool at the same instant.
     pub fn overload_backoff(&self, worker: usize) -> Option<Duration> {
         if self.overload_strikes == 0 {
             return None;
@@ -753,6 +870,10 @@ impl Scheduler {
         let scaled = OVERLOAD_BACKOFF_BASE
             .saturating_mul(1u32 << (self.overload_strikes - 1))
             .min(OVERLOAD_BACKOFF_MAX);
+        let scaled = match self.overload_hint {
+            Some(hint) => scaled.max(hint),
+            None => scaled,
+        };
         // Deterministic per-worker offset over [0, scaled): no RNG dependency,
         // and reproducible in tests.
         let span = scaled.as_millis() as u64;
@@ -1298,7 +1419,7 @@ mod tests {
         let mut s = sched(Strategy::Throughput, 8, None);
         let mut last = Duration::ZERO;
         for _ in 0..OVERLOAD_STRIKES_MAX {
-            s.note_overload();
+            s.note_overload(None);
             // Worker 0's jitter offset is 0, so it reads the base pause exactly.
             let now = s.overload_backoff(0).unwrap();
             assert!(now >= last, "backoff must not shrink while strikes climb");
@@ -1307,7 +1428,7 @@ mod tests {
         assert_eq!(s.overload_strikes(), OVERLOAD_STRIKES_MAX);
         // Further strikes neither overflow the shift nor exceed the cap.
         for _ in 0..4 {
-            s.note_overload();
+            s.note_overload(None);
         }
         assert_eq!(s.overload_strikes(), OVERLOAD_STRIKES_MAX);
         assert_eq!(s.overload_backoff(0).unwrap(), OVERLOAD_BACKOFF_MAX);
@@ -1316,8 +1437,8 @@ mod tests {
     #[test]
     fn overload_backoff_staggers_workers_instead_of_pausing_them_together() {
         let mut s = sched(Strategy::Throughput, 8, None);
-        s.note_overload();
-        s.note_overload();
+        s.note_overload(None);
+        s.note_overload(None);
         // The point of the jitter: an unjittered pause is served by the whole
         // pool at once, which resynchronises it into the same burst that earned
         // the 429 in the first place.
@@ -1332,8 +1453,8 @@ mod tests {
     #[test]
     fn a_successful_claim_works_off_one_strike() {
         let mut s = sched(Strategy::Throughput, 4, None);
-        s.note_overload();
-        s.note_overload();
+        s.note_overload(None);
+        s.note_overload(None);
         assert_eq!(s.overload_strikes(), 2);
 
         let c = s.claim(0).expect("a fresh scheduler has work");
@@ -1350,6 +1471,121 @@ mod tests {
         s.note_claim_outcome(true, &c);
         assert_eq!(s.overload_strikes(), 0);
         assert_eq!(s.overload_backoff(0), None, "recovered pools do not wait");
+    }
+
+    #[test]
+    fn a_fresh_wall_remembers_nothing() {
+        let w = ClaimWall::new();
+        assert_eq!(w.get(), None);
+        // Seeding from an empty wall must leave sizing exactly as it was.
+        let plain = sched(Strategy::Throughput, 8, None);
+        let seeded =
+            sched(Strategy::Throughput, 8, None).with_claim_wall(Arc::new(ClaimWall::new()));
+        assert_eq!(seeded.auto_limit(), plain.auto_limit());
+        assert_eq!(seeded.auto_claim_len(), plain.auto_claim_len());
+    }
+
+    #[test]
+    fn the_wall_only_tightens() {
+        let w = ClaimWall::new();
+        w.record(32 * MIN_CLAIM);
+        w.record(8 * MIN_CLAIM);
+        assert_eq!(w.get(), Some(8 * MIN_CLAIM));
+        // A later, larger failure says nothing new — it must not widen.
+        w.record(64 * MIN_CLAIM);
+        assert_eq!(w.get(), Some(8 * MIN_CLAIM));
+        w.clear();
+        assert_eq!(w.get(), None);
+    }
+
+    #[test]
+    fn a_learned_wall_seeds_the_next_scheduler() {
+        let wall = Arc::new(ClaimWall::new());
+
+        // First request: a big claim times out having delivered nothing.
+        let mut first = sched(Strategy::Throughput, 4, None).with_claim_wall(Arc::clone(&wall));
+        let c = first.claim(0).expect("fresh scheduler has work");
+        first.finish(0, c.start);
+        first.note_claim_outcome(false, &c);
+        let learned = wall.get().expect("the failure must be remembered");
+
+        // Second request against the same task starts already knowing, instead
+        // of buying the same lesson with another read timeout.
+        let second = sched(Strategy::Throughput, 4, None).with_claim_wall(Arc::clone(&wall));
+        assert_eq!(second.auto_limit(), Some(RECOVERY_CLAIM.min(learned)));
+        assert!(
+            second.auto_claim_len() <= learned,
+            "a seeded scheduler must not re-issue a claim above the wall"
+        );
+    }
+
+    #[test]
+    fn the_wall_expires_so_one_bad_minute_is_not_permanent() {
+        let w = ClaimWall::new();
+        w.record(MIN_CLAIM);
+        assert_eq!(w.get(), Some(MIN_CLAIM));
+        // Backdate past the TTL: a stale wall must stop constraining, or a
+        // single blip would hold the task at recovery-sized claims forever.
+        *w.inner.lock() = Some((
+            MIN_CLAIM,
+            Instant::now() - CLAIM_WALL_TTL - Duration::from_secs(1),
+        ));
+        assert_eq!(w.get(), None);
+    }
+
+    #[test]
+    fn a_retry_after_hint_raises_the_floor_but_never_lowers_it() {
+        // Server asks for much longer than our first-strike pause.
+        let mut generous = sched(Strategy::Throughput, 4, None);
+        generous.note_overload(Some(Duration::from_secs(30)));
+        assert!(
+            generous.overload_backoff(0).unwrap() >= Duration::from_secs(30),
+            "an explicit Retry-After must be honoured when it exceeds our ladder"
+        );
+
+        // Server asks for less than our ladder already decided. Honouring that
+        // would hammer an origin that keeps refusing us, so our value wins.
+        let mut stingy = sched(Strategy::Throughput, 4, None);
+        for _ in 0..OVERLOAD_STRIKES_MAX {
+            stingy.note_overload(Some(Duration::from_millis(1)));
+        }
+        let ours = OVERLOAD_BACKOFF_MAX;
+        assert!(
+            stingy.overload_backoff(0).unwrap() >= ours,
+            "a tiny Retry-After must not undercut the escalation we earned"
+        );
+    }
+
+    #[test]
+    fn a_retry_after_hint_is_still_jittered() {
+        // Even a server-dictated wait must not release the whole pool at once.
+        let mut s = sched(Strategy::Throughput, 8, None);
+        s.note_overload(Some(Duration::from_secs(10)));
+        let waits: std::collections::HashSet<_> =
+            (0..8).map(|w| s.overload_backoff(w).unwrap()).collect();
+        assert!(
+            waits.len() > 1,
+            "server-dictated waits resynchronised the pool"
+        );
+    }
+
+    #[test]
+    fn recovery_forgets_the_retry_after_hint() {
+        let mut s = sched(Strategy::Throughput, 4, None);
+        s.note_overload(Some(Duration::from_secs(45)));
+
+        // Work the single strike off; the hint must go with it, or every future
+        // pause would stay padded by a request the origin has long since
+        // stopped making.
+        let c = s.claim(0).expect("fresh scheduler has work");
+        s.finish(0, c.end());
+        s.note_claim_outcome(true, &c);
+        assert_eq!(s.overload_strikes(), 0);
+        assert_eq!(s.overload_backoff(0), None);
+
+        // A later, hint-free strike must fall back to the base ladder.
+        s.note_overload(None);
+        assert!(s.overload_backoff(0).unwrap() < Duration::from_secs(45));
     }
 
     fn sched(strategy: Strategy, threads: usize, cap: Option<u64>) -> Scheduler {

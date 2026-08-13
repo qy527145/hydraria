@@ -665,6 +665,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "hex",
+ "httpdate",
  "mime_guess",
  "parking_lot",
  "rand 0.8.6",

@@ -248,6 +248,25 @@ pub struct UrlHealthAcc {
     pub window_bytes: AtomicU64,
     pub current_speed_bps: AtomicU64,
     pub in_flight_requests: AtomicU32,
+    /// Normalized `ETag` this specific URL has been seen to serve.
+    ///
+    /// **Per-URL on purpose.** Mirrors of identical content routinely report
+    /// different ETags (nginx derives them from mtime+size, so two servers
+    /// holding the same bytes disagree), so comparing one mirror's ETag against
+    /// another's — or against a single task-wide value — would false-positive on
+    /// every healthy multi-mirror task. Comparing a URL only against itself
+    /// detects the thing we actually care about: an origin that swapped its
+    /// content out from under an in-flight download.
+    pub observed_etag: parking_lot::Mutex<Option<String>>,
+    /// How many times this URL has contradicted its own earlier `ETag`.
+    ///
+    /// Bounds the damage when a URL's validators are simply unstable — a CDN
+    /// fronting several origins whose mtimes differ can hand out a different
+    /// ETag per request for byte-identical content. Treating that as corruption
+    /// forever would fail every claim and take the whole task down, which is
+    /// strictly worse than not checking at all. After a couple of strikes the
+    /// check stops trusting this URL's validators and stands down.
+    pub etag_mismatches: AtomicU32,
 }
 
 impl UrlHealthAcc {
@@ -264,6 +283,8 @@ impl UrlHealthAcc {
             window_bytes: AtomicU64::new(0),
             current_speed_bps: AtomicU64::new(0),
             in_flight_requests: AtomicU32::new(0),
+            observed_etag: parking_lot::Mutex::new(None),
+            etag_mismatches: AtomicU32::new(0),
         }
     }
 
@@ -427,6 +448,12 @@ pub struct TaskEntry {
     /// these and goes straight to the 1-byte Range GET. Cleared whenever the
     /// task's volume list changes.
     pub head_unsupported: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
+    /// What this task's origins have taught us about how large a range they
+    /// will swallow. Shared by every scheduler the task builds, because a
+    /// scheduler is built per client request and the lesson costs a full read
+    /// timeout to learn. Expires on its own (see `ClaimWall`) and is cleared
+    /// whenever the volume list changes.
+    pub claim_wall: Arc<crate::schedule::ClaimWall>,
 }
 
 impl TaskConfig {
@@ -522,6 +549,7 @@ impl TaskEntry {
             probe_cache: Mutex::new(None),
             probe_inflight: tokio::sync::Mutex::new(()),
             head_unsupported: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
+            claim_wall: Arc::new(crate::schedule::ClaimWall::new()),
         }
     }
 
@@ -570,6 +598,8 @@ impl TaskEntry {
             // just fixed/replaced. Drop both.
             *self.probe_cache.lock() = None;
             self.head_unsupported.write().clear();
+            // The wall describes an origin that may no longer be in the list.
+            self.claim_wall.clear();
         }
         // `max_threads` 是派生值，PATCH 里带上也只会被下面重新算出来 —— 保留
         // 这个字段只为兼容老客户端的请求体，不让它报错。

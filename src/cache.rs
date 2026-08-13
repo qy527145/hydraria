@@ -1560,11 +1560,14 @@ mod prealloc_tests {
     /// `preallocate` must reserve real blocks rather than leaving a hole, and
     /// `set_len` after it must still produce the exact logical length.
     ///
-    /// The reservation is checked against a sparse control file rather than
-    /// against `len`, because it is best-effort by contract: APFS honours
-    /// `F_PREALLOCATE` approximately (a 4 MiB request reports ~3.8 MiB of
-    /// `st_blocks` on a fresh file), and some filesystems decline entirely.
-    /// What must hold is that it did *something* a bare `set_len` would not.
+    /// What this deliberately does **not** assert is any particular fraction of
+    /// `len`. Preallocation is best-effort by contract, and APFS proves it: the
+    /// same 4 MiB request reports ~3.8 MiB of `st_blocks` on an idle machine and
+    /// ~1.9 MiB when the rest of this suite is hammering the filesystem. Any
+    /// threshold there is a guess about the allocator that will flake. The
+    /// property that actually matters — and the regression worth catching, a
+    /// silent no-op from a wrong flag, a bad `cfg`, or a swallowed error — is
+    /// "reserved strictly more than a bare `set_len` would".
     #[test]
     fn preallocate_reserves_real_blocks() {
         use std::os::unix::fs::MetadataExt;
@@ -1584,8 +1587,8 @@ mod prealloc_tests {
         let reserved = f.metadata().unwrap().blocks() * 512;
         assert_eq!(f.metadata().unwrap().len(), len, "logical length is exact");
 
-        // The control: a bare set_len leaves a hole. Without this the test
-        // would still pass on a platform where `preallocate` is a no-op.
+        // The control: a bare set_len leaves a hole. Without it the test would
+        // still pass on a platform where `preallocate` does nothing at all.
         let s = std::fs::File::create(dir.join("sparse.bin")).unwrap();
         s.set_len(len).unwrap();
         let sparse = s.metadata().unwrap().blocks() * 512;
@@ -1596,9 +1599,9 @@ mod prealloc_tests {
              so this test cannot tell preallocation from nothing"
         );
         assert!(
-            reserved > sparse && reserved >= len / 2,
+            reserved > sparse,
             "preallocate reserved {reserved} B against a sparse baseline of \
-             {sparse} B (wanted {len}) — it looks like a no-op"
+             {sparse} B (asked for {len}) — it looks like a no-op"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

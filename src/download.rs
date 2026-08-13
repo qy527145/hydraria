@@ -510,12 +510,23 @@ impl CacheJob {
                         // Busy, not broken: stagger the pool and leave the
                         // failure budget alone, or a rate-limited origin would
                         // fail the whole job at full speed.
-                        self.scheduler.lock().note_overload();
+                        self.scheduler.lock().note_overload(error.retry_after());
                         continue;
                     }
                     // A failure the scheduler answers by cutting smaller claims
                     // is its own to absorb — see `Scheduler::note_claim_outcome`.
-                    if self.scheduler.lock().note_claim_outcome(false, &claim) {
+                    //
+                    // A content swap is deliberately kept away from that learner:
+                    // it looks like "failed having delivered nothing", which the
+                    // learner reads as "the range was too big" and would answer by
+                    // shrinking claims — and now by remembering that wall for
+                    // minutes. It counts as a real failure, just not a sizing one.
+                    let counts = if error.is_content_changed() {
+                        true
+                    } else {
+                        self.scheduler.lock().note_claim_outcome(false, &claim)
+                    };
+                    if counts {
                         let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
                         if failures >= self.failure_budget {
                             *self.state.lock() = JobState::Failed(error.to_string());
@@ -626,7 +637,7 @@ fn build_scheduler(
     strategy: Strategy,
 ) -> Scheduler {
     let already = entry.staged_ranges(0, total_size - 1);
-    Scheduler::new(
+    let scheduler = Scheduler::new(
         0,
         total_size - 1,
         strategy,
@@ -635,7 +646,11 @@ fn build_scheduler(
         engine.config().max_per_volume.max(1),
         Some(engine.config().max_split).filter(|value| *value > 0),
         &already,
-    )
+    );
+    match engine.claim_wall() {
+        Some(wall) => scheduler.with_claim_wall(wall),
+        None => scheduler,
+    }
 }
 pub struct DownloadManager {
     jobs: RwLock<HashMap<String, Arc<CacheJob>>>,

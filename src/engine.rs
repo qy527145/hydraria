@@ -43,6 +43,79 @@ pub(crate) const READER_BUFFER_PROBE: u64 = 64 * 1024 * 1024;
 /// only the prefetch nobody is waiting on gets coalesced.
 pub(crate) const WRITE_THROUGH_AHEAD: u64 = 32 * 1024 * 1024;
 
+/// How many times a single URL may contradict its own `ETag` before we stop
+/// treating that as evidence of anything.
+///
+/// Two, so a genuine content swap is still caught loudly and immediately, while
+/// a URL whose validators are merely unstable costs at most this many retried
+/// claims over the task's whole life instead of failing every one of them.
+const ETAG_MISMATCH_TOLERANCE: u32 = 2;
+
+/// Normalize an `ETag` for comparison against the *same URL's* earlier answer.
+///
+/// Weak validators (`W/"abc"`) compare equal to their strong form. That is
+/// deliberately looser than RFC 9110's strong comparison, because the question
+/// here is not "is this range byte-identical to a cached copy" but "did the
+/// origin quietly swap the entity". A server that flips `"abc"` to `W/"abc"`
+/// between requests changed its header style, not its content, and treating that
+/// as corruption would be a false alarm.
+///
+/// Returns `None` for an absent or unreadable header, which the caller must
+/// treat as "this response expressed no opinion" — never as a mismatch.
+fn normalize_etag(raw: Option<&HeaderValue>) -> Option<String> {
+    let text = raw?.to_str().ok()?.trim();
+    let text = text.strip_prefix("W/").unwrap_or(text).trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// Longest wait we will honour from a `Retry-After` header.
+///
+/// The header is attacker- and misconfiguration-controlled: `Retry-After: 86400`
+/// is a legal answer that would park a fetcher for a day. Capping keeps a
+/// nonsense value from turning into a hang — a permanently throttled origin then
+/// fails through the normal failure budget instead, which is the outcome the
+/// caller can actually see and act on.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(60);
+
+/// Parse `Retry-After`, which RFC 9110 allows in two shapes: delta-seconds
+/// (`120`) or an HTTP-date (`Wed, 21 Oct 2015 07:28:00 GMT`).
+///
+/// Every failure mode returns `None`, which means "the origin gave no usable
+/// hint" and leaves the scheduler's own exponential backoff in charge. That is
+/// the whole contract: a header we cannot make sense of must never produce a
+/// worse outcome than not looking at it. Specifically tolerated —
+///
+/// * header absent, or bytes that are not valid ASCII/UTF-8
+/// * a value that is neither an integer nor a date (`"soon"`, `""`)
+/// * a negative or overflowing integer
+/// * a date already in the past, or one so far out it overflows the clock
+/// * anything above [`RETRY_AFTER_MAX`], which is clamped rather than honoured
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // delta-seconds. `parse::<u64>` rejects "-1" and anything non-numeric, so a
+    // negative or absurd value falls through to the date branch and then to
+    // `None` rather than wrapping into a huge wait.
+    let secs = if let Ok(secs) = raw.parse::<u64>() {
+        secs
+    } else {
+        // HTTP-date. Past dates clamp to zero via `duration_since` failing.
+        let when = httpdate::parse_http_date(raw).ok()?;
+        when.duration_since(std::time::SystemTime::now())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+
+    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
+}
+
 /// Ceiling on how far ahead of the serializer the in-memory fallback path
 /// (`stream_range`) may spawn fetchers, in chunks.
 ///
@@ -99,6 +172,10 @@ pub struct Engine {
     /// least once. `probe_one` consults this to skip the HEAD round-trip on
     /// known-bad URLs and go straight to the 1-byte Range GET.
     head_unsupported: Option<Arc<parking_lot::RwLock<std::collections::HashSet<String>>>>,
+    /// Task-scoped memory of the largest range these origins will swallow.
+    /// Handed to every [`Scheduler`] this engine builds, so the lesson outlives
+    /// the single request that paid a read timeout to learn it.
+    claim_wall: Option<Arc<crate::schedule::ClaimWall>>,
 }
 
 /// Where and what bytes a fetch attempt should request from a concrete URL.
@@ -169,6 +246,7 @@ impl Engine {
             volumes: None,
             pipeline: None,
             head_unsupported: None,
+            claim_wall: None,
         }
     }
 
@@ -207,6 +285,16 @@ impl Engine {
     ) -> Self {
         self.head_unsupported = Some(set);
         self
+    }
+
+    pub fn with_claim_wall(mut self, wall: Arc<crate::schedule::ClaimWall>) -> Self {
+        self.claim_wall = Some(wall);
+        self
+    }
+
+    /// Task-scoped claim-size memory, for the schedulers this engine builds.
+    pub(crate) fn claim_wall(&self) -> Option<Arc<crate::schedule::ClaimWall>> {
+        self.claim_wall.clone()
     }
 
     /// Install the per-task plugin pipeline. Bytes flowing to the client are
@@ -266,6 +354,67 @@ impl Engine {
         let h = self.health.iter().find(|h| h.url == url)?.clone();
         h.in_flight_requests.fetch_add(1, Ordering::Relaxed);
         Some(InFlightGuard(h))
+    }
+
+    /// Check a response's `ETag` against what this same URL served before, and
+    /// remember it if this is the first opinion we have had.
+    ///
+    /// Returns `false` only when the URL previously gave a *different* ETag —
+    /// i.e. the origin swapped its content while we were stitching a file out of
+    /// it, which would otherwise be written into the output as a silent splice of
+    /// two different entities.
+    ///
+    /// Everything else returns `true`, because everything else is normal:
+    ///
+    /// * no `ETag` on this response (very common on 206 from CDNs)
+    /// * an `ETag` we cannot decode
+    /// * the first `ETag` seen for this URL — recorded as the baseline
+    /// * a URL that is not in the health table at all (one-shot probes)
+    /// * a URL that has already contradicted itself
+    ///   [`ETAG_MISMATCH_TOLERANCE`] times — see below
+    ///
+    /// Deliberately *not* compared across mirrors: see
+    /// [`UrlHealthAcc::observed_etag`].
+    ///
+    /// The tolerance exists because "unstable ETag" and "content swapped" look
+    /// identical from here, and the two want opposite responses. A CDN fronting
+    /// several origins with differing mtimes can legitimately return a new ETag
+    /// per request for identical bytes; failing every claim over that would take
+    /// down a task that works fine today. So the check is loud and strict at
+    /// first, then stands down for that URL rather than fighting it forever.
+    fn etag_still_matches(&self, url: &str, headers: &HeaderMap) -> bool {
+        let Some(fresh) = normalize_etag(headers.get(reqwest::header::ETAG)) else {
+            return true;
+        };
+        let Some(h) = self.health.iter().find(|h| h.url == url) else {
+            return true;
+        };
+        let mut slot = h.observed_etag.lock();
+        match slot.as_deref() {
+            None => {
+                *slot = Some(fresh);
+                true
+            }
+            Some(known) if known == fresh => true,
+            Some(_) => {
+                let strikes = h.etag_mismatches.fetch_add(1, Ordering::Relaxed) + 1;
+                // Re-baseline either way: holding the stale value would keep
+                // reporting a mismatch against an entity that is already gone.
+                *slot = Some(fresh);
+                if strikes > ETAG_MISMATCH_TOLERANCE {
+                    tracing::warn!(
+                        "url={} has changed its ETag {} times; its validators are \
+                         not a reliable signal, so content-swap detection is now \
+                         disabled for it",
+                        url,
+                        strikes,
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     fn record_success(&self, url: &str, status: u16, latency_ms: u64) {
@@ -802,6 +951,12 @@ impl Engine {
                 accepts_ranges = true;
             }
             let h = resp.headers();
+            // Note: no ETag baseline is recorded here. `prepare_engine` attaches
+            // the health table *after* probing, so `self.health` is still empty
+            // at this point and there would be nowhere to put it. The baseline is
+            // established by the first chunk instead, which still catches the
+            // case that matters — an entity replaced while we are stitching it.
+            // Cross-session changes are already caught by the cache meta check.
             // Prefer Content-Range total when available (more authoritative than CL).
             if let Some(cr) = h.get(reqwest::header::CONTENT_RANGE) {
                 if let Some(t) = cr
@@ -1328,7 +1483,7 @@ impl Engine {
 
         let already = staging.entry().staged_ranges(start, end);
         let staged_bytes: u64 = already.iter().map(|&(s, e)| e - s + 1).sum();
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             start,
             end,
             strategy,
@@ -1338,6 +1493,9 @@ impl Engine {
             split_cap,
             &already,
         );
+        if let Some(wall) = self.claim_wall() {
+            scheduler = scheduler.with_claim_wall(wall);
+        }
 
         tracing::debug!(
             "stream_staged [{}, {}] strategy={} threads={} per_volume={} split_cap={:?} \
@@ -1470,10 +1628,29 @@ impl Engine {
                     // single-mirror task there is nowhere to rotate to. Hand it
                     // straight back so the worker can take its backoff; `finish`
                     // returns the untouched range to the pool.
-                    return Err(err);
+                    return Err(ProxyError::Throttled {
+                        status: status_code,
+                        retry_after: parse_retry_after(resp.headers()),
+                    });
                 }
                 last_err = Some(err);
                 continue;
+            }
+            // Before a single byte is written at an absolute offset: has this URL
+            // changed what it serves since we last looked? If so its bytes no
+            // longer belong in the same file as the ones already on disk.
+            if !self.etag_still_matches(&target.url, resp.headers()) {
+                let msg = "ETag changed mid-download; entity was replaced upstream";
+                self.record_failure(&target.url, Some(status_code), msg);
+                tracing::warn!(
+                    "claim worker={} url={} {} — giving the range back to the pool",
+                    worker,
+                    target.url,
+                    msg,
+                );
+                return Err(ProxyError::ContentChanged {
+                    url: target.url.clone(),
+                });
             }
             self.record_success(&target.url, status_code, latency_ms);
 
@@ -1767,6 +1944,23 @@ impl Engine {
                     status_code,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
+                continue;
+            }
+            // Same guard as the staged path. Here a mismatch only has to rotate:
+            // `continue` moves to the next mirror, and this path does no
+            // claim-size learning that a content swap could mislead.
+            if !self.etag_still_matches(&target.url, resp.headers()) {
+                let msg = "ETag changed mid-download; entity was replaced upstream";
+                self.record_failure(&target.url, Some(status_code), msg);
+                tracing::warn!(
+                    "fetch span chunk={} url={} {} — rotating mirror",
+                    idx,
+                    target.url,
+                    msg,
+                );
+                last_err = Some(ProxyError::ContentChanged {
+                    url: target.url.clone(),
+                });
                 continue;
             }
             self.record_success(&target.url, status_code, latency_ms);
@@ -2123,7 +2317,7 @@ impl StagedRun {
                     // Busy, not broken: stagger the pool and spare the failure
                     // budget, which a rate-limited origin would otherwise drain
                     // as fast as the workers can retry.
-                    self.scheduler.lock().note_overload();
+                    self.scheduler.lock().note_overload(e.retry_after());
                     self.bump();
                     continue;
                 }
@@ -2132,7 +2326,18 @@ impl StagedRun {
                 // here as a read timeout, and shrinking is the only way out.
                 // A failure the scheduler answers by cutting smaller claims is
                 // its own to absorb, so it doesn't reach the budget.
-                if self.scheduler.lock().note_claim_outcome(false, &claim) {
+                //
+                // A content swap is kept out of that learner: it presents as
+                // "failed having delivered nothing", which the learner reads as
+                // "the range was too big" and would answer by shrinking claims
+                // (and remembering that wall for minutes) over something that
+                // says nothing about size at all.
+                let counts = if e.is_content_changed() {
+                    true
+                } else {
+                    self.scheduler.lock().note_claim_outcome(false, &claim)
+                };
+                if counts {
                     let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::debug!(
                         "claim worker={} failed ({}/{}), next claim now {} B: {}",
@@ -2726,6 +2931,211 @@ fn plan_chunks_with_head(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn etag_header(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::ETAG,
+            HeaderValue::from_str(value).expect("test input must be a legal header value"),
+        );
+        h
+    }
+
+    fn engine_for_urls(urls: &[&str]) -> Engine {
+        let cfg = TaskConfig {
+            volumes: vec![urls.iter().map(|u| u.to_string()).collect()],
+            max_threads: 1,
+            max_per_volume: 1,
+            max_split: 0,
+            cache: false,
+            headers: Default::default(),
+            name: None,
+            output_filename: None,
+            auto_filename: true,
+            rate_limit_bps: 0,
+            rate_limit_algorithm: Default::default(),
+            persist: false,
+            plugins: Vec::new(),
+            content_disposition: Default::default(),
+        };
+        let mut e = Engine::new(
+            Arc::new(cfg),
+            Client::builder().build().expect("client builds"),
+        );
+        e.health = urls
+            .iter()
+            .map(|u| Arc::new(UrlHealthAcc::new(u.to_string())))
+            .collect();
+        e
+    }
+
+    #[test]
+    fn a_stable_etag_keeps_matching() {
+        let e = engine_for_urls(&["https://a/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v1\"")));
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v1\"")));
+    }
+
+    #[test]
+    fn a_changed_etag_on_the_same_url_is_caught() {
+        let e = engine_for_urls(&["https://a/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v1\"")));
+        assert!(
+            !e.etag_still_matches("https://a/f", &etag_header("\"v2\"")),
+            "the origin swapped the entity and that must not go unnoticed"
+        );
+    }
+
+    #[test]
+    fn mirrors_with_different_etags_do_not_false_positive() {
+        // The failure mode this design exists to avoid. nginx derives ETags from
+        // mtime+size, so two mirrors holding identical bytes disagree. Comparing
+        // across URLs would fail every healthy multi-mirror task.
+        let e = engine_for_urls(&["https://a/f", "https://b/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"aaa\"")));
+        assert!(
+            e.etag_still_matches("https://b/f", &etag_header("\"bbb\"")),
+            "a second mirror's own ETag must be judged against itself only"
+        );
+        // And each keeps its own baseline afterwards.
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"aaa\"")));
+        assert!(!e.etag_still_matches("https://b/f", &etag_header("\"ccc\"")));
+    }
+
+    #[test]
+    fn a_weak_validator_matches_its_strong_form() {
+        // A server changing header style is not a content swap.
+        let e = engine_for_urls(&["https://a/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v1\"")));
+        assert!(e.etag_still_matches("https://a/f", &etag_header("W/\"v1\"")));
+    }
+
+    #[test]
+    fn a_response_without_a_usable_etag_expresses_no_opinion() {
+        let e = engine_for_urls(&["https://a/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v1\"")));
+        // Absent: extremely common on 206 from CDNs. Must never read as mismatch.
+        assert!(e.etag_still_matches("https://a/f", &HeaderMap::new()));
+        // Present but empty / whitespace-only.
+        assert!(e.etag_still_matches("https://a/f", &etag_header("")));
+        assert!(e.etag_still_matches("https://a/f", &etag_header("   ")));
+        assert!(e.etag_still_matches("https://a/f", &etag_header("W/")));
+        // A URL absent from the health table (one-shot probes) has no baseline.
+        assert!(e.etag_still_matches("https://elsewhere/f", &etag_header("\"zzz\"")));
+        // None of that disturbed the recorded baseline.
+        assert!(!e.etag_still_matches("https://a/f", &etag_header("\"v2\"")));
+    }
+
+    #[test]
+    fn an_unstable_etag_stands_down_instead_of_failing_every_claim() {
+        // The regression this tolerance exists for. A CDN fronting several
+        // origins with differing mtimes can hand out a fresh ETag per request
+        // for byte-identical content. Failing forever on that would take down a
+        // task that works fine without the check — strictly worse than not
+        // checking. So: strict at first, then stand down.
+        let e = engine_for_urls(&["https://a/f"]);
+        assert!(e.etag_still_matches("https://a/f", &etag_header("\"v0\"")));
+
+        let mut refusals = 0;
+        for i in 1..=12 {
+            if !e.etag_still_matches("https://a/f", &etag_header(&format!("\"v{i}\""))) {
+                refusals += 1;
+            }
+        }
+        assert_eq!(
+            refusals, ETAG_MISMATCH_TOLERANCE as usize,
+            "an endlessly-changing ETag must cost a bounded number of claims"
+        );
+
+        // Stood down for good: still no refusals however long it keeps flapping.
+        for i in 13..=20 {
+            assert!(e.etag_still_matches("https://a/f", &etag_header(&format!("\"v{i}\""))));
+        }
+    }
+
+    #[test]
+    fn standing_down_is_per_url_not_global() {
+        let e = engine_for_urls(&["https://flaky/f", "https://solid/f"]);
+        assert!(e.etag_still_matches("https://flaky/f", &etag_header("\"a\"")));
+        assert!(e.etag_still_matches("https://solid/f", &etag_header("\"s1\"")));
+
+        // Exhaust the flaky mirror's tolerance.
+        for i in 0..=ETAG_MISMATCH_TOLERANCE {
+            e.etag_still_matches("https://flaky/f", &etag_header(&format!("\"b{i}\"")));
+        }
+        assert!(e.etag_still_matches("https://flaky/f", &etag_header("\"whatever\"")));
+
+        // The well-behaved mirror must still be policed.
+        assert!(
+            !e.etag_still_matches("https://solid/f", &etag_header("\"s2\"")),
+            "one bad mirror must not disable the check for the others"
+        );
+    }
+
+    fn retry_after_of(value: &str) -> Option<Duration> {
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(value).expect("test input must be a legal header value"),
+        );
+        parse_retry_after(&h)
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds() {
+        assert_eq!(retry_after_of("5"), Some(Duration::from_secs(5)));
+        assert_eq!(retry_after_of("  7  "), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after_of("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_clamps_absurd_waits() {
+        // `Retry-After: 86400` is legal and would otherwise park a fetcher for a
+        // day. A permanently throttled origin has to fail visibly instead.
+        assert_eq!(retry_after_of("86400"), Some(RETRY_AFTER_MAX));
+        assert_eq!(retry_after_of("999999999999999999999"), None);
+    }
+
+    #[test]
+    fn retry_after_ignores_anything_it_cannot_trust() {
+        // Every one of these must yield `None` — meaning "no usable hint", which
+        // leaves the scheduler's own backoff in charge. A header we cannot parse
+        // must never produce a worse outcome than not reading it at all.
+        for bad in [
+            "",                              // empty
+            "   ",                           // whitespace only
+            "soon",                          // not a number, not a date
+            "-1",                            // negative delta-seconds
+            "1.5",                           // fractional
+            "5s",                            // unit suffix
+            "0x10",                          // hex
+            "Tue, 99 Xxx 9999 99:99:99 GMT", // date-shaped garbage
+        ] {
+            assert_eq!(retry_after_of(bad), None, "{bad:?} should be ignored");
+        }
+        // Absent header.
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates_and_floors_past_ones() {
+        let future = std::time::SystemTime::now() + Duration::from_secs(30);
+        let parsed = retry_after_of(&httpdate::fmt_http_date(future))
+            .expect("a well-formed future HTTP-date is a valid hint");
+        // Second-granularity formatting plus test scheduling slop.
+        assert!(
+            parsed <= Duration::from_secs(30) && parsed >= Duration::from_secs(25),
+            "expected ~30s, got {parsed:?}"
+        );
+
+        // A date already in the past means "retry now", not a huge wait from an
+        // underflow.
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        assert_eq!(
+            retry_after_of(&httpdate::fmt_http_date(past)),
+            Some(Duration::ZERO)
+        );
+    }
 
     #[test]
     fn parses_plain_filename() {

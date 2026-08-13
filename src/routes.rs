@@ -66,7 +66,16 @@ impl IntoResponse for ProxyError {
             ProxyError::NoUpstream => StatusCode::BAD_GATEWAY,
             ProxyError::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
             ProxyError::BadStatus(s) => StatusCode::from_u16(*s).unwrap_or(StatusCode::BAD_GATEWAY),
+            // Pass the origin's throttle through, so a client that understands
+            // 429/503 can back off too instead of retrying into the same wall.
+            ProxyError::Throttled { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            }
             ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            // The origin replaced the file while we were serving it. There is no
+            // coherent response body left to give, and it is the upstream's
+            // inconsistency, not the client's request, that is at fault.
+            ProxyError::ContentChanged { .. } => StatusCode::BAD_GATEWAY,
             ProxyError::Io(_) | ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(ApiError {
@@ -480,7 +489,8 @@ async fn prepare_engine(
 ) -> Result<(Arc<TaskConfig>, UpstreamProbe, Engine), ProxyError> {
     let cfg = Arc::new(entry.config_snapshot());
     let engine = Engine::new(Arc::clone(&cfg), state.upstream.clone())
-        .with_head_unsupported(Arc::clone(&entry.head_unsupported));
+        .with_head_unsupported(Arc::clone(&entry.head_unsupported))
+        .with_claim_wall(Arc::clone(&entry.claim_wall));
 
     // Probe is expensive on multi-volume tasks (N × HEAD + N × Range:0-0
     // round-trips) and players like PotPlayer open a fresh connection for
