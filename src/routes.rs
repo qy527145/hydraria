@@ -65,9 +65,7 @@ impl IntoResponse for ProxyError {
             ProxyError::TaskNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::NoUpstream => StatusCode::BAD_GATEWAY,
             ProxyError::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
-            ProxyError::BadStatus(s) => {
-                StatusCode::from_u16(*s).unwrap_or(StatusCode::BAD_GATEWAY)
-            }
+            ProxyError::BadStatus(s) => StatusCode::from_u16(*s).unwrap_or(StatusCode::BAD_GATEWAY),
             ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
             ProxyError::Io(_) | ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -168,7 +166,7 @@ async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
 /// with the supplied URLs/volumes/headers, runs the same probe path the
 /// streamer would, then derives a "suggested" filename (LCP across volumes).
 async fn probe_urls(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<ProbeReq>,
 ) -> Result<Json<ProbeResp>, ProxyError> {
     if req.volumes.iter().all(|v| v.is_empty()) {
@@ -192,7 +190,7 @@ async fn probe_urls(
     };
     cfg.normalize();
     let layout = cfg.effective_volumes();
-    let engine = Engine::new(Arc::new(cfg))?;
+    let engine = Engine::new(Arc::new(cfg), state.upstream.clone());
     let probe = engine.probe().await?;
 
     // Suggested filename for the UI: when there are 2+ volumes, take the
@@ -239,20 +237,23 @@ async fn patch_task(
     // Snapshot the cache key before the URL list changes so we can migrate
     // the on-disk entry if the user just rotated a signed link.
     let old_cache_key = crate::cache::CacheStore::key_for_task(&entry.config_snapshot());
-    entry
-        .apply_update(update)
-        .map_err(ProxyError::Internal)?;
+    entry.apply_update(update).map_err(ProxyError::Internal)?;
     let new_cache_key = crate::cache::CacheStore::key_for_task(&entry.config_snapshot());
     if old_cache_key != new_cache_key {
         match state.cache.migrate_key(&old_cache_key, &new_cache_key) {
             Ok(true) => tracing::info!(
                 "cache migrated for task {}: {} -> {}",
-                task_id, old_cache_key, new_cache_key,
+                task_id,
+                old_cache_key,
+                new_cache_key,
             ),
             Ok(false) => {}
             Err(e) => tracing::warn!(
                 "cache migration failed for task {} ({} -> {}): {}",
-                task_id, old_cache_key, new_cache_key, e,
+                task_id,
+                old_cache_key,
+                new_cache_key,
+                e,
             ),
         }
     }
@@ -336,7 +337,10 @@ async fn export_task(
     let cfg = entry.config_snapshot();
     let body = serde_json::to_vec_pretty(&cfg).map_err(|e| ProxyError::Internal(e.to_string()))?;
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     let disp = format!("attachment; filename=\"hydraria-task-{}.json\"", task_id);
     if let Ok(v) = HeaderValue::from_str(&disp) {
         headers.insert(header::CONTENT_DISPOSITION, v);
@@ -437,7 +441,11 @@ async fn handle_stream(
             Some(_) => "cache",
             None => "none",
         },
-        if probe.accepts_ranges && probe.total_size.is_some() { "ranged" } else { "passthrough" },
+        if probe.accepts_ranges && probe.total_size.is_some() {
+            "ranged"
+        } else {
+            "passthrough"
+        },
     );
 
     let engine = Arc::new(engine.with_cache(cache_entry.clone()));
@@ -471,7 +479,7 @@ async fn prepare_engine(
     entry: &Arc<TaskEntry>,
 ) -> Result<(Arc<TaskConfig>, UpstreamProbe, Engine), ProxyError> {
     let cfg = Arc::new(entry.config_snapshot());
-    let engine = Engine::new(Arc::clone(&cfg))?
+    let engine = Engine::new(Arc::clone(&cfg), state.upstream.clone())
         .with_head_unsupported(Arc::clone(&entry.head_unsupported));
 
     // Probe is expensive on multi-volume tasks (N × HEAD + N × Range:0-0
@@ -489,7 +497,11 @@ async fn prepare_engine(
             .map(|(p, _)| Arc::clone(p))
     };
     let mut probe = if let Some(p) = read_cached() {
-        tracing::debug!("probe cache HIT task={} (age<{}s)", task_id, PROBE_CACHE_TTL.as_secs());
+        tracing::debug!(
+            "probe cache HIT task={} (age<{}s)",
+            task_id,
+            PROBE_CACHE_TTL.as_secs()
+        );
         UpstreamProbe::clone(&p)
     } else {
         // Singleflight: serialize concurrent first-time probes so they don't
@@ -506,7 +518,10 @@ async fn prepare_engine(
             tracing::info!(
                 "probe ok task={} total={} vols={} accepts_ranges={} etag={:?} unreachable={:?} ({}ms)",
                 task_id,
-                fresh.total_size.map(|t| t.to_string()).unwrap_or_else(|| "unknown".into()),
+                fresh
+                    .total_size
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
                 fresh.volumes.as_ref().map(|v| v.len()).unwrap_or(0),
                 fresh.accepts_ranges,
                 fresh.etag,
@@ -550,13 +565,15 @@ async fn prepare_engine(
             {
                 tracing::debug!(
                     "task={} forcing Content-Type from upstream {:?} → {} (from filename '{}')",
-                    task_id, probe.content_type, g, name,
+                    task_id,
+                    probe.content_type,
+                    g,
+                    name,
                 );
                 probe.content_type = Some(g.to_string());
             }
         }
     }
-
 
     let health = entry.url_health.read().iter().cloned().collect::<Vec<_>>();
     // Build the plugin transform pipeline from the task's enabled plugins
@@ -606,11 +623,12 @@ async fn ensure_cache_job(
     if !probe.accepts_ranges {
         return Err(ProxyError::Internal(
             "upstream does not support byte ranges; full caching needs ranges".into(),
-       ));
+        ));
     }
-    let total = probe.total_size.filter(|value| *value > 0).ok_or_else(|| {
-        ProxyError::Internal("upstream did not report a cacheable size".into())
-    })?;
+    let total = probe
+        .total_size
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ProxyError::Internal("upstream did not report a cacheable size".into()))?;
     let mut urls = cfg.urls();
     urls.sort_unstable();
     let meta = CacheMeta {
@@ -733,8 +751,7 @@ fn resolve_staging(
         block_size: crate::cache::BLOCK_SIZE,
         urls,
     };
-    let staging =
-        crate::cache::CacheStore::acquire_staging(&state.cache, &key, meta, cfg.cache)?;
+    let staging = crate::cache::CacheStore::acquire_staging(&state.cache, &key, meta, cfg.cache)?;
     tracing::debug!(
         "staging ready key={} total={} persistent={} etag={:?}",
         key,
@@ -786,7 +803,11 @@ async fn build_stream_response(
     }
     resp_headers.insert(
         header::ACCEPT_RANGES,
-        HeaderValue::from_static(if probe.accepts_ranges { "bytes" } else { "none" }),
+        HeaderValue::from_static(if probe.accepts_ranges {
+            "bytes"
+        } else {
+            "none"
+        }),
     );
     resp_headers.insert(
         HeaderName::from_static("x-hydraria-task"),

@@ -24,4 +24,17 @@ pub enum ProxyError {
     Internal(String),
 }
 
+impl ProxyError {
+    /// Whether this is the origin asking for less concurrency rather than
+    /// reporting a broken transfer.
+    ///
+    /// Treated separately from ordinary failures because the answer is opposite:
+    /// an ordinary failure should retry, promptly and elsewhere, while these
+    /// want the pool to slow down and *not* spend its failure budget — a
+    /// rate-limited origin is healthy, just busy.
+    pub fn is_overload(&self) -> bool {
+        matches!(self, Self::BadStatus(429 | 503))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ProxyError>;

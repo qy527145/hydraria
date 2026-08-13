@@ -12,7 +12,11 @@ use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "hydraria", about = "Multi-threaded HTTP streaming proxy", version)]
+#[command(
+    name = "hydraria",
+    about = "Multi-threaded HTTP streaming proxy",
+    version
+)]
 struct Cli {
     /// Bind address (e.g. 127.0.0.1:9527). Used when no subcommand is given
     /// or with the explicit `server` subcommand.
@@ -97,15 +101,24 @@ async fn main() -> anyhow::Result<()> {
             volumes,
             cache,
         }) => {
-            let cache_dir = cli.cache_dir.clone().unwrap_or_else(|| home_subdir("cache"));
-            run_download(urls, output, headers, threads, split, volumes, cache, cache_dir).await
+            let cache_dir = cli
+                .cache_dir
+                .clone()
+                .unwrap_or_else(|| home_subdir("cache"));
+            run_download(
+                urls, output, headers, threads, split, volumes, cache, cache_dir,
+            )
+            .await
         }
         Some(Command::Server) | None => run_server(cli).await,
     }
 }
 
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
-    let cache_dir = cli.cache_dir.clone().unwrap_or_else(|| home_subdir("cache"));
+    let cache_dir = cli
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| home_subdir("cache"));
     let cache = Arc::new(CacheStore::new(cache_dir.clone())?);
 
     let state_file = cli
@@ -122,6 +135,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         GlobalSettings::default(),
         plugins,
         Arc::new(hydraria::download::DownloadManager::new()),
+        hydraria::engine::build_upstream_client()?,
     );
     let state = Arc::new(state);
 
@@ -219,7 +233,12 @@ async fn run_download(
     let mut cfg: TaskConfig = serde_json::from_value(cfg_json)?;
     cfg.normalize();
 
-    let engine = Engine::new(Arc::new(cfg.clone()))?;
+    // One-shot CLI: a single client for the whole invocation is already the
+    // shared-pool case the server needs `AppState::upstream` for.
+    let engine = Engine::new(
+        Arc::new(cfg.clone()),
+        hydraria::engine::build_upstream_client()?,
+    );
     eprintln!("probing {} URL(s)...", cfg.urls().len());
     let probe = engine.probe().await?;
 
@@ -266,7 +285,9 @@ async fn run_download(
 
     let total = match total {
         Some(t) if t > 0 => t,
-        _ => anyhow::bail!("cannot download: upstream did not report a total size and passthrough downloads aren't supported via the CLI yet"),
+        _ => anyhow::bail!(
+            "cannot download: upstream did not report a total size and passthrough downloads aren't supported via the CLI yet"
+        ),
     };
 
     // Open output destination.
@@ -336,7 +357,11 @@ fn fmt_size(n: u64) -> String {
 }
 
 fn print_progress(written: u64, total: u64, start: std::time::Instant) {
-    let pct = if total > 0 { (written * 100) / total } else { 0 };
+    let pct = if total > 0 {
+        (written * 100) / total
+    } else {
+        0
+    };
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     let rate = (written as f64 / elapsed) as u64;
     let bar_width = 30usize;

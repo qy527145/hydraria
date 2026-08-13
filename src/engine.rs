@@ -1,4 +1,4 @@
-use crate::cache::{CacheEntry, Staging};
+use crate::cache::{CacheEntry, Staging, WriteCoalescer};
 use crate::error::{ProxyError, Result};
 use crate::models::{TaskConfig, UrlHealthAcc};
 use crate::plugins::TransformPipeline;
@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
 use reqwest::{Client, StatusCode};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -33,6 +33,15 @@ const READ_CHUNK: u64 = crate::cache::BLOCK_SIZE;
 /// block, and because the answer only has to distinguish "no runway" from
 /// "plenty" — see [`crate::schedule::Scheduler::claim_len`].
 pub(crate) const READER_BUFFER_PROBE: u64 = 64 * 1024 * 1024;
+
+/// Bytes ahead of an ordered reader that fetchers must still write straight
+/// through instead of batching into [`WriteCoalescer`].
+///
+/// The cost of guessing wrong is asymmetric: batching too eagerly stalls
+/// playback on bytes that are already downloaded but sitting in a buffer, while
+/// batching too timidly only costs syscalls. So this is deliberately generous —
+/// only the prefetch nobody is waiting on gets coalesced.
+pub(crate) const WRITE_THROUGH_AHEAD: u64 = 32 * 1024 * 1024;
 
 /// Ceiling on how far ahead of the serializer the in-memory fallback path
 /// (`stream_range`) may spawn fetchers, in chunks.
@@ -103,41 +112,55 @@ struct FetchTarget {
     merged_start: u64,
 }
 
-impl Engine {
-    pub fn new(config: Arc<TaskConfig>) -> Result<Self> {
-        // HTTP/1.1 only, deliberately. hyper's connection pool hands out a
-        // *shared* reservation for HTTP/2 connections (`Reservation::Shared`)
-        // and a unique one for HTTP/1. Since reqwest enables `http2` by
-        // default and virtually every CDN negotiates h2 over ALPN, leaving it
-        // on means all `max_threads` concurrent chunk requests to one host
-        // multiplex onto a *single* TCP connection — one congestion window,
-        // and only one instance of whatever per-connection rate limit the
-        // origin applies. That silently collapses N-way parallelism back to
-        // 1× and is the single biggest throughput cliff against pan/CDN
-        // origins. Forcing h1 gives us one real socket per in-flight fetcher.
-        //
-        // The timeout is a *read* timeout rather than a total-request one, and
-        // it is deliberately long. Staging relays (the pan-CDN middlemen that
-        // materialize an entire byte range upstream before emitting anything)
-        // routinely take tens of seconds to send their first byte, and that is
-        // a healthy request, not a stalled one — a 30 s deadline here failed
-        // 84 out of 84 requests against one such origin. Its remaining job is
-        // narrow: detect a socket that has genuinely stopped delivering, and
-        // give the scheduler the failure signal it needs to shrink an
-        // oversized claim (see `Scheduler::note_claim_outcome`). TCP keepalive
-        // covers peers that vanish without closing.
-        let client = Client::builder()
-            .pool_max_idle_per_host(64)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(120))
-            .connect_timeout(Duration::from_secs(15))
-            .http1_only()
-            .http1_title_case_headers()
-            .build()
-            .map_err(ProxyError::Upstream)?;
+/// Build the one upstream HTTP client for the whole process.
+///
+/// Call this **once** and clone the result (a `Client` is an `Arc` internally).
+/// Each `Client` owns its own connection pool, so building one per request
+/// throws the pool away between requests — and players like PotPlayer open a
+/// fresh downstream connection on *every seek*, which would mean
+/// `max_threads` fresh TCP+TLS handshakes per seek before a single byte flows.
+///
+/// HTTP/1.1 only, deliberately. hyper's connection pool hands out a *shared*
+/// reservation for HTTP/2 connections (`Reservation::Shared`) and a unique one
+/// for HTTP/1. Since virtually every CDN negotiates h2 over ALPN, leaving it on
+/// means all `max_threads` concurrent chunk requests to one host multiplex onto
+/// a *single* TCP connection — one congestion window, and only one instance of
+/// whatever per-connection rate limit the origin applies. That silently
+/// collapses N-way parallelism back to 1× and is the single biggest throughput
+/// cliff against pan/CDN origins. Forcing h1 gives us one real socket per
+/// in-flight fetcher. `reqwest`'s `http2` feature is also switched off in
+/// `Cargo.toml`, so this call is belt *and* braces: the protocol is not even
+/// compiled in, and a future dependency edit that pulls it back cannot silently
+/// re-enable it here.
+///
+/// The timeout is a *read* timeout rather than a total-request one, and it is
+/// deliberately long. Staging relays (the pan-CDN middlemen that materialize an
+/// entire byte range upstream before emitting anything) routinely take tens of
+/// seconds to send their first byte, and that is a healthy request, not a
+/// stalled one — a 30 s deadline here failed 84 out of 84 requests against one
+/// such origin. Its remaining job is narrow: detect a socket that has genuinely
+/// stopped delivering, and give the scheduler the failure signal it needs to
+/// shrink an oversized claim (see `Scheduler::note_claim_outcome`). TCP
+/// keepalive covers peers that vanish without closing.
+pub fn build_upstream_client() -> Result<Client> {
+    Client::builder()
+        .pool_max_idle_per_host(64)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(15))
+        .http1_only()
+        .http1_title_case_headers()
+        .build()
+        .map_err(ProxyError::Upstream)
+}
 
-        Ok(Self {
+impl Engine {
+    /// `client` must be the process-wide client from [`build_upstream_client`],
+    /// cloned. Building a fresh one here would give every engine its own empty
+    /// connection pool.
+    pub fn new(config: Arc<TaskConfig>, client: Client) -> Self {
+        Self {
             client,
             config,
             rr_counter: AtomicUsize::new(0),
@@ -146,7 +169,7 @@ impl Engine {
             volumes: None,
             pipeline: None,
             head_unsupported: None,
-        })
+        }
     }
 
     pub fn with_cache(mut self, cache: Option<Arc<CacheEntry>>) -> Self {
@@ -510,19 +533,26 @@ impl Engine {
                             if !p.accepts_ranges {
                                 let msg = "no Range support; skipping for multi-volume task";
                                 self.record_failure(url, None, msg);
-                                tracing::debug!("probe vol {} mirror {} rejected: {}", vi + 1, url, msg);
-                                last_err = Some(ProxyError::Internal(format!(
-                                    "{} ({})", msg, url
-                                )));
+                                tracing::debug!(
+                                    "probe vol {} mirror {} rejected: {}",
+                                    vi + 1,
+                                    url,
+                                    msg
+                                );
+                                last_err = Some(ProxyError::Internal(format!("{} ({})", msg, url)));
                                 continue;
                             }
                             if p.total_size.is_none() {
-                                let msg = "no Content-Length; can't stitch volumes without known sizes";
+                                let msg =
+                                    "no Content-Length; can't stitch volumes without known sizes";
                                 self.record_failure(url, None, msg);
-                                tracing::debug!("probe vol {} mirror {} rejected: {}", vi + 1, url, msg);
-                                last_err = Some(ProxyError::Internal(format!(
-                                    "{} ({})", msg, url
-                                )));
+                                tracing::debug!(
+                                    "probe vol {} mirror {} rejected: {}",
+                                    vi + 1,
+                                    url,
+                                    msg
+                                );
+                                last_err = Some(ProxyError::Internal(format!("{} ({})", msg, url)));
                                 continue;
                             }
                         }
@@ -657,11 +687,15 @@ impl Engine {
         // prefix so we surface the stitched name (e.g. "movie") instead of
         // volume 0's (e.g. "movie.part01"). Single-volume tasks pass through.
         if multi_volume {
-            filename = merge_volume_filenames(&per_volume_filenames, &representative_urls)
-                .or(filename);
+            filename =
+                merge_volume_filenames(&per_volume_filenames, &representative_urls).or(filename);
         }
 
-        let total = if size_known_all { Some(total_size) } else { None };
+        let total = if size_known_all {
+            Some(total_size)
+        } else {
+            None
+        };
         Ok(UpstreamProbe {
             total_size: total,
             accepts_ranges: accepts_ranges_all,
@@ -901,16 +935,9 @@ impl Engine {
             head_split,
         );
         let total_chunks = plan.len();
-        let vol_count = self
-            .volumes
-            .as_deref()
-            .map(|v| v.len())
-            .unwrap_or(1)
-            .max(1);
-        let vol_of: Vec<usize> = plan_volume_indices(
-            &plan,
-            self.volumes.as_deref().map(|v| v.as_slice()),
-        );
+        let vol_count = self.volumes.as_deref().map(|v| v.len()).unwrap_or(1).max(1);
+        let vol_of: Vec<usize> =
+            plan_volume_indices(&plan, self.volumes.as_deref().map(|v| v.as_slice()));
 
         tracing::debug!(
             "stream_range [{}, {}] split={} max_threads={} max_per_volume={} vol_count={} chunks={} open_ended={} head_split={:?}",
@@ -949,8 +976,7 @@ impl Engine {
         let chan_buffer = split.div_ceil(MIN_STREAM_ITEM).clamp(8, 65536) as usize;
         let mut senders: Vec<Option<mpsc::Sender<Result<Bytes>>>> =
             Vec::with_capacity(total_chunks);
-        let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> =
-            Vec::with_capacity(total_chunks);
+        let mut receivers: Vec<mpsc::Receiver<Result<Bytes>>> = Vec::with_capacity(total_chunks);
         for _ in 0..total_chunks {
             let (tx, rx) = mpsc::channel::<Result<Bytes>>(chan_buffer);
             senders.push(Some(tx));
@@ -1332,6 +1358,9 @@ impl Engine {
             staging,
             fatal: parking_lot::Mutex::new(None),
             wake: tokio::sync::watch::Sender::new(0),
+            // A staged run always has a reader, and it starts at `start` — so
+            // the head of the request is write-through from the first byte.
+            write_through_below: AtomicU64::new(start.saturating_add(WRITE_THROUGH_AHEAD)),
             active_workers: AtomicUsize::new(max_threads),
             failures: AtomicUsize::new(0),
             failure_budget: max_threads.saturating_mul(2).max(8),
@@ -1379,6 +1408,7 @@ impl Engine {
         claim: &Claim,
         sink: &CacheEntry,
         transform_on_write: bool,
+        write_through_below: &AtomicU64,
     ) -> Result<()> {
         let attempts = self.fetch_attempts(claim.start);
         let mut last_err: Option<ProxyError> = None;
@@ -1389,16 +1419,11 @@ impl Engine {
             if resume_at > claim_end {
                 return Ok(());
             }
-            let target = match self.resolve_target(
-                worker,
-                attempt,
-                claim.start,
-                resume_at,
-                claim_end,
-            )? {
-                Some(t) => t,
-                None => return Ok(()),
-            };
+            let target =
+                match self.resolve_target(worker, attempt, claim.start, resume_at, claim_end)? {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             tracing::trace!(
                 "fetch claim worker={} attempt={} url={} range={}-{} merged_start={}",
@@ -1419,7 +1444,10 @@ impl Engine {
                     self.record_failure(&target.url, None, &msg);
                     tracing::debug!(
                         "claim worker={} attempt={} url={} network error: {}",
-                        worker, attempt, target.url, msg,
+                        worker,
+                        attempt,
+                        target.url,
+                        msg,
                     );
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
@@ -1436,7 +1464,15 @@ impl Engine {
                     Some(status_code),
                     &format!("expected 206, got {status_code}"),
                 );
-                last_err = Some(ProxyError::BadStatus(status_code));
+                let err = ProxyError::BadStatus(status_code);
+                if err.is_overload() {
+                    // Retrying now just re-hits the same rate limiter — on a
+                    // single-mirror task there is nowhere to rotate to. Hand it
+                    // straight back so the worker can take its backoff; `finish`
+                    // returns the untouched range to the pool.
+                    return Err(err);
+                }
+                last_err = Some(err);
                 continue;
             }
             self.record_success(&target.url, status_code, latency_ms);
@@ -1444,6 +1480,7 @@ impl Engine {
             let mut cursor = target.merged_start;
             let mut stream = resp.bytes_stream();
             let mut had_err = false;
+            let mut writer = WriteCoalescer::new();
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(b) => {
@@ -1469,13 +1506,22 @@ impl Engine {
                         } else {
                             slice
                         };
-                        if let Err(e) = sink.write_range(cursor, &slice) {
+                        // Bytes an ordered reader is about to consume have to be
+                        // visible the moment they land; everything further ahead
+                        // is prefetch nobody is blocked on, so batch it into one
+                        // sequential write.
+                        let coalesce = cursor >= write_through_below.load(Ordering::Relaxed);
+                        if let Err(e) = writer.write(sink, cursor, &slice, coalesce) {
                             // Losing the backing file is unrecoverable — there
                             // is nowhere left to put the bytes.
                             return Err(ProxyError::Io(e));
                         }
                         cursor += take as u64;
-                        claim.advance_to(cursor);
+                        // Only ever publish a watermark that is durable. `finish`
+                        // retires this range from the scheduler and the bitmap is
+                        // the only record that survives, so counting buffered
+                        // bytes as done would strand a hole nobody reclaims.
+                        claim.advance_to(cursor - writer.buffered());
                         self.record_bytes(&target.url, take as u64);
                         if take < b.len() {
                             break; // reached the claim's (possibly cut) end
@@ -1487,7 +1533,10 @@ impl Engine {
                         tracing::debug!(
                             "claim worker={} attempt={} url={} mid-stream error at {}; \
                              will resume there",
-                            worker, attempt, target.url, cursor,
+                            worker,
+                            attempt,
+                            target.url,
+                            cursor,
                         );
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
@@ -1495,6 +1544,13 @@ impl Engine {
                     }
                 }
             }
+            // Bytes are good even when the stream broke; only the tail is
+            // missing. Land them before deciding to retry, so the resume point
+            // (`claim.cursor()`) starts from what is actually on disk.
+            if let Err(e) = writer.flush(sink) {
+                return Err(ProxyError::Io(e));
+            }
+            claim.advance_to(cursor);
             if !had_err {
                 return Ok(());
             }
@@ -1544,10 +1600,7 @@ impl Engine {
             let span_end = (((j + 1) * bs - 1).min(total - 1)).min(end);
 
             if hit {
-                tracing::trace!(
-                    "cache HIT chunk={} blocks=[{}..={}]",
-                    idx, i, j,
-                );
+                tracing::trace!("cache HIT chunk={} blocks=[{}..={}]", idx, i, j,);
                 match cache.read_range(span_start, span_end) {
                     Ok(bytes) => {
                         cache.hits.fetch_add(j - i + 1, Ordering::Relaxed);
@@ -1565,7 +1618,10 @@ impl Engine {
                         // file may be broken).
                         tracing::warn!(
                             "cache read failed chunk={} blocks=[{}..={}]: {}; falling back to origin",
-                            idx, i, j, e,
+                            idx,
+                            i,
+                            j,
+                            e,
                         );
                         let from = i * bs;
                         let to = ((j + 1) * bs - 1).min(total - 1);
@@ -1574,10 +1630,7 @@ impl Engine {
                     }
                 }
             } else {
-                tracing::trace!(
-                    "cache MISS chunk={} blocks=[{}..={}]",
-                    idx, i, j,
-                );
+                tracing::trace!("cache MISS chunk={} blocks=[{}..={}]", idx, i, j,);
                 cache.misses.fetch_add(j - i + 1, Ordering::Relaxed);
                 // Fetch the BLOCK-aligned span from origin so writes land at
                 // the right offsets and complete whole blocks in the bitmap.
@@ -1612,10 +1665,20 @@ impl Engine {
         cache: Option<&CacheEntry>,
         tx: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<()> {
-        let subs = slice_span_by_volumes(self.volumes.as_deref().map(|v| v.as_slice()), span_start, span_end);
+        let subs = slice_span_by_volumes(
+            self.volumes.as_deref().map(|v| v.as_slice()),
+            span_start,
+            span_end,
+        );
         for (sub_start, sub_end) in subs {
             self.fetch_single_volume_subspan(
-                idx, sub_start, sub_end, chunk_start, chunk_end, cache, tx,
+                idx,
+                sub_start,
+                sub_end,
+                chunk_start,
+                chunk_end,
+                cache,
+                tx,
             )
             .await?;
         }
@@ -1657,7 +1720,13 @@ impl Engine {
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             tracing::trace!(
                 "fetch span chunk={} attempt={} url={} range={}-{} merged_start={} resume={}",
-                idx, attempt, target.url, target.local_start, target.local_end, target.merged_start, delivered,
+                idx,
+                attempt,
+                target.url,
+                target.local_start,
+                target.local_end,
+                target.merged_start,
+                delivered,
             );
             let req_start = Instant::now();
             let _in_flight = self.in_flight_guard(&target.url);
@@ -1668,7 +1737,10 @@ impl Engine {
                     self.record_failure(&target.url, None, &msg);
                     tracing::debug!(
                         "fetch span chunk={} attempt={} url={} network error: {}",
-                        idx, attempt, target.url, msg,
+                        idx,
+                        attempt,
+                        target.url,
+                        msg,
                     );
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
@@ -1689,7 +1761,10 @@ impl Engine {
                 );
                 tracing::debug!(
                     "fetch span chunk={} attempt={} url={} expected 206, got {}",
-                    idx, attempt, target.url, status_code,
+                    idx,
+                    attempt,
+                    target.url,
+                    status_code,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
@@ -1702,6 +1777,10 @@ impl Engine {
             let mut cursor = target.merged_start;
             let mut stream = resp.bytes_stream();
             let mut had_err = false;
+            // This path streams to the client through `tx`, so nothing is
+            // blocked on the cache write landing — it is a pure side effect and
+            // can always be batched.
+            let mut writer = WriteCoalescer::new();
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(b) => {
@@ -1714,7 +1793,7 @@ impl Engine {
                         delivered += b.len() as u64;
 
                         if let Some(c) = cache {
-                            if let Err(e) = c.write_range(piece_start, &b) {
+                            if let Err(e) = writer.write(c, piece_start, &b, true) {
                                 tracing::warn!(
                                     "cache write at offset {} failed: {}",
                                     piece_start,
@@ -1745,6 +1824,9 @@ impl Engine {
                         let merged_offset = piece_start + lo as u64;
                         let to_send = self.transform_outgoing(merged_offset, to_send);
                         if tx.send(Ok(to_send)).await.is_err() {
+                            if let Some(c) = cache {
+                                let _ = writer.flush(c);
+                            }
                             return Ok(());
                         }
                     }
@@ -1753,12 +1835,21 @@ impl Engine {
                         self.record_failure(&target.url, Some(status_code), &msg);
                         tracing::debug!(
                             "fetch span chunk={} attempt={} url={} mid-stream error after {} bytes; will resume from offset {}",
-                            idx, attempt, target.url, delivered, sub_start + delivered,
+                            idx,
+                            attempt,
+                            target.url,
+                            delivered,
+                            sub_start + delivered,
                         );
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
                         break;
                     }
+                }
+            }
+            if let Some(c) = cache {
+                if let Err(e) = writer.flush(c) {
+                    tracing::warn!("cache flush failed: {}", e);
                 }
             }
             if !had_err {
@@ -1796,7 +1887,12 @@ impl Engine {
             let headers = self.build_headers(Some((target.local_start, target.local_end)))?;
             tracing::trace!(
                 "fetch chunk={} attempt={} url={} range={}-{} resume={}",
-                idx, attempt, target.url, target.local_start, target.local_end, delivered,
+                idx,
+                attempt,
+                target.url,
+                target.local_start,
+                target.local_end,
+                delivered,
             );
             let req_start = Instant::now();
             let _in_flight = self.in_flight_guard(&target.url);
@@ -1807,7 +1903,10 @@ impl Engine {
                     self.record_failure(&target.url, None, &msg);
                     tracing::debug!(
                         "fetch chunk={} attempt={} url={} network error: {}",
-                        idx, attempt, target.url, msg,
+                        idx,
+                        attempt,
+                        target.url,
+                        msg,
                     );
                     last_err = Some(ProxyError::Upstream(e));
                     continue;
@@ -1824,7 +1923,10 @@ impl Engine {
                 );
                 tracing::debug!(
                     "fetch chunk={} attempt={} url={} bad status {}",
-                    idx, attempt, target.url, status_code,
+                    idx,
+                    attempt,
+                    target.url,
+                    status_code,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
@@ -1840,7 +1942,9 @@ impl Engine {
                 );
                 tracing::debug!(
                     "fetch chunk={} attempt={} url={} multi-volume task got 200 (expected 206), retrying",
-                    idx, attempt, target.url,
+                    idx,
+                    attempt,
+                    target.url,
                 );
                 last_err = Some(ProxyError::BadStatus(status.as_u16()));
                 continue;
@@ -1910,7 +2014,11 @@ impl Engine {
                         self.record_failure(&target.url, Some(status_code), &msg);
                         tracing::debug!(
                             "fetch chunk={} attempt={} url={} mid-stream error after {} bytes; will resume from offset {}",
-                            idx, attempt, target.url, delivered, start + delivered,
+                            idx,
+                            attempt,
+                            target.url,
+                            delivered,
+                            start + delivered,
                         );
                         last_err = Some(ProxyError::Upstream(e));
                         had_err = true;
@@ -1921,7 +2029,9 @@ impl Engine {
             if !had_err {
                 tracing::trace!(
                     "chunk done idx={} emitted={} attempt={}",
-                    idx, emitted, attempt,
+                    idx,
+                    emitted,
+                    attempt,
                 );
                 return Ok(());
             }
@@ -1957,6 +2067,11 @@ struct StagedRun {
     /// write counter, so it learns "nobody is coming" as promptly as it learns
     /// about new bytes.
     wake: tokio::sync::watch::Sender<u64>,
+    /// Offset below which fetchers must write straight through rather than
+    /// batching, because this run's ordered reader is close enough to be blocked
+    /// on those bytes. Kept as an atomic so the check costs one relaxed load per
+    /// network buffer instead of taking the scheduler lock on the data path.
+    write_through_below: AtomicU64,
     active_workers: AtomicUsize,
     failures: AtomicUsize,
     /// Permanently-failed claims tolerated before the stream gives up. A failed
@@ -1975,17 +2090,43 @@ impl StagedRun {
             if self.fatal.lock().is_some() {
                 break;
             }
+            // Parked, not retired. The reader treats `active_workers == 0` as
+            // "nobody is coming" and gives up, so a throttled worker has to stay
+            // counted — that is why overload backoff is a pause here and not an
+            // early `break`.
+            //
+            // Bound the guard to a `let` first — an `if let` scrutinee temporary
+            // lives through the body, which would hold the scheduler lock across
+            // the sleep.
+            let pause = self.scheduler.lock().overload_backoff(worker);
+            if let Some(pause) = pause {
+                tokio::time::sleep(pause).await;
+            }
             let claim = self.scheduler.lock().claim(worker);
             let Some(claim) = claim else { break };
             let res = self
                 .engine
-                .fetch_claim(worker, &claim, self.staging.entry(), false)
+                .fetch_claim(
+                    worker,
+                    &claim,
+                    self.staging.entry(),
+                    false,
+                    &self.write_through_below,
+                )
                 .await;
             // `cursor` is the first byte we did not deliver; whatever remains
             // of the claim returns to the pool for another worker — or for the
             // next iteration of this one.
             self.scheduler.lock().finish(worker, claim.cursor());
             if let Err(e) = res {
+                if e.is_overload() {
+                    // Busy, not broken: stagger the pool and spare the failure
+                    // budget, which a rate-limited origin would otherwise drain
+                    // as fast as the workers can retry.
+                    self.scheduler.lock().note_overload();
+                    self.bump();
+                    continue;
+                }
                 // Feed the failure into automatic claim sizing before anything
                 // else: an oversized claim against a staging relay shows up
                 // here as a read timeout, and shrinking is the only way out.
@@ -2123,6 +2264,12 @@ impl StagedRun {
                 sched.set_read_head(cursor);
                 sched.set_reader_buffer(ahead);
             }
+            // Fetchers near the reader must keep writing through; the rest of
+            // the pool is free to batch.
+            self.write_through_below.store(
+                cursor.saturating_add(WRITE_THROUGH_AHEAD),
+                Ordering::Relaxed,
+            );
             self.bump();
         }
         tracing::debug!("staged stream delivered [{}, {}] in full", start, end);
@@ -2153,7 +2300,8 @@ pub fn parse_range_header(value: &str, total: Option<u64>) -> Result<(u64, Optio
             .trim()
             .parse()
             .map_err(|_| ProxyError::InvalidRange(value.into()))?;
-        let total = total.ok_or_else(|| ProxyError::InvalidRange("suffix range without total".into()))?;
+        let total =
+            total.ok_or_else(|| ProxyError::InvalidRange("suffix range without total".into()))?;
         if n == 0 {
             return Err(ProxyError::InvalidRange(value.into()));
         }
@@ -2341,13 +2489,7 @@ fn longest_common_prefix(strings: &[String]) -> String {
 /// runs, and the trailing word "part" / "vol" / "卷" if it's clearly dangling.
 fn trim_filename_tail(s: &str) -> String {
     let mut out = s.trim_end_matches(|c: char| {
-        c.is_ascii_digit()
-            || c == '.'
-            || c == '-'
-            || c == '_'
-            || c == ' '
-            || c == '('
-            || c == '['
+        c.is_ascii_digit() || c == '.' || c == '-' || c == '_' || c == ' ' || c == '(' || c == '['
     });
     // Strip a trailing "part" / "vol" / "卷" / "第" word so the suggestion
     // doesn't end in "movie.part" or "movie 第".
@@ -2639,10 +2781,7 @@ mod tests {
     #[test]
     fn plan_mirror_mode_splits_by_size() {
         let plan = plan_chunks(0, 99, 30, None);
-        assert_eq!(
-            plan,
-            vec![(0, 29), (30, 59), (60, 89), (90, 99)]
-        );
+        assert_eq!(plan, vec![(0, 29), (30, 59), (60, 89), (90, 99)]);
     }
 
     #[test]
@@ -2711,15 +2850,7 @@ mod tests {
         // chunk never spans two URLs.
         let vols = vec![vol("a", 0, 100), vol("b", 100, 150)];
         let plan = plan_chunks(0, 249, 80, Some(&vols));
-        assert_eq!(
-            plan,
-            vec![
-                (0, 79),
-                (80, 99),
-                (100, 179),
-                (180, 249),
-            ]
-        );
+        assert_eq!(plan, vec![(0, 79), (80, 99), (100, 179), (180, 249),]);
     }
 
     #[test]
@@ -2807,7 +2938,10 @@ mod tests {
             "http://host/t.mkv.02".to_string(),
             "http://host/t.mkv.03".to_string(),
         ];
-        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("t.mkv"));
+        assert_eq!(
+            merge_volume_filenames(&per_vol, &urls).as_deref(),
+            Some("t.mkv")
+        );
     }
 
     #[test]
@@ -2821,7 +2955,10 @@ mod tests {
             "http://host/movie.part03.mp4".to_string(),
         ];
         // suggest_volume_filename on the URLs trims to "movie".
-        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("movie"));
+        assert_eq!(
+            merge_volume_filenames(&per_vol, &urls).as_deref(),
+            Some("movie")
+        );
     }
 
     #[test]
@@ -2834,7 +2971,10 @@ mod tests {
             "http://host/x.part02".to_string(),
         ];
         // URL fallback gives "x".
-        assert_eq!(merge_volume_filenames(&per_vol, &urls).as_deref(), Some("x"));
+        assert_eq!(
+            merge_volume_filenames(&per_vol, &urls).as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
@@ -2917,16 +3057,18 @@ mod tests {
         // in volume 0. Warm-up must spawn volume 1's first chunk and volume
         // 2's first chunk.
         // plan: v0 has 5 chunks, v1 has 5 chunks, v2 has 5 chunks.
-        let vol_of: Vec<usize> = [0; 5]
-            .into_iter()
-            .chain([1; 5])
-            .chain([2; 5])
-            .collect();
+        let vol_of: Vec<usize> = [0; 5].into_iter().chain([1; 5]).chain([2; 5]).collect();
         let spawned = initial_spawn_set(&vol_of, 2, 3);
         assert!(spawned.contains(&0), "initial chunk 0 must spawn");
         assert!(spawned.contains(&1), "initial chunk 1 must spawn");
-        assert!(spawned.contains(&5), "v1's first chunk (idx=5) must be warmed up");
-        assert!(spawned.contains(&10), "v2's first chunk (idx=10) must be warmed up");
+        assert!(
+            spawned.contains(&5),
+            "v1's first chunk (idx=5) must be warmed up"
+        );
+        assert!(
+            spawned.contains(&10),
+            "v2's first chunk (idx=10) must be warmed up"
+        );
         assert_eq!(spawned.len(), 4);
     }
 
@@ -2934,11 +3076,7 @@ mod tests {
     fn warmup_is_noop_when_initial_window_already_covers_all_volumes() {
         // 3 volumes, max_threads=8. Plan order means initial 8 may already
         // span volumes 0 and 1 but not 2 if v0 is large.
-        let vol_of: Vec<usize> = [0; 20]
-            .into_iter()
-            .chain([1; 20])
-            .chain([2; 20])
-            .collect();
+        let vol_of: Vec<usize> = [0; 20].into_iter().chain([1; 20]).chain([2; 20]).collect();
         let spawned = initial_spawn_set(&vol_of, 8, 3);
         // Initial window is all in v0; warm-up adds v1's first (idx=20) and
         // v2's first (idx=40).
@@ -2968,11 +3106,7 @@ mod tests {
     #[test]
     fn warmup_chunk_zero_always_first() {
         // No-deadlock invariant: chunk 0 must be in the spawn set.
-        let vol_of: Vec<usize> = [0; 3]
-            .into_iter()
-            .chain([1; 3])
-            .chain([2; 3])
-            .collect();
+        let vol_of: Vec<usize> = [0; 3].into_iter().chain([1; 3]).chain([2; 3]).collect();
         let spawned = initial_spawn_set(&vol_of, 1, 3);
         assert!(spawned.contains(&0));
         // Warm-up adds first chunk of v1 (idx=3) and v2 (idx=6).
@@ -3038,7 +3172,12 @@ mod tests {
         // behavior: all 8 slots get filled by overflow.
         let vol_of: Vec<usize> = vec![0; 10];
         let spawned = simulate_spawn_set(&vol_of, 8, 4, 1);
-        assert_eq!(spawned.len(), 8, "expected 8 fetchers, got {}", spawned.len());
+        assert_eq!(
+            spawned.len(),
+            8,
+            "expected 8 fetchers, got {}",
+            spawned.len()
+        );
         assert_eq!(spawned, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
@@ -3046,10 +3185,7 @@ mod tests {
     fn strict_pass_spreads_across_volumes_before_overflow() {
         // Two volumes, plenty of chunks each. max_threads=8, cap=4.
         // Strict pass should give 4 to v0 and 4 to v1 — no overflow needed.
-        let vol_of: Vec<usize> = [0; 10]
-            .into_iter()
-            .chain([1; 10])
-            .collect();
+        let vol_of: Vec<usize> = [0; 10].into_iter().chain([1; 10]).collect();
         let spawned = simulate_spawn_set(&vol_of, 8, 4, 2);
         assert_eq!(spawned.len(), 8);
         let v0_count = spawned.iter().filter(|&&i| vol_of[i] == 0).count();
@@ -3063,10 +3199,7 @@ mod tests {
         // v0 has 10 chunks, v1 has 2 chunks. max_threads=8, cap=4.
         // Strict pass: 4 from v0 + 2 from v1 = 6. Overflow needs to push 2
         // more — and they must come from v0 (v1 is empty).
-        let vol_of: Vec<usize> = [0; 10]
-            .into_iter()
-            .chain([1; 2])
-            .collect();
+        let vol_of: Vec<usize> = [0; 10].into_iter().chain([1; 2]).collect();
         let spawned = simulate_spawn_set(&vol_of, 8, 4, 2);
         assert_eq!(spawned.len(), 8);
         let v0_count = spawned.iter().filter(|&&i| vol_of[i] == 0).count();
@@ -3115,11 +3248,7 @@ mod tests {
     fn chunk_zero_always_in_first_spawn() {
         // Playback invariant: chunk 0 must be spawned in the initial batch
         // — the serializer can't return any bytes to the client without it.
-        let vol_of: Vec<usize> = [0; 5]
-            .into_iter()
-            .chain([1; 5])
-            .chain([2; 5])
-            .collect();
+        let vol_of: Vec<usize> = [0; 5].into_iter().chain([1; 5]).chain([2; 5]).collect();
         let spawned = simulate_spawn_set(&vol_of, 3, 4, 3);
         assert_eq!(spawned.len(), 3);
         assert!(spawned.contains(&0), "chunk 0 must be in first spawn set");
@@ -3141,8 +3270,14 @@ mod tests {
         // Every chunk's volume index matches the volume containing its start.
         for ((cs, _ce), &vi) in plan.iter().zip(mapped.iter()) {
             let v = &vols[vi];
-            assert!(*cs >= v.offset && *cs < v.offset + v.size,
-                    "chunk start {} not in volume {} [{},{})", cs, vi, v.offset, v.offset + v.size);
+            assert!(
+                *cs >= v.offset && *cs < v.offset + v.size,
+                "chunk start {} not in volume {} [{},{})",
+                cs,
+                vi,
+                v.offset,
+                v.offset + v.size
+            );
         }
     }
 
@@ -3153,13 +3288,19 @@ mod tests {
         let vols = vec![vol("a", 0, 50), vol("empty", 50, 0), vol("c", 50, 50)];
         let plan = plan_chunks(0, 99, 200, Some(&vols));
         let mapped = plan_volume_indices(&plan, Some(&vols));
-        assert!(!mapped.contains(&1), "empty volume must not appear in mapping");
+        assert!(
+            !mapped.contains(&1),
+            "empty volume must not appear in mapping"
+        );
     }
 
     #[test]
     fn slice_span_single_volume_returns_unchanged() {
         let vols = vec![vol("a", 0, 1000)];
-        assert_eq!(slice_span_by_volumes(Some(&vols), 100, 500), vec![(100, 500)]);
+        assert_eq!(
+            slice_span_by_volumes(Some(&vols), 100, 500),
+            vec![(100, 500)]
+        );
     }
 
     #[test]

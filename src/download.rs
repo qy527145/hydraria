@@ -13,7 +13,7 @@
 //! Both can be on at once: the reader's window keeps priority while spare
 //! workers fill the rest of the file.
 use crate::cache::CacheEntry;
-use crate::engine::{Engine, READER_BUFFER_PROBE};
+use crate::engine::{Engine, READER_BUFFER_PROBE, WRITE_THROUGH_AHEAD};
 use crate::error::{ProxyError, Result};
 use crate::models::ThroughputSampler;
 use crate::schedule::{DEFAULT_CRITICAL_WINDOW, Scheduler, Strategy};
@@ -115,6 +115,14 @@ pub struct CacheJob {
     cache_requested: AtomicBool,
     /// Live playback readers by id, each holding its current read offset.
     readers: RwLock<HashMap<u64, u64>>,
+    /// Offset below which cache writes must skip the coalescing buffer, because
+    /// an ordered reader is close enough to be blocked on them. `0` means no
+    /// reader is waiting and every fetcher may batch freely.
+    ///
+    /// Mirrors `readers` as a single atomic on purpose: fetchers consult this
+    /// once per network buffer, and taking the `readers` lock (or the scheduler
+    /// lock) that often would put a contended lock straight on the data path.
+    write_through_below: AtomicU64,
     next_reader: AtomicU64,
     failures: AtomicUsize,
     failure_budget: usize,
@@ -127,7 +135,9 @@ impl CacheJob {
     pub fn new(task_id: String, engine: Arc<Engine>, entry: Arc<CacheEntry>) -> Result<Arc<Self>> {
         let total_size = entry.meta.total_size;
         if total_size == 0 {
-            return Err(ProxyError::Internal("cannot cache an unknown-size upstream".into()));
+            return Err(ProxyError::Internal(
+                "cannot cache an unknown-size upstream".into(),
+            ));
         }
         let threads = engine.config().max_threads.max(1);
         let scheduler = build_scheduler(&entry, &engine, total_size, threads, Strategy::Throughput);
@@ -143,9 +153,14 @@ impl CacheJob {
             entry,
             scheduler: Mutex::new(scheduler),
             workers: Mutex::new(Workers::new(threads)),
-            state: Mutex::new(if complete { JobState::Done } else { JobState::Idle }),
+            state: Mutex::new(if complete {
+                JobState::Done
+            } else {
+                JobState::Idle
+            }),
             cache_requested: AtomicBool::new(false),
             readers: RwLock::new(HashMap::new()),
+            write_through_below: AtomicU64::new(0),
             next_reader: AtomicU64::new(1),
             failures: AtomicUsize::new(0),
             failure_budget: threads.saturating_mul(2).max(8),
@@ -163,7 +178,10 @@ impl CacheJob {
         let stats = self.entry.stats();
         CacheJobInfo {
             state: state.label(),
-            error: match state { JobState::Failed(e) => Some(e), _ => None },
+            error: match state {
+                JobState::Failed(e) => Some(e),
+                _ => None,
+            },
             total_bytes: self.total_size,
             done_bytes: stats.bytes_cached.min(self.total_size),
             current_speed_bps: self.current_speed_bps.load(Ordering::Relaxed),
@@ -268,7 +286,8 @@ impl CacheJob {
         let previous = self.last_done_bytes.swap(done, Ordering::Relaxed);
         let bps = ((done.saturating_sub(previous)) as f64 / elapsed) as u64;
         self.throughput.push(bps);
-        self.current_speed_bps.store(self.throughput.recent_mean(4), Ordering::Relaxed);
+        self.current_speed_bps
+            .store(self.throughput.recent_mean(4), Ordering::Relaxed);
     }
     /// Re-cut the claims whose requests have stopped producing bytes entirely.
     ///
@@ -310,6 +329,7 @@ impl CacheJob {
     pub fn stream(self: &Arc<Self>, start: u64, end: u64) -> mpsc::Receiver<Result<Bytes>> {
         let id = self.next_reader.fetch_add(1, Ordering::Relaxed);
         self.readers.write().insert(id, start);
+        self.republish_write_through();
         self.retune();
         let stale = self
             .scheduler
@@ -430,6 +450,23 @@ impl CacheJob {
         );
         *self.last_sample.lock() = Instant::now();
     }
+    /// Recompute the write-through frontier from the live readers.
+    ///
+    /// Everything below `slowest_read_head + WRITE_THROUGH_AHEAD` is treated as
+    /// "someone is about to read this", so fetchers there write through instead
+    /// of batching. The window is generous because the cost of guessing wrong is
+    /// asymmetric: batching too eagerly stalls playback, batching too timidly
+    /// only costs syscalls.
+    fn republish_write_through(&self) {
+        let frontier = self
+            .readers
+            .read()
+            .values()
+            .min()
+            .map(|head| head.saturating_add(WRITE_THROUGH_AHEAD))
+            .unwrap_or(0);
+        self.write_through_below.store(frontier, Ordering::Relaxed);
+    }
     async fn run_worker(self: Arc<Self>, worker: usize, generation: u64) {
         // `superseded` separates "a newer generation took over" from "nothing
         // left to claim". Only the former restaffs the slot; doing it for the
@@ -440,15 +477,42 @@ impl CacheJob {
                 superseded = true;
                 break;
             }
+            // Parked, not retired: the pool keeps its width so a recovered
+            // origin needs no restaffing, and `active_workers`-style liveness
+            // checks elsewhere still see a working pool.
+            //
+            // Bound the guard to a `let` first — an `if let` scrutinee temporary
+            // lives through the body, which would hold the scheduler lock across
+            // the sleep.
+            let pause = self.scheduler.lock().overload_backoff(worker);
+            if let Some(pause) = pause {
+                tokio::time::sleep(pause).await;
+            }
             let claim = self.scheduler.lock().claim(worker);
             let Some(claim) = claim else { break };
-            let result = self.engine.fetch_claim(worker, &claim, &self.entry, false).await;
+            let result = self
+                .engine
+                .fetch_claim(
+                    worker,
+                    &claim,
+                    &self.entry,
+                    false,
+                    &self.write_through_below,
+                )
+                .await;
             self.scheduler.lock().finish(worker, claim.cursor());
             match result {
                 Ok(()) => {
                     self.scheduler.lock().note_claim_outcome(true, &claim);
                 }
                 Err(error) => {
+                    if error.is_overload() {
+                        // Busy, not broken: stagger the pool and leave the
+                        // failure budget alone, or a rate-limited origin would
+                        // fail the whole job at full speed.
+                        self.scheduler.lock().note_overload();
+                        continue;
+                    }
                     // A failure the scheduler answers by cutting smaller claims
                     // is its own to absorb — see `Scheduler::note_claim_outcome`.
                     if self.scheduler.lock().note_claim_outcome(false, &claim) {
@@ -524,6 +588,7 @@ impl CacheJob {
             }
             cursor += available;
             self.readers.write().insert(id, cursor);
+            self.republish_write_through();
             // Report the runway along with the position: an unbuffered reader
             // needs the pool packed behind it in short claims, a buffered one
             // can afford long ones. See `Scheduler::claim_len`.
@@ -535,6 +600,7 @@ impl CacheJob {
             }
         }
         self.readers.write().remove(&id);
+        self.republish_write_through();
         if self.readers.read().is_empty() {
             if self.is_cache_active() {
                 // Last reader gone: back to sweeping the whole file at full width.
@@ -561,7 +627,7 @@ fn build_scheduler(
 ) -> Scheduler {
     let already = entry.staged_ranges(0, total_size - 1);
     Scheduler::new(
-       0,
+        0,
         total_size - 1,
         strategy,
         engine.volumes(),
@@ -575,10 +641,16 @@ pub struct DownloadManager {
     jobs: RwLock<HashMap<String, Arc<CacheJob>>>,
 }
 impl Default for DownloadManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl DownloadManager {
-    pub fn new() -> Self { Self { jobs: RwLock::new(HashMap::new()) } }
+    pub fn new() -> Self {
+        Self {
+            jobs: RwLock::new(HashMap::new()),
+        }
+    }
     pub fn get(&self, task_id: &str) -> Option<Arc<CacheJob>> {
         self.jobs.read().get(task_id).cloned()
     }
@@ -642,7 +714,9 @@ impl DownloadManager {
             .sum()
     }
     pub fn persisted(&self) -> Vec<PersistedDownload> {
-        self.jobs.read().values()
+        self.jobs
+            .read()
+            .values()
             .filter(|job| job.is_cache_active() || matches!(*job.state.lock(), JobState::Paused))
             .map(|job| job.to_persisted())
             .collect()

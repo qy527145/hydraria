@@ -60,11 +60,125 @@ fn pwrite_all(f: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Re
     Ok(())
 }
 
+/// Reserve real disk blocks for `len` bytes, best-effort.
+///
+/// `set_len` alone leaves a sparse file, and `max_threads` fetchers writing at
+/// scattered offsets into a sparse file is the worst case for extent
+/// fragmentation — the allocator watches the file fill in random order and has
+/// no way to keep it contiguous. Reserving up front also surfaces ENOSPC now
+/// rather than at 90% of a multi-gigabyte download.
+///
+/// Must be called on a **freshly truncated, zero-length** file, before
+/// `set_len`. rustix's Apple implementation passes `F_PEOFPOSMODE`, which
+/// reserves `len` bytes measured from the *physical* EOF; calling it on a file
+/// already extended to `len` would therefore reserve a second `len` bytes and
+/// could spuriously fail on a nearly-full volume.
+///
+/// Failure is deliberately silent: filesystems that do not implement
+/// preallocation still work correctly with the sparse file `set_len` leaves
+/// behind, just with more fragmentation.
+#[cfg(unix)]
+fn preallocate(f: &std::fs::File, len: u64) {
+    // Empty flags is the only mode rustix accepts off Linux, and on Linux it
+    // means "allocate and grow i_size" — the behaviour we want everywhere.
+    let _ = rustix::fs::fallocate(f, rustix::fs::FallocateFlags::empty(), 0, len);
+}
+
+#[cfg(not(unix))]
+fn preallocate(_f: &std::fs::File, _len: u64) {
+    // Windows sparse-file semantics differ enough (and SetFileValidData needs a
+    // privilege we should not be asking for) that set_len alone is the sane
+    // default here.
+}
+
 /// Block granularity used for the bitmap. Bytes are stored at their absolute
 /// file offset in a sparse `file.bin`; the bitmap simply records which
 /// `BLOCK_SIZE`-sized regions are *fully* present, so reads can decide
 /// whether to hit disk or fall back to the origin.
 pub const BLOCK_SIZE: u64 = 1024 * 1024;
+
+/// How much a fetcher may hold before flushing, when no ordered reader is
+/// waiting on those bytes. One block keeps flushes aligned with the bitmap
+/// granularity, so a flush tends to complete whole blocks rather than
+/// straddling two.
+const COALESCE_BYTES: usize = BLOCK_SIZE as usize;
+
+/// Batches contiguous cache writes so far-ahead prefetch costs one large
+/// sequential `pwrite` instead of one per network buffer.
+///
+/// `reqwest` hands back whatever hyper read off the socket — typically 8–64 KiB
+/// — and `max_threads` fetchers each writing that straight to their own offset
+/// is, from the disk's point of view, pure random IO. Each worker's stream is
+/// *sequential within its own claim*, so batching recovers that sequentiality.
+///
+/// The ordered reader serves bytes out of this same file, so anything it is
+/// about to need must bypass the buffer entirely — see the `coalesce` argument
+/// to [`WriteCoalescer::write`]. Buffered bytes are lost if the fetch dies
+/// before a flush, which is harmless: the bitmap is the only durable record, so
+/// those bytes are simply re-downloaded. That does mean a caller must not
+/// report progress for bytes it has only buffered.
+pub(crate) struct WriteCoalescer {
+    start: u64,
+    buf: Vec<u8>,
+}
+
+impl WriteCoalescer {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Bytes accepted but not yet on disk. Subtract this from a fetch cursor to
+    /// get the durable watermark.
+    pub(crate) fn buffered(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
+    /// Accept `data` for absolute offset `at`. When `coalesce` is false the
+    /// write goes straight through (after draining anything already buffered,
+    /// so on-disk order still matches stream order).
+    pub(crate) fn write(
+        &mut self,
+        sink: &CacheEntry,
+        at: u64,
+        data: &[u8],
+        coalesce: bool,
+    ) -> std::io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if !coalesce {
+            self.flush(sink)?;
+            return sink.write_range(at, data);
+        }
+        // Only a contiguous append can share the buffer; anything else would
+        // write the wrong offsets on flush.
+        if !self.buf.is_empty() && self.start + self.buf.len() as u64 != at {
+            self.flush(sink)?;
+        }
+        if self.buf.is_empty() {
+            self.start = at;
+            self.buf.reserve(COALESCE_BYTES);
+        }
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= COALESCE_BYTES {
+            self.flush(sink)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self, sink: &CacheEntry) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        sink.write_range(self.start, &self.buf)?;
+        // Keeps the capacity, so steady state is one allocation per fetch.
+        self.buf.clear();
+        Ok(())
+    }
+}
 
 /// Subdirectory of the cache root holding ephemeral staging scratch files.
 /// Dot-prefixed so the entry-directory walks (`clear_all`,
@@ -172,7 +286,9 @@ impl CacheEntry {
         let bm = self.bitmap.lock();
         let byte_idx = (idx / 8) as usize;
         let bit = (idx % 8) as u8;
-        bm.get(byte_idx).map(|&b| (b >> bit) & 1 != 0).unwrap_or(false)
+        bm.get(byte_idx)
+            .map(|&b| (b >> bit) & 1 != 0)
+            .unwrap_or(false)
     }
 
     /// Read [start, end] inclusive from the sparse file. Caller must have
@@ -234,9 +350,7 @@ impl CacheEntry {
                         // that can extend the contiguous run.
                         set.iter()
                             .take_while(|&&(lo, _)| lo as u64 <= in_block)
-                            .find(|&&(lo, hi)| {
-                                lo as u64 <= in_block && in_block < hi as u64
-                            })
+                            .find(|&&(lo, hi)| lo as u64 <= in_block && in_block < hi as u64)
                             .map(|&(_, hi)| hi as u64)
                     })
                     .unwrap_or(in_block)
@@ -278,7 +392,6 @@ impl CacheEntry {
         desired: CacheMeta,
         ephemeral: bool,
     ) -> Result<Arc<CacheEntry>> {
-
         let meta_path = dir.join("meta.json");
         let file_path = dir.join("file.bin");
         let bitmap_path = dir.join("bitmap.bin");
@@ -296,7 +409,7 @@ impl CacheEntry {
             // Wipe and recreate.
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).map_err(ProxyError::Io)?;
-            // Sparse file: open with truncate + set_len.
+            // Preallocated where the platform supports it, sparse otherwise.
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -305,6 +418,9 @@ impl CacheEntry {
                 .open(&file_path)
                 .map_err(ProxyError::Io)?;
             if desired.total_size > 0 {
+                // preallocate first: it measures from the physical EOF, and
+                // set_len is the authoritative fallback when it is a no-op.
+                preallocate(&f, desired.total_size);
                 f.set_len(desired.total_size).map_err(ProxyError::Io)?;
             }
             // Empty bitmap.
@@ -334,8 +450,8 @@ impl CacheEntry {
             padded
         };
 
-        let bytes_cached: u64 = bm.iter().map(|b| b.count_ones() as u64).sum::<u64>()
-            * desired.block_size;
+        let bytes_cached: u64 =
+            bm.iter().map(|b| b.count_ones() as u64).sum::<u64>() * desired.block_size;
         let bytes_cached = bytes_cached.min(desired.total_size);
 
         Ok(Arc::new(CacheEntry {
@@ -422,8 +538,7 @@ impl CacheEntry {
                     continue;
                 }
                 let block_start = b * self.meta.block_size;
-                let block_end =
-                    ((b + 1) * self.meta.block_size - 1).min(self.meta.total_size - 1);
+                let block_end = ((b + 1) * self.meta.block_size - 1).min(self.meta.total_size - 1);
                 let bl = block_end - block_start + 1;
 
                 let in_start = start.max(block_start);
@@ -487,7 +602,11 @@ impl CacheEntry {
         let blocks_total = self.block_count();
         let (blocks_cached, bitmap_summary) = {
             let bm = self.bitmap.lock();
-            let cached = bm.iter().map(|b| b.count_ones() as u64).sum::<u64>().min(blocks_total);
+            let cached = bm
+                .iter()
+                .map(|b| b.count_ones() as u64)
+                .sum::<u64>()
+                .min(blocks_total);
             let summary = downsample_bitmap(&bm, blocks_total, 128);
             (cached, summary)
         };
@@ -764,11 +883,7 @@ impl CacheStore {
         if dir.exists() {
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => tracing::debug!("staging scratch removed: {}", dir.display()),
-                Err(e) => tracing::warn!(
-                    "failed to remove staging dir {}: {}",
-                    dir.display(),
-                    e
-                ),
+                Err(e) => tracing::warn!("failed to remove staging dir {}: {}", dir.display(), e),
             }
         }
     }
@@ -842,10 +957,7 @@ impl CacheStore {
                 let path = ent.path();
                 if path.is_dir() && !is_reserved_dir(&path) {
                     if let Err(e) = std::fs::remove_dir_all(&path) {
-                        tracing::warn!(
-                            "clear_all: failed to remove {}: {}",
-                            path.display(), e,
-                        );
+                        tracing::warn!("clear_all: failed to remove {}: {}", path.display(), e,);
                     }
                 }
             }
@@ -950,7 +1062,8 @@ fn is_reserved_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn cache_meta_compatible(stored: &CacheMeta, desired: &CacheMeta) -> bool {    if stored.total_size != desired.total_size {
+fn cache_meta_compatible(stored: &CacheMeta, desired: &CacheMeta) -> bool {
+    if stored.total_size != desired.total_size {
         return false;
     }
     if stored.block_size != desired.block_size {
@@ -1301,6 +1414,72 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_batches_contiguous_writes_into_one_flush() {
+        let (root, store) = fresh_store();
+        let e = tiny_entry(&store);
+        let mut w = WriteCoalescer::new();
+
+        // Three contiguous 8-byte appends, well under COALESCE_BYTES: nothing
+        // should be on disk yet, and the buffered count is the caller's cue not
+        // to report those bytes as durable.
+        for i in 0..3u64 {
+            w.write(&e, i * 8, &[b'a'; 8], true).unwrap();
+        }
+        assert_eq!(w.buffered(), 24);
+        assert_eq!(
+            e.contiguous_from(0, 200),
+            0,
+            "buffered bytes must not be visible"
+        );
+
+        w.flush(&e).unwrap();
+        assert_eq!(w.buffered(), 0);
+        assert_eq!(e.read_range(0, 23).unwrap().as_ref(), &[b'a'; 24][..]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coalescer_flushes_before_a_non_contiguous_write() {
+        let (root, store) = fresh_store();
+        let e = tiny_entry(&store);
+        let mut w = WriteCoalescer::new();
+
+        w.write(&e, 0, &[b'x'; 8], true).unwrap();
+        // Jumping to a new offset must land the buffer at its *own* start, not
+        // at the new one — the bug this guards against silently misplaces bytes.
+        w.write(&e, 100, &[b'y'; 8], true).unwrap();
+        assert_eq!(w.buffered(), 8, "only the second write is still buffered");
+        w.flush(&e).unwrap();
+
+        assert_eq!(e.read_range(0, 7).unwrap().as_ref(), &[b'x'; 8][..]);
+        assert_eq!(e.read_range(100, 107).unwrap().as_ref(), &[b'y'; 8][..]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coalescer_write_through_drains_the_buffer_first() {
+        let (root, store) = fresh_store();
+        let e = tiny_entry(&store);
+        let mut w = WriteCoalescer::new();
+
+        w.write(&e, 0, &[b'1'; 8], true).unwrap();
+        // A write-through for the *next* offset must not overtake the buffered
+        // bytes behind it, or the reader sees a hole it will never revisit.
+        w.write(&e, 8, &[b'2'; 8], false).unwrap();
+        assert_eq!(w.buffered(), 0);
+        assert_eq!(
+            e.contiguous_from(0, 16),
+            16,
+            "both runs are on disk in order"
+        );
+
+        let got = e.read_range(0, 15).unwrap();
+        assert_eq!(&got[..8], &[b'1'; 8][..]);
+        assert_eq!(&got[8..], &[b'2'; 8][..]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn ephemeral_staging_is_refcounted_and_removed_on_last_drop() {
         let (root, store) = fresh_store();
         let store = Arc::new(store);
@@ -1345,7 +1524,10 @@ mod tests {
         assert!(!h.is_ephemeral());
         drop(h);
         assert!(store.entry_dir("k").is_dir(), "cache entry must persist");
-        assert!(!store.staging_dir("k").exists(), "must not use scratch root");
+        assert!(
+            !store.staging_dir("k").exists(),
+            "must not use scratch root"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1370,5 +1552,55 @@ mod tests {
             "an in-use scratch file must not be pulled out from under its stream",
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod prealloc_tests {
+    /// `preallocate` must reserve real blocks rather than leaving a hole, and
+    /// `set_len` after it must still produce the exact logical length.
+    ///
+    /// The reservation is checked against a sparse control file rather than
+    /// against `len`, because it is best-effort by contract: APFS honours
+    /// `F_PREALLOCATE` approximately (a 4 MiB request reports ~3.8 MiB of
+    /// `st_blocks` on a fresh file), and some filesystems decline entirely.
+    /// What must hold is that it did *something* a bare `set_len` would not.
+    #[test]
+    fn preallocate_reserves_real_blocks() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hydraria-prealloc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let len = 4 * 1024 * 1024u64;
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.join("f.bin"))
+            .unwrap();
+        super::preallocate(&f, len);
+        f.set_len(len).unwrap();
+        let reserved = f.metadata().unwrap().blocks() * 512;
+        assert_eq!(f.metadata().unwrap().len(), len, "logical length is exact");
+
+        // The control: a bare set_len leaves a hole. Without this the test
+        // would still pass on a platform where `preallocate` is a no-op.
+        let s = std::fs::File::create(dir.join("sparse.bin")).unwrap();
+        s.set_len(len).unwrap();
+        let sparse = s.metadata().unwrap().blocks() * 512;
+
+        assert!(
+            sparse < len,
+            "set_len allocated {sparse} B of {len}; the control is not sparse, \
+             so this test cannot tell preallocation from nothing"
+        );
+        assert!(
+            reserved > sparse && reserved >= len / 2,
+            "preallocate reserved {reserved} B against a sparse baseline of \
+             {sparse} B (wanted {len}) — it looks like a no-op"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

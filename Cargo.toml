@@ -29,7 +29,22 @@ eula = false
 axum = { version = "0.8.9", features = ["macros"] }
 clap = { version = "4.6.1", features = ["derive"] }
 futures-util = "0.3.32"
-reqwest = { version = "0.13.3", features = ["json", "stream"] }
+# `http2` is deliberately absent from this feature list. reqwest's defaults are
+# ["default-tls", "charset", "http2", "system-proxy"]; everything except http2 is
+# re-listed here. When h2 is negotiated over ALPN, hyper's pool hands out a
+# *shared* connection reservation, so all `max_threads` concurrent chunk
+# requests to one host multiplex onto a single TCP connection — one congestion
+# window, and one instance of whatever per-connection rate limit the origin
+# applies. That collapses N-way parallelism back to 1×, which is this project's
+# entire reason to exist. `engine::build_upstream_client` also calls
+# `.http1_only()`, so the guard survives someone re-adding the feature here.
+reqwest = { version = "0.13.3", default-features = false, features = [
+    "default-tls",
+    "charset",
+    "system-proxy",
+    "json",
+    "stream",
+] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.52.3", features = ["full"] }
@@ -63,3 +78,6 @@ strip = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }

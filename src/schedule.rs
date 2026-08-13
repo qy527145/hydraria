@@ -86,6 +86,18 @@ pub const STRAGGLER_RATIO: f64 = 0.35;
 /// the worker (`design.md` §12 `dead_conn_window`).
 pub const DEAD_CLAIM_WINDOW: Duration = Duration::from_secs(30);
 
+/// First pause after the origin answers 429/503, doubled per further strike.
+const OVERLOAD_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+/// Ceiling on the 429/503 pause. Long enough to actually clear a rate-limit
+/// window, short enough that a recovered origin is not left idle.
+const OVERLOAD_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// Strike ceiling. The ladder is `250ms × 2^(strikes-1)`, so six strikes is
+/// exactly [`OVERLOAD_BACKOFF_MAX`]; counting past that could only slow how
+/// fast a successful claim works the strikes back off.
+const OVERLOAD_STRIKES_MAX: u32 = 6;
+
 /// Rate samples shorter than this are noise, so a claim younger than it is
 /// never judged a straggler (`design.md` §11: 2000 ms or 512 KiB sampling
 /// threshold).
@@ -271,7 +283,10 @@ impl Live {
     /// mean anything (`design.md` §11).
     fn rate(&self) -> Option<f64> {
         let elapsed = self.started.elapsed();
-        let done = self.cursor.load(Ordering::Acquire).saturating_sub(self.start);
+        let done = self
+            .cursor
+            .load(Ordering::Acquire)
+            .saturating_sub(self.start);
         if elapsed < RATE_SAMPLE_WINDOW && done < RATE_SAMPLE_BYTES {
             return None;
         }
@@ -323,6 +338,16 @@ pub struct Scheduler {
     /// never refilled, so a pathological tail can't turn into a request storm
     /// against the origin (`design.md` §6.1).
     dup_budget: u64,
+    /// Unworked-off "slow down" answers (HTTP 429/503) from the origin.
+    ///
+    /// This is the one signal that says the *number of connections* is wrong
+    /// rather than their size — `auto_limit` covers the latter. Each strike
+    /// stretches the pause a worker takes before its next claim, which thins
+    /// concurrency without retiring workers: a staged reader infers "nobody is
+    /// coming" from the live worker count, so parking a worker is safe where
+    /// ending one is not. Successful claims work strikes back off, so a
+    /// transient 429 costs a short stagger, not a permanently narrower pool.
+    overload_strikes: u32,
 }
 
 impl Scheduler {
@@ -357,9 +382,9 @@ impl Scheduler {
             work_limit: None,
             auto_limit: None,
             auto_wall: u64::MAX,
-            dup_budget: (req_end.saturating_sub(req_start).saturating_add(1)
-                / DUP_BUDGET_DIVISOR)
+            dup_budget: (req_end.saturating_sub(req_start).saturating_add(1) / DUP_BUDGET_DIVISOR)
                 .min(DUP_BUDGET_MAX),
+            overload_strikes: 0,
         };
         for &(s0, e0) in already_staged {
             s.subtract(s0, e0);
@@ -665,6 +690,10 @@ impl Scheduler {
     ///   `2 × max_threads` on its own.
     pub fn note_claim_outcome(&mut self, ok: bool, claim: &Claim) -> bool {
         if ok {
+            // A claim that completed is evidence the current width is workable,
+            // so work off one strike. Additive recovery against multiplicative
+            // backoff — the same shape TCP uses, and for the same reason.
+            self.overload_strikes = self.overload_strikes.saturating_sub(1);
             // Recovery: climb back towards the strategy's size, but never past
             // what this upstream has been shown to swallow.
             if let Some(limit) = self.auto_limit {
@@ -698,6 +727,46 @@ impl Scheduler {
     /// exposed for logging and tests.
     pub fn auto_limit(&self) -> Option<u64> {
         self.auto_limit
+    }
+
+    /// Record that the origin answered 429/503 — it is refusing this much
+    /// concurrency, whatever the claim size.
+    ///
+    /// Rotating to the next mirror (what a plain failure does) is the wrong
+    /// answer here: on a single-origin task there is nowhere to rotate to, so
+    /// the retry lands on the same rate limiter and burns the task's failure
+    /// budget at full speed.
+    pub fn note_overload(&mut self) {
+        self.overload_strikes = (self.overload_strikes + 1).min(OVERLOAD_STRIKES_MAX);
+    }
+
+    /// How long `worker` should wait before taking its next claim.
+    ///
+    /// The jitter is what makes this thin concurrency rather than just slow
+    /// everything down: an unjittered pause is served by every worker at once,
+    /// so they resynchronise and hit the origin in the same bursts that earned
+    /// the 429. Spreading them across the window staggers the requests instead.
+    pub fn overload_backoff(&self, worker: usize) -> Option<Duration> {
+        if self.overload_strikes == 0 {
+            return None;
+        }
+        let scaled = OVERLOAD_BACKOFF_BASE
+            .saturating_mul(1u32 << (self.overload_strikes - 1))
+            .min(OVERLOAD_BACKOFF_MAX);
+        // Deterministic per-worker offset over [0, scaled): no RNG dependency,
+        // and reproducible in tests.
+        let span = scaled.as_millis() as u64;
+        let offset = if span == 0 {
+            0
+        } else {
+            (worker as u64).wrapping_mul(2_654_435_761) % span
+        };
+        Some(scaled + Duration::from_millis(offset))
+    }
+
+    /// Unworked-off 429/503 strikes — exposed for logging and tests.
+    pub fn overload_strikes(&self) -> u32 {
+        self.overload_strikes
     }
 
     /// How long a claim starting at the read head would be right now — the
@@ -1000,7 +1069,9 @@ impl Scheduler {
                 return Some(i);
             }
         }
-        eligible.into_iter().max_by_key(|&i| self.live[i].remaining())
+        eligible
+            .into_iter()
+            .max_by_key(|&i| self.live[i].remaining())
     }
 
     /// T3 — the endgame (`design.md` §6.1). Every byte is claimed and nothing
@@ -1123,8 +1194,7 @@ impl Scheduler {
     fn claim_len(&self) -> u64 {
         let policy = match self.strategy {
             Strategy::Throughput => self.even_share(),
-            Strategy::Latency { head_claim, .. } => (self.buffered
-                / (self.max_threads as u64))
+            Strategy::Latency { head_claim, .. } => (self.buffered / (self.max_threads as u64))
                 .max(head_claim.max(1))
                 .min(self.even_share()),
         };
@@ -1214,8 +1284,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_healthy_scheduler_never_makes_a_worker_wait() {
+        let s = sched(Strategy::Throughput, 8, None);
+        assert_eq!(s.overload_strikes(), 0);
+        for worker in 0..8 {
+            assert_eq!(s.overload_backoff(worker), None);
+        }
+    }
+
+    #[test]
+    fn overload_backoff_grows_multiplicatively_and_caps() {
+        let mut s = sched(Strategy::Throughput, 8, None);
+        let mut last = Duration::ZERO;
+        for _ in 0..OVERLOAD_STRIKES_MAX {
+            s.note_overload();
+            // Worker 0's jitter offset is 0, so it reads the base pause exactly.
+            let now = s.overload_backoff(0).unwrap();
+            assert!(now >= last, "backoff must not shrink while strikes climb");
+            last = now;
+        }
+        assert_eq!(s.overload_strikes(), OVERLOAD_STRIKES_MAX);
+        // Further strikes neither overflow the shift nor exceed the cap.
+        for _ in 0..4 {
+            s.note_overload();
+        }
+        assert_eq!(s.overload_strikes(), OVERLOAD_STRIKES_MAX);
+        assert_eq!(s.overload_backoff(0).unwrap(), OVERLOAD_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn overload_backoff_staggers_workers_instead_of_pausing_them_together() {
+        let mut s = sched(Strategy::Throughput, 8, None);
+        s.note_overload();
+        s.note_overload();
+        // The point of the jitter: an unjittered pause is served by the whole
+        // pool at once, which resynchronises it into the same burst that earned
+        // the 429 in the first place.
+        let waits: std::collections::HashSet<_> =
+            (0..8).map(|w| s.overload_backoff(w).unwrap()).collect();
+        assert!(
+            waits.len() > 1,
+            "all workers got the same pause, so they will resynchronise: {waits:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_claim_works_off_one_strike() {
+        let mut s = sched(Strategy::Throughput, 4, None);
+        s.note_overload();
+        s.note_overload();
+        assert_eq!(s.overload_strikes(), 2);
+
+        let c = s.claim(0).expect("a fresh scheduler has work");
+        s.finish(0, c.end());
+        s.note_claim_outcome(true, &c);
+        assert_eq!(
+            s.overload_strikes(),
+            1,
+            "success is evidence, so decay by one"
+        );
+
+        let c = s.claim(0).expect("still work left");
+        s.finish(0, c.end());
+        s.note_claim_outcome(true, &c);
+        assert_eq!(s.overload_strikes(), 0);
+        assert_eq!(s.overload_backoff(0), None, "recovered pools do not wait");
+    }
+
     fn sched(strategy: Strategy, threads: usize, cap: Option<u64>) -> Scheduler {
-        Scheduler::new(0, 100 * MIN_CLAIM - 1, strategy, None, threads, threads, cap, &[])
+        Scheduler::new(
+            0,
+            100 * MIN_CLAIM - 1,
+            strategy,
+            None,
+            threads,
+            threads,
+            cap,
+            &[],
+        )
     }
 
     /// Hand out a claim, deliver nothing, and report the failure the way a
@@ -1396,7 +1543,10 @@ mod tests {
         assert_eq!(a.start, 0);
         let len = a.end() - a.start + 1;
         assert_eq!(len, 100 * MIN_CLAIM);
-        assert!(len > 5 * 1024 * 1024 * 10, "must dwarf the old 5 MiB default");
+        assert!(
+            len > 5 * 1024 * 1024 * 10,
+            "must dwarf the old 5 MiB default"
+        );
     }
 
     #[test]
@@ -1626,7 +1776,8 @@ mod tests {
         // largest-gap decision, not this test's business — so assert on the
         // give-back itself.)
         assert!(
-            s.unclaimed_ranges().contains(&(MIN_CLAIM, 4 * MIN_CLAIM - 1)),
+            s.unclaimed_ranges()
+                .contains(&(MIN_CLAIM, 4 * MIN_CLAIM - 1)),
             "refetching must resume at the cursor, not at the claim's start; \
              unclaimed = {:?}",
             s.unclaimed_ranges(),
@@ -1760,7 +1911,10 @@ mod tests {
 
     #[test]
     fn claims_never_span_a_volume_boundary() {
-        let vols = Arc::new(vec![vol(0, 10 * MIN_CLAIM), vol(10 * MIN_CLAIM, 10 * MIN_CLAIM)]);
+        let vols = Arc::new(vec![
+            vol(0, 10 * MIN_CLAIM),
+            vol(10 * MIN_CLAIM, 10 * MIN_CLAIM),
+        ]);
         let mut s = Scheduler::new(
             0,
             20 * MIN_CLAIM - 1,
@@ -1916,7 +2070,16 @@ mod tests {
 
     #[test]
     fn drains_and_then_returns_none() {
-        let mut s = Scheduler::new(0, 2 * MIN_CLAIM - 1, Strategy::Throughput, None, 2, 2, None, &[]);
+        let mut s = Scheduler::new(
+            0,
+            2 * MIN_CLAIM - 1,
+            Strategy::Throughput,
+            None,
+            2,
+            2,
+            None,
+            &[],
+        );
         let a = s.claim(0).unwrap();
         let b = s.claim(1).unwrap();
         assert!(!s.is_drained());
@@ -2075,7 +2238,11 @@ mod tests {
         }
         live.advance_to(live.start + MIN_CLAIM); // this one is still working
 
-        assert_eq!(s.reclaim_stalled(), vec![0], "only the dead claim is re-cut");
+        assert_eq!(
+            s.reclaim_stalled(),
+            vec![0],
+            "only the dead claim is re-cut"
+        );
         assert!(
             s.unclaimed_ranges()
                 .contains(&(stuck.start + MIN_CLAIM, stuck.end())),

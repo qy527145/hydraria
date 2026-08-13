@@ -377,11 +377,12 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         // Saturating: an underflow would wrap the u32 to ~4 billion and make
         // the gauge worse than useless.
-        let _ = self.0.active_connections.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .0
+            .active_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -520,9 +521,7 @@ impl TaskEntry {
             last_sample: Mutex::new(Instant::now()),
             probe_cache: Mutex::new(None),
             probe_inflight: tokio::sync::Mutex::new(()),
-            head_unsupported: Arc::new(parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
+            head_unsupported: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -712,6 +711,10 @@ pub struct AppState {
     pub persist_path: Arc<std::path::PathBuf>,
     pub plugins: Arc<PluginRegistry>,
     pub downloads: Arc<crate::download::DownloadManager>,
+    /// The one upstream HTTP client, shared by every engine this process
+    /// builds. A `Client` owns its connection pool, so this must not be
+    /// rebuilt per request — see [`crate::engine::build_upstream_client`].
+    pub upstream: reqwest::Client,
 }
 
 impl AppState {
@@ -722,6 +725,7 @@ impl AppState {
         settings: GlobalSettings,
         plugins: Arc<PluginRegistry>,
         downloads: Arc<crate::download::DownloadManager>,
+        upstream: reqwest::Client,
     ) -> Self {
         let limiter = Arc::new(Limiter::new(
             settings.global_rate_limit_bps,
@@ -734,6 +738,7 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             global_limiter: limiter,
             downloads,
+            upstream,
             global_throughput: Arc::new(ThroughputSampler::new(60)),
             global_window_bytes: Arc::new(AtomicU64::new(0)),
             persist_path: Arc::new(persist_path),
@@ -761,7 +766,8 @@ impl AppState {
             // Look up each URL's volume size from the cached probe (if any),
             // so the dashboard can show "this URL is for a 1.2 GB volume"
             // alongside the live in-flight counter.
-            let size_for: std::collections::HashMap<String, u64> = match &*entry.probe_cache.lock() {
+            let size_for: std::collections::HashMap<String, u64> = match &*entry.probe_cache.lock()
+            {
                 Some((probe, _)) => probe
                     .volumes
                     .as_ref()
@@ -1069,7 +1075,9 @@ impl AppState {
         for k in pg_keys {
             k.hash(&mut hasher);
             if let Some(v) = s.plugin_globals.get(k) {
-                serde_json::to_string(v).unwrap_or_default().hash(&mut hasher);
+                serde_json::to_string(v)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
             }
         }
         drop(s);
@@ -1148,7 +1156,10 @@ mod tests {
         // jump a task to the top of the list without changing anything.
         let entry = TaskEntry::new(config("before"));
         let created = entry.updated_at.load(Ordering::Relaxed);
-        assert_eq!(created, entry.created_at, "an unedited task reads as created");
+        assert_eq!(
+            created, entry.created_at,
+            "an unedited task reads as created"
+        );
 
         entry.updated_at.store(created - 60, Ordering::Relaxed);
         entry
@@ -1210,7 +1221,11 @@ mod tests {
                 ..Default::default()
             })
             .expect("valid");
-        assert_eq!(entry.config.read().max_threads, 16, "8 × 2 卷，忽略 PATCH 的 3");
+        assert_eq!(
+            entry.config.read().max_threads,
+            16,
+            "8 × 2 卷，忽略 PATCH 的 3"
+        );
 
         // 硬上限守住 128。
         let mut huge = config("derive");
