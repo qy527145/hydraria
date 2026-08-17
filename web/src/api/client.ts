@@ -104,7 +104,7 @@ export interface HostMapping {
   enabled: boolean;
 }
 
-/** `GET /api/hostmap/resolve` 的响应：这个 host 到底会被连到哪儿。 */
+/** `POST /api/hostmap/resolve` 的响应：这个 host 到底会被连到哪儿。 */
 export interface HostResolution {
   host: string;
   /** 命中的映射目标；null = 没有规则命中，走的是正常 DNS。 */
@@ -114,6 +114,14 @@ export interface HostResolution {
   /** 检测到的代理环境变量名。命中映射的请求会自动绕开代理，这里只是告知。 */
   proxy_env: string | null;
 }
+
+/**
+ * 测试一份规则时，这份规则是「全部规则」还是「盖在全局之上的一层」。
+ *
+ * 差别在删掉一条规则之后才显出来：全局面板里删掉一条再测，必须报「没有规则
+ * 命中」，按任务级的合并语义则会把刚删掉的那条从已保存的全局表里又捞回来。
+ */
+export type HostMapScope = 'global' | 'task';
 
 export interface GlobalSettings {
   global_rate_limit_bps: number;
@@ -177,6 +185,9 @@ export interface ProbeResult {
 export interface CreatedTask {
   task_id: string;
   proxy_url: string;
+  /** 只在请求里带了 start_cache 时出现。 */
+  cache_started?: boolean;
+  cache_error?: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -228,11 +239,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ volumes, headers, host_mappings }),
     }),
-  /** 诊断：这个域名最终会被连到哪儿。带 taskId 就按该任务的生效表算。 */
-  resolveHost: (host: string, taskId?: string) =>
-    request<HostResolution>(
-      `/api/hostmap/resolve?host=${encodeURIComponent(host)}${taskId ? `&task_id=${taskId}` : ''}`,
-    ),
+  /**
+   * 诊断：这个域名最终会被连到哪儿。
+   *
+   * 走 POST 而不是 GET，是为了能把**编辑中**（还没保存）的规则一起发过去。
+   * 只认已保存规则的话，「改完 target 再测一次」报的永远是上一次的结果 ——
+   * 而按下测试的时机，恰恰是规则还没保存的时候。
+   */
+  resolveHost: (host: string, opts: { scope: HostMapScope; mappings?: HostMapping[]; taskId?: string } ) =>
+    request<HostResolution>('/api/hostmap/resolve', {
+      method: 'POST',
+      body: JSON.stringify({
+        host,
+        scope: opts.scope,
+        mappings: opts.mappings,
+        task_id: opts.taskId,
+      }),
+    }),
   savePluginGlobal: (id: string, config: unknown) =>
     request<void>(`/api/plugins/${id}/global`, { method: 'PUT', body: JSON.stringify(config) }),
 };

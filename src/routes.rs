@@ -27,6 +27,13 @@ use tokio_stream::wrappers::ReceiverStream;
 struct CreateResp {
     task_id: String,
     proxy_url: String,
+    /// 只有请求里要求了 `start_cache` 时才出现：整文件缓存有没有真的跑起来。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_started: Option<bool>,
+    /// 缓存那一步失败的原因。任务本身已经建好了 —— 分开报，脚本才能区分
+    /// 「任务没建成」和「任务建好了但源站现在连不上」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +48,34 @@ struct ResolveQuery {
     /// 带上就按这个任务的生效表算（含它自己的任务级映射）。
     #[serde(default)]
     task_id: Option<String>,
+}
+
+/// `POST /api/hostmap/resolve` 的请求体。GET 那版只能测**已保存**的规则，于是
+/// 「改完 target 再测一次，报的还是上一次的结果」—— 面板里最容易踩的一个坑。
+/// 这里允许把编辑器里当前那份规则一起发过来，测的就是屏幕上写着的东西。
+#[derive(Deserialize)]
+struct ResolveReq {
+    host: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    /// 编辑中的规则。`None` = 按已保存的算（等价于 GET）。
+    #[serde(default)]
+    mappings: Option<Vec<crate::hostmap::HostMapping>>,
+    /// `mappings` 替换的是哪一层，见 [`ResolveScope`]。
+    #[serde(default)]
+    scope: ResolveScope,
+}
+
+/// 草稿规则替换哪一层。
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResolveScope {
+    /// 任务级：草稿盖在**当前生效的全局规则**之上，和任务真正跑起来时一样。
+    #[default]
+    Task,
+    /// 全局级：草稿**就是**全部规则。全局设置面板要的是这个 —— 在那儿删掉一条
+    /// 规则后再测，结果必须是「没有规则命中」。
+    Global,
 }
 
 #[derive(Deserialize)]
@@ -116,7 +151,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/export", get(export_task))
         .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
-        .route("/api/hostmap/resolve", get(resolve_host))
+        .route(
+            "/api/hostmap/resolve",
+            get(resolve_host).post(resolve_host_draft),
+        )
         .route("/api/global", get(get_global))
         .route("/api/plugins", get(list_plugins))
         .route(
@@ -149,21 +187,61 @@ async fn put_settings(
 /// 都是它 —— 光看日志得先复现一次请求，这里可以随时问。
 ///
 /// `task_id` 传了就用那个任务的生效表（全局 ∪ 任务级），不传就只看全局。
+/// 想测**还没保存**的规则用 POST，见 [`resolve_host_draft`]。
 async fn resolve_host(
     State(state): State<AppState>,
     Query(q): Query<ResolveQuery>,
 ) -> Result<Json<crate::hostmap::Diagnosis>, ProxyError> {
-    let host = q.host.trim();
-    if host.is_empty() {
-        return Err(ProxyError::Internal("host must not be empty".into()));
-    }
-    // 顺手接受整条 URL —— 排查的时候手里有的通常是 URL，不是光秃秃一个域名。
-    let host = reqwest::Url::parse(host)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or_else(|| host.to_string());
+    let host = probe_host(&q.host)?;
+    let table = saved_table(&state, q.task_id.as_deref())?;
+    Ok(Json(crate::hostmap::diagnose(&table, &host).await))
+}
 
-    let table = match q.task_id.as_deref() {
+/// 同上，但可以带一份**编辑中**的规则。
+///
+/// 这是「改了 target，再测还是旧结果」的解法：那不是缓存，是 GET 那版只认已经
+/// 落库的规则 —— 而按下测试的时机，恰恰是规则还没保存的时候。
+async fn resolve_host_draft(
+    State(state): State<AppState>,
+    Json(req): Json<ResolveReq>,
+) -> Result<Json<crate::hostmap::Diagnosis>, ProxyError> {
+    let host = probe_host(&req.host)?;
+    let table = match req.mappings {
+        Some(draft) => draft_table(draft, req.scope).map_err(ProxyError::Internal)?,
+        None => saved_table(&state, req.task_id.as_deref())?,
+    };
+    Ok(Json(crate::hostmap::diagnose(&table, &host).await))
+}
+
+/// 编辑中的规则 → 一张可以拿来解析的表。
+///
+/// 两个 scope 的差别就是「草稿是全部规则，还是盖在全局之上的一层」，而这个差别
+/// 是有后果的：在全局设置里删掉一条规则再测，必须报「没有规则命中」，用
+/// `Task` 的合并语义会把刚删掉的那条从全局又捞回来。
+fn draft_table(
+    draft: Vec<crate::hostmap::HostMapping>,
+    scope: ResolveScope,
+) -> Result<Arc<crate::hostmap::HostTable>, String> {
+    // 只填了一半的行是表单里刚加出来的，测的人显然不是在问它们；留着只会让
+    // build 因为「source must not be empty」整体失败。
+    let draft: Vec<_> = draft
+        .into_iter()
+        .filter(|m| !m.from.trim().is_empty() && !m.to.trim().is_empty())
+        .collect();
+    let rules = match scope {
+        ResolveScope::Task => crate::hostmap::merged_rules(&draft),
+        ResolveScope::Global => draft,
+    };
+    // 规则本身写错时，这条错误正是用户要的答案，原样报回去。
+    crate::hostmap::HostTable::build(&rules).map(Arc::new)
+}
+
+/// 已保存的生效表：给了任务就是「全局 ∪ 该任务」，否则只有全局那张。
+fn saved_table(
+    state: &AppState,
+    task_id: Option<&str>,
+) -> Result<Arc<crate::hostmap::HostTable>, ProxyError> {
+    match task_id {
         Some(id) => {
             let entry = state
                 .tasks
@@ -172,30 +250,81 @@ async fn resolve_host(
                 .cloned()
                 .ok_or_else(|| ProxyError::Internal(format!("no such task: {id}")))?;
             let rules = entry.config.read().host_mappings.clone();
-            crate::hostmap::effective_for(&rules)
+            Ok(crate::hostmap::effective_for(&rules)
                 .map_err(ProxyError::Internal)?
-                .table
+                .table)
         }
-        None => crate::hostmap::global_table(),
-    };
-    Ok(Json(crate::hostmap::diagnose(&table, &host).await))
+        None => Ok(crate::hostmap::global_table()),
+    }
+}
+
+/// 顺手接受整条 URL —— 排查的时候手里有的通常是 URL，不是光秃秃一个域名。
+fn probe_host(raw: &str) -> Result<String, ProxyError> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return Err(ProxyError::Internal("host must not be empty".into()));
+    }
+    Ok(reqwest::Url::parse(host)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| host.to_string()))
 }
 
 async fn get_global(State(state): State<AppState>) -> Json<GlobalState> {
     Json(state.global_state())
 }
 
+/// `POST /api/tasks` —— 建任务，返回代理短链。
+///
+/// 请求体就是一个 `TaskConfig`，但对**脚本**额外放宽了 URL 的写法：`volumes`
+/// 是二维的（分卷 × 镜像），而绝大多数脚本要下发的只是「一个文件、一到几个
+/// 镜像」，为此多写一层方括号（更常见的是写错）不值得。所以下面这些全都认，
+/// 语义与 aria2 的 `addUri`、Motrix、Gopeed 一致：
+///
+/// ```jsonc
+/// {"url":  "https://a/f.mp4"}                       // 一卷一镜像
+/// {"urls": ["https://a/f.mp4", "https://b/f.mp4"]}  // 一卷两镜像（同一个文件）
+/// {"volumes": [["https://a/p1"], ["https://a/p2"]]} // 两卷（顺序拼接）
+/// ```
+///
+/// `uri` / `uris` 是 aria2 的叫法，一并接受。其余字段缺省即可 —— 服务端会填上
+/// 和面板新建任务时一样的默认值。
+///
+/// `start_cache: true`（或 `?start_cache=1`）表示建完立刻开始把整个文件拉进
+/// 缓存，也就是 aria2 那种「加进来就开始下」。它会失败（源站连不上、不支持
+/// Range），但那不该让创建也跟着失败：任务已经建好了，短链是有效的，所以缓存
+/// 的结果单独放在 `cache_started` / `cache_error` 里报。
 async fn create_task(
     State(state): State<AppState>,
-    Json(mut cfg): Json<TaskConfig>,
+    Query(q): Query<CreateQuery>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<CreateResp>, ProxyError> {
+    let mut body = match body {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(ProxyError::Internal(
+                "request body must be a JSON object".into(),
+            ));
+        }
+    };
+    coerce_url_aliases(&mut body).map_err(ProxyError::Internal)?;
+    let start_cache = q.start_cache()
+        || matches!(
+            body.remove("start_cache"),
+            Some(serde_json::Value::Bool(true))
+        );
+    reject_unknown_fields(&body).map_err(ProxyError::Internal)?;
+
+    let mut cfg: TaskConfig = serde_json::from_value(serde_json::Value::Object(body))
+        .map_err(|e| ProxyError::Internal(format!("invalid task config: {e}")))?;
     cfg.normalize();
     if cfg.volumes.is_empty() {
         return Err(ProxyError::Internal(
-            "at least one URL is required across all volumes".into(),
+            "at least one URL is required — pass \"url\", \"urls\" or \"volumes\"".into(),
         ));
     }
-    cfg.validate_host_mappings().map_err(ProxyError::Internal)?;
+    cfg.validate().map_err(ProxyError::Internal)?;
+    validate_task_plugins(&state, &cfg.plugins).map_err(ProxyError::Internal)?;
     let id = {
         let mut tries = 0;
         loop {
@@ -210,11 +339,228 @@ async fn create_task(
         }
     };
     let entry = Arc::new(TaskEntry::new(cfg));
-    state.insert(id.clone(), entry);
+    state.insert(id.clone(), Arc::clone(&entry));
+
+    let (cache_started, cache_error) = if start_cache {
+        match ensure_cache_job(&state, &id, &entry).await {
+            Ok(job) => {
+                job.start_cache();
+                (Some(true), None)
+            }
+            Err(e) => (Some(false), Some(e.to_string())),
+        }
+    } else {
+        (None, None)
+    };
     Ok(Json(CreateResp {
         proxy_url: format!("http://{}/stream/{}", state.bind_addr, id),
         task_id: id,
+        cache_started,
+        cache_error,
     }))
+}
+
+#[derive(Deserialize)]
+struct CreateQuery {
+    /// 建完立刻开始整文件缓存。和请求体里的同名字段等价，两个给了任一个就算数。
+    ///
+    /// 收字符串再自己判真假，而不是让 serde 直接反序列化成 `bool`：那样只认
+    /// `true` / `false`，而 `?start_cache=1` 是查询串里更常见的写法，报一句
+    /// 「provided string was not `true` or `false`」纯属为难人。
+    #[serde(default)]
+    start_cache: Option<String>,
+}
+
+impl CreateQuery {
+    fn start_cache(&self) -> bool {
+        match self.start_cache.as_deref() {
+            // `?start_cache`（没有等号）解出来是空串，写的人显然是想要它。
+            Some(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            None => false,
+        }
+    }
+}
+
+/// 请求体里允许出现的字段：`TaskConfig` 的全部字段，加上创建 / 更新时额外接受的
+/// 那几个别名与开关。
+///
+/// 和 `TaskConfig` 的定义放在一起看才有意义 —— 加字段时这里也要加，否则新字段会
+/// 被下面的检查拒掉（测试 `every_task_config_field_is_reachable_through_the_api`
+/// 会立刻发现）。
+const ACCEPTED_TASK_FIELDS: &[&str] = &[
+    // TaskConfig 本体
+    "volumes",
+    "max_threads",
+    "max_per_volume",
+    "max_split",
+    "cache",
+    "headers",
+    "name",
+    "output_filename",
+    "auto_filename",
+    "rate_limit_bps",
+    "rate_limit_algorithm",
+    "persist",
+    "plugins",
+    "content_disposition",
+    "host_mappings",
+    // 创建 / 更新时的便捷写法（`coerce_url_aliases` 会先把它们吸收掉，
+    // 这里列出来只是为了错误信息里能提到它们）
+    "url",
+    "urls",
+    "uri",
+    "uris",
+    "start_cache",
+];
+
+/// 未知字段直接报错，而不是静默忽略。
+///
+/// 静默忽略是脚本作者最难查的一类问题：`max_treads` 打错一个字母，请求返回 200，
+/// 任务却在用默认值跑，而错误信息一个字都没有。控制面接口宁可吵一点。
+///
+/// 只在这两个入口检查，不用 `#[serde(deny_unknown_fields)]`：同一个 `TaskConfig`
+/// 还要用来读磁盘上的持久化文件，那条路必须宽容 —— 用旧版本的状态文件启动新版本
+/// （或反之）不该因为多一个字段就整个启动失败。
+fn reject_unknown_fields(body: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    reject_unknown(body, ACCEPTED_TASK_FIELDS)
+}
+
+/// PATCH 版本：`start_cache` 在这里不作数（它只对创建有意义），所以也算未知字段。
+/// 静默吃掉它的后果是「PATCH 里写了 start_cache，缓存却没动」。
+fn reject_unknown_fields_for_update(
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let accepted: Vec<&str> = ACCEPTED_TASK_FIELDS
+        .iter()
+        .copied()
+        .filter(|k| *k != "start_cache")
+        .collect();
+    reject_unknown(body, &accepted)
+}
+
+fn reject_unknown(
+    body: &serde_json::Map<String, serde_json::Value>,
+    accepted: &[&str],
+) -> Result<(), String> {
+    let unknown: Vec<&str> = body
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !accepted.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown field(s): {} — accepted fields are: {}",
+        unknown.join(", "),
+        accepted.join(", "),
+    ))
+}
+
+/// 建任务 / 改任务时先把插件配置过一遍插件自己的校验。
+///
+/// 见 [`crate::plugins::PluginRegistry::validate_task_configs`]：不做的话，一条写
+/// 错的密钥要等到有人来播才炸成 500，而脚本早就拿着 200 走了。
+fn validate_task_plugins(
+    state: &AppState,
+    plugins: &[crate::plugins::TaskPluginConfig],
+) -> Result<(), String> {
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    let globals = state.settings.read().plugin_globals.clone();
+    state.plugins.validate_task_configs(plugins, &globals)
+}
+
+/// URL 字段的别名归一：把 `url` / `urls` / `uri` / `uris` 和扁平写法的 `volumes`
+/// 统统收敛成 `volumes: [[…]]` 这一种形状。
+///
+/// 返回值表示「这次请求到底提没提 URL」—— PATCH 要用它来区分「改成这些 URL」
+/// 和「这次不动 URL」，后者绝不能被写成一个空数组（那会把任务的源清空）。
+fn coerce_url_aliases(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, String> {
+    const ALIASES: [&str; 4] = ["urls", "url", "uris", "uri"];
+    let mut volumes = match body.get("volumes") {
+        Some(v) => Some(volumes_from_value(v, "volumes")?),
+        None => None,
+    };
+    for key in ALIASES {
+        let Some(value) = body.remove(key) else {
+            continue;
+        };
+        let parsed = volumes_from_value(&value, key)?;
+        // `volumes` 显式给了就以它为准，别名只在它缺席（或为空）时补位 ——
+        // 两个都写了通常是复制粘贴的残留，静默合并只会得到一个谁也没想要的任务。
+        if volumes
+            .as_ref()
+            .is_none_or(|v: &Vec<Vec<String>>| v.is_empty())
+            && !parsed.is_empty()
+        {
+            volumes = Some(parsed);
+        }
+    }
+    match volumes {
+        Some(v) => {
+            body.insert(
+                "volumes".into(),
+                serde_json::to_value(v).map_err(|e| e.to_string())?,
+            );
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// 一个 URL 字段能长成的所有样子 → 规范的分卷布局。
+///
+/// * `"https://a/f"`                → 一卷一镜像
+/// * `["https://a/f", "https://b/f"]` → 一卷两镜像（**镜像**，不是两卷 ——
+///   和 aria2 `addUri` 收一组 URI 的含义一致）
+/// * `[["…"], ["…"]]`               → 两卷，顺序拼接
+///
+/// 混着写（既有字符串又有数组）是拒绝而不是猜：猜错的代价是一个看起来建成了、
+/// 播出来却是错的任务。
+fn volumes_from_value(value: &serde_json::Value, field: &str) -> Result<Vec<Vec<String>>, String> {
+    use serde_json::Value;
+    let as_url = |v: &Value| -> Result<String, String> {
+        v.as_str()
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| format!("'{field}' must contain URL strings"))
+    };
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(s) => Ok(vec![vec![s.trim().to_string()]]),
+        Value::Array(items) if items.is_empty() => Ok(Vec::new()),
+        Value::Array(items) => {
+            if items.iter().all(|i| i.is_array()) {
+                items
+                    .iter()
+                    .map(|inner| {
+                        inner
+                            .as_array()
+                            .expect("checked above")
+                            .iter()
+                            .map(as_url)
+                            .collect()
+                    })
+                    .collect()
+            } else if items.iter().any(|i| i.is_array()) {
+                Err(format!(
+                    "'{field}' mixes URL strings and volume arrays — use either \
+                     [\"url\", …] for mirrors of one file or [[\"url\"], …] for volumes"
+                ))
+            } else {
+                Ok(vec![items.iter().map(as_url).collect::<Result<_, _>>()?])
+            }
+        }
+        _ => Err(format!(
+            "'{field}' must be a URL string, a list of URLs, or a list of volumes"
+        )),
+    }
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
@@ -225,12 +571,28 @@ async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
 /// filename and metadata before the task exists. Builds a throwaway `Engine`
 /// with the supplied URLs/volumes/headers, runs the same probe path the
 /// streamer would, then derives a "suggested" filename (LCP across volumes).
+///
+/// URL 字段认与建任务相同的那批别名（`url` / `urls` / `uri` / `uris`）—— 「先探测
+/// 一下再决定要不要建」是脚本里很自然的一步，没道理在这里换一种写法。
 async fn probe_urls(
     State(state): State<AppState>,
-    Json(req): Json<ProbeReq>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ProbeResp>, ProxyError> {
+    let mut body = match body {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(ProxyError::Internal(
+                "request body must be a JSON object".into(),
+            ));
+        }
+    };
+    coerce_url_aliases(&mut body).map_err(ProxyError::Internal)?;
+    let req: ProbeReq = serde_json::from_value(serde_json::Value::Object(body))
+        .map_err(|e| ProxyError::Internal(format!("invalid probe request: {e}")))?;
     if req.volumes.iter().all(|v| v.is_empty()) {
-        return Err(ProxyError::Internal("volumes must not be empty".into()));
+        return Err(ProxyError::Internal(
+            "at least one URL is required — pass \"url\", \"urls\" or \"volumes\"".into(),
+        ));
     }
     let mut cfg = TaskConfig {
         volumes: req.volumes.clone(),
@@ -288,11 +650,33 @@ async fn get_task(
     Ok(Json(state.task_info(&task_id, &entry)))
 }
 
+/// `PATCH /api/tasks/:id` —— 部分更新，只动请求里出现过的字段。
+///
+/// URL 字段和创建时认同一批别名（`url` / `urls` / `uri` / `uris` / `volumes`），
+/// 所以「签名过期了，把地址换掉」在脚本里就是一行 `{"url": "…"}`。没提到 URL
+/// 的 PATCH 不会碰任务的源列表。
 async fn patch_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-    Json(update): Json<TaskUpdate>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<TaskInfo>, ProxyError> {
+    let mut body = match body {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(ProxyError::Internal(
+                "request body must be a JSON object".into(),
+            ));
+        }
+    };
+    coerce_url_aliases(&mut body).map_err(ProxyError::Internal)?;
+    // `start_cache` 只对创建有意义；PATCH 里出现它多半是复制了创建时的请求体，
+    // 与其静默忽略，不如让它走下面的未知字段检查报出来。
+    reject_unknown_fields_for_update(&body).map_err(ProxyError::Internal)?;
+    let update: TaskUpdate = serde_json::from_value(serde_json::Value::Object(body))
+        .map_err(|e| ProxyError::Internal(format!("invalid task update: {e}")))?;
+    if let Some(plugins) = update.plugins.as_deref() {
+        validate_task_plugins(&state, plugins).map_err(ProxyError::Internal)?;
+    }
     let entry = state
         .get(&task_id)
         .ok_or_else(|| ProxyError::TaskNotFound(task_id.clone()))?;
@@ -1302,4 +1686,157 @@ async fn fs_pick_handler(
         .map_err(|e| ProxyError::Internal(format!("fs/pick task join: {e}")))?
         .map_err(ProxyError::Internal)?;
     Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn coerce(value: serde_json::Value) -> Result<(bool, serde_json::Value), String> {
+        let mut map = value.as_object().expect("object").clone();
+        let touched = coerce_url_aliases(&mut map)?;
+        Ok((touched, serde_json::Value::Object(map)))
+    }
+
+    /// 脚本下发任务时手里只有 URL，不该被迫先学会「分卷」这个概念。
+    #[test]
+    fn url_aliases_all_land_on_the_same_volume_layout() {
+        let one = json!([["https://a/f.mp4"]]);
+        for body in [
+            json!({"url": "https://a/f.mp4"}),
+            json!({"urls": ["https://a/f.mp4"]}),
+            json!({"uri": "https://a/f.mp4"}),
+            json!({"uris": ["https://a/f.mp4"]}),
+            json!({"volumes": "https://a/f.mp4"}),
+            json!({"volumes": ["https://a/f.mp4"]}),
+            json!({"volumes": [["https://a/f.mp4"]]}),
+        ] {
+            let (touched, out) = coerce(body.clone()).expect("valid");
+            assert!(touched, "{body} mentions URLs");
+            assert_eq!(out["volumes"], one, "从 {body} 归一");
+            // 别名不该原样留在体里 —— TaskConfig 忽略未知字段，但留着会让
+            // 「到底哪个字段说了算」在日志里变成一个悬案。
+            for key in ["url", "urls", "uri", "uris"] {
+                assert!(out.get(key).is_none(), "{key} 应当已被吸收");
+            }
+        }
+
+        // 一组 URL = 同一个文件的多个镜像（aria2 addUri 的含义），不是多卷。
+        let (_, out) = coerce(json!({"urls": ["https://a/f", "https://b/f"]})).unwrap();
+        assert_eq!(out["volumes"], json!([["https://a/f", "https://b/f"]]));
+
+        // 二维写法保持分卷语义。
+        let (_, out) = coerce(json!({"volumes": [["https://a/1"], ["https://a/2"]]})).unwrap();
+        assert_eq!(out["volumes"], json!([["https://a/1"], ["https://a/2"]]));
+    }
+
+    #[test]
+    fn a_patch_that_never_mentions_urls_leaves_them_alone() {
+        // 关键：这里插一个空 volumes 的话，一次「只改限速」的 PATCH 会把任务的
+        // 源清空 —— 而且报的错会是「至少要有一个 URL」，与用户做的事毫无关系。
+        let (touched, out) = coerce(json!({"cache": true})).expect("valid");
+        assert!(!touched);
+        assert!(out.get("volumes").is_none());
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_url_fields_are_rejected() {
+        assert!(coerce(json!({"urls": ["https://a/f", ["https://b/f"]]})).is_err());
+        assert!(coerce(json!({"url": 42})).is_err());
+        assert!(coerce(json!({"urls": [{"u": "x"}]})).is_err());
+    }
+
+    /// `volumes` 显式给了就以它为准；别名只在它缺席或为空时补位。
+    #[test]
+    fn explicit_volumes_beat_the_aliases() {
+        let (_, out) = coerce(json!({
+            "volumes": [["https://real/1"]],
+            "url": "https://leftover/0",
+        }))
+        .unwrap();
+        assert_eq!(out["volumes"], json!([["https://real/1"]]));
+
+        let (_, out) = coerce(json!({"volumes": [], "url": "https://a/f"})).unwrap();
+        assert_eq!(out["volumes"], json!([["https://a/f"]]));
+    }
+
+    fn mapping(from: &str, to: &str) -> crate::hostmap::HostMapping {
+        crate::hostmap::HostMapping {
+            from: from.into(),
+            to: to.into(),
+            enabled: true,
+        }
+    }
+
+    /// 「改完 target 再测一次，报的还是上一次的」—— 这个 bug 的根因是测试只认
+    /// 已保存的规则，而按下测试的时机恰恰是还没保存的时候。草稿必须说了算。
+    #[test]
+    fn testing_a_draft_rule_reflects_the_edit_not_the_saved_value() {
+        let _guard = crate::hostmap::lock_global();
+        crate::hostmap::install(&[mapping("cdn.example.com", "1.1.1.1")]).unwrap();
+
+        let edited = vec![mapping("cdn.example.com", "2.2.2.2")];
+        for scope in [ResolveScope::Task, ResolveScope::Global] {
+            let table = draft_table(edited.clone(), scope).unwrap();
+            assert_eq!(
+                table.explain("cdn.example.com").as_deref(),
+                Some("2.2.2.2"),
+                "改了 target 就要报新的那个",
+            );
+        }
+
+        // 半截的行（刚点「添加映射」加出来的那一条）不该让整次测试失败。
+        let table = draft_table(
+            vec![mapping("cdn.example.com", "2.2.2.2"), mapping("", "")],
+            ResolveScope::Task,
+        )
+        .unwrap();
+        assert_eq!(table.explain("cdn.example.com").as_deref(), Some("2.2.2.2"));
+
+        crate::hostmap::install(&[]).unwrap();
+    }
+
+    /// 两个 scope 的差别在「删掉一条规则之后」才显出来。
+    #[test]
+    fn a_task_draft_layers_over_global_while_a_global_draft_replaces_it() {
+        let _guard = crate::hostmap::lock_global();
+        crate::hostmap::install(&[
+            mapping("a.example.com", "1.1.1.1"),
+            mapping("b.example.com", "2.2.2.2"),
+        ])
+        .unwrap();
+
+        // 任务级草稿：只写了 b，a 仍然由全局提供 —— 和任务真跑起来时一致。
+        let task = draft_table(
+            vec![mapping("b.example.com", "9.9.9.9")],
+            ResolveScope::Task,
+        )
+        .unwrap();
+        assert_eq!(task.explain("a.example.com").as_deref(), Some("1.1.1.1"));
+        assert_eq!(task.explain("b.example.com").as_deref(), Some("9.9.9.9"));
+
+        // 全局草稿：这就是全部规则。在设置里删掉 a 再测，答案必须是「没命中」，
+        // 而不是把刚删掉的那条从已保存的全局表里又捞回来。
+        let global = draft_table(
+            vec![mapping("b.example.com", "9.9.9.9")],
+            ResolveScope::Global,
+        )
+        .unwrap();
+        assert_eq!(global.explain("a.example.com"), None);
+        assert_eq!(global.explain("b.example.com").as_deref(), Some("9.9.9.9"));
+
+        crate::hostmap::install(&[]).unwrap();
+    }
+
+    /// 规则写错时，那条错误正是用户按下测试想知道的东西。
+    #[test]
+    fn an_invalid_draft_rule_surfaces_as_an_error() {
+        let err = draft_table(
+            vec![mapping("cdn.example.com", "https://backup.example.com")],
+            ResolveScope::Global,
+        )
+        .expect_err("URL 不是合法的映射目标");
+        assert!(err.contains("bare host"), "{err}");
+    }
 }

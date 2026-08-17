@@ -24,10 +24,11 @@ Hydraria 把一个慢的、单一来源的 HTTP 下载，重写成多源并行�
 - **直通回退** —— 源不支持 Range 时自动落到单流直通模式，保证不可分段的源也能播。
 - **背压感知流** —— chunk planner 走有界 `tokio::sync::mpsc` 管线，客户端读慢就会自然反压到上游抓取，不会爆内存。
 - **任务级自定义请求头** —— 任务创建时一次设好 `Cookie`、`User-Agent`、`Referer` 等，所有上游 chunk 请求都会带上。
-- **域名映射** —— 等价于 `curl --resolve`，全局和任务级都能配（`host_mappings`，两层取并集、同名以任务级为准；CLI 用 `--map 原域名=目标`）。域名公共 DNS 解析不出来、又不能改 URL（一改签名失效）时，把它指到已知 IP 或备用域名即可。**只换 TCP 连到哪儿**：URL、`Host` 头、TLS SNI 全部保持原样，签名照常通过。支持 `*.example.com` 通配、目标带端口、原地址是裸 IP。命中映射的请求会**自动绕开代理** —— 否则域名由代理解析，映射静默失效。`GET /api/hostmap/resolve?host=…`（面板上是每行末尾的 ⚡）可以随时查这个域名最终会被连到哪儿。
+- **域名映射** —— 等价于 `curl --resolve`，全局和任务级都能配（`host_mappings`，两层取并集、同名以任务级为准；CLI 用 `--map 原域名=目标`）。域名公共 DNS 解析不出来、又不能改 URL（一改签名失效）时，把它指到已知 IP 或备用域名即可。**只换 TCP 连到哪儿**：URL、`Host` 头、TLS SNI 全部保持原样，签名照常通过。支持 `*.example.com` 通配、目标带端口、原地址是裸 IP。命中映射的请求会**自动绕开代理** —— 否则域名由代理解析，映射静默失效。`POST /api/hostmap/resolve`（面板上是每行末尾的 ⚡）可以随时查这个域名最终会被连到哪儿 —— 包括还在编辑、尚未保存的规则。
 - **暂停 / 恢复 / 编辑** —— 任务可暂停（流返回 503，配置和缓存仍在），可通过 `PATCH /api/tasks/:id` 在线编辑，无需删了重建。
 - **限速** —— 任务级和全局级令牌桶（任务上 `rate_limit_bps`，设置里 `global_rate_limit_bps`）。允许小幅突发，长程均值压在上限。
-- **持久化** —— 任务上 `persist: true` 会落盘到 `~/.hydraria/tasks.json`（状态变化时每 ~5s 原子写一次），设置也一并持久化，下次启动自动恢复。
+- **持久化** —— `persist` **默认开启**：任务落盘到 `~/.hydraria/tasks.json`（状态变化时每 ~5s 原子写一次），下次启动自动恢复，贴进播放列表或脚本里的短链不会因为重启变成死链。设置也一并持久化。临时任务把 `persist` 关掉即可。
+- **可脚本化** —— `POST /api/tasks` 只要 `{"url": "…"}`（或 `urls` / `uris` / `volumes`），其余全部走默认值；加上 `?start_cache=1` 就是 aria2 / Motrix / Gopeed 那种「加进来就开始下」。见 [API](#api)。
 - **每源健康度** —— 任务跟踪每条 URL 的最新状态码、TTFB 延迟、当前吞吐、累计贡献字节、最近错误，全部在面板的"源状态看板"里展示。
 - **实时迷你图** —— 全局吞吐和每任务吞吐按 ~1 Hz 采样，面板画 60 点的实时 SVG 曲线。
 - **嵌入式面板** —— Web UI 编译进二进制（`rust-embed`），不需要额外部署静态目录。
@@ -92,20 +93,82 @@ hydraria \
 
 ## API
 
+面板能配的每一样东西，API 都能配 —— 面板自己也只用这些接口，没有私有通道。下面是
+概览，**完整参考见 [docs/API.md](docs/API.md)**：任务的每个字段（类型 + 默认值）、
+每个端点、每种错误，外加一份把所有字段都写满的请求示例。
+
 ### 控制面
 
 #### `POST /api/tasks`
 
 新建一个代理任务，返回短链。
 
+**唯一必填的是 URL**，其余字段一律回落到面板新建表单用的那套默认值 —— 脚本下发
+任务不需要写一份完整配置：
+
+```bash
+curl -X POST http://127.0.0.1:9527/api/tasks \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://server1.com/file.mp4"}'
+```
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3" }
+```
+
+URL 可以写成下面任意一种；`uri` / `uris` 是 aria2 的叫法，作为 `url` / `urls`
+的别名一并接受。源列表是**二维**的：外层是分卷（按顺序拼接成一个文件），内层是该卷
+的镜像（内容相同、可互换）：
+
+| 请求体 | 卷 × 镜像 | 含义 |
+| --- | --- | --- |
+| `{"url": "https://a/f.mp4"}` | 1 × 1 | 一个文件、一个源 |
+| `{"urls": ["https://a/f.mp4", "https://b/f.mp4"]}` | 1 × 2 | 一个文件、两个**镜像** |
+| `{"volumes": [["https://a/p1"], ["https://a/p2"]]}` | 2 × 1 | 两个**分卷**，顺序拼接 |
+| `{"volumes": [["https://a/p1", "https://b/p1"], ["https://a/p2", "https://b/p2"]]}` | 2 × 2 | 两个分卷，**每卷各两个镜像** |
+
+**既有分卷又有镜像就用最后那种** —— 二维的 `volumes` 是唯一能同时表达两层的形式。
+卷的顺序**就是**文件的字节顺序（写反了拼出来的文件是坏的）；镜像的顺序只是偏好。
+
+一个列表里既有字符串又有数组时是拒绝而不是猜 —— 猜错的代价是一个看起来建成了、
+播出来却是错的任务。
+
+其余字段（`headers`、`max_per_volume`、`host_mappings`、`plugins`……）写在同一个
+JSON 对象里，完整字段表见 [docs/API.md](docs/API.md)。
+
+加上 `?start_cache=1`（或请求体里 `"start_cache": true`）会在建完后立刻开始把
+整个文件拉进缓存，也就是 aria2 那种「加进来就开始下」：
+
+```bash
+curl -X POST 'http://127.0.0.1:9527/api/tasks?start_cache=1' \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://server1.com/file.mp4", "name": "电影"}'
+```
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3",
+  "cache_started": true }
+```
+
+缓存起不来（源站连不上、不支持 Range）时任务照样建成，原因单独报回来 —— 脚本
+才能区分「任务没建成」和「任务建好了，只是源站现在不通」：
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "…", "cache_started": false,
+  "cache_error": "internal: cannot reach the upstream: upstream returned non-success status: 404" }
+```
+
+其余 `TaskConfig` 字段可以一起带上：
+
 ```bash
 curl -X POST http://127.0.0.1:9527/api/tasks \
   -H 'content-type: application/json' \
   -d '{
     "urls": ["https://server1.com/file.mp4", "https://server2.com/file.mp4"],
-    "max_threads": 16,
+    "max_per_volume": 8,
     "max_split": "5M",
-    "cache": false,
+    "cache": true,
+    "persist": true,
     "headers": {
       "User-Agent": "Mozilla/5.0",
       "Cookie": "session=xxxx"
@@ -113,13 +176,8 @@ curl -X POST http://127.0.0.1:9527/api/tasks \
   }'
 ```
 
-响应：
-
-```json
-{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3" }
-```
-
 `max_split` 可以是字节数，也可以是人类可读字符串：`"5M"`、`"512K"`、`"1G"` 等。
+`max_threads` 是派生值（单卷并发上限 × 卷数），带上也会被忽略。
 
 #### `GET /api/tasks`
 
@@ -135,12 +193,18 @@ curl -X POST http://127.0.0.1:9527/api/tasks \
 
 #### `PATCH /api/tasks/:task_id`
 
-原地局部更新任务 —— `urls`、`max_threads`、`max_split`、`cache`、`headers`、`name` 的任意子集。返回更新后的 `TaskInfo`。
+原地局部更新任务 —— `TaskConfig` 的任意子集，返回更新后的 `TaskInfo`。URL 认与
+创建相同的那批别名，所以「签名过期了换个地址」就是一行；而没有提到 URL 的 PATCH
+不会动源列表。
 
 ```bash
 curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
   -H 'content-type: application/json' \
-  -d '{"max_threads": 32, "cache": true}'
+  -d '{"url": "https://server1.com/file.mp4?sign=fresh"}'
+
+curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
+  -H 'content-type: application/json' \
+  -d '{"max_per_volume": 8, "cache": true}'
 ```
 
 #### `POST /api/tasks/:task_id/pause` 与 `…/resume`
@@ -172,7 +236,7 @@ curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
 | `download_dir` | 下载按钮的默认目录。 |
 | `host_mappings` | `[{from, to, enabled}]`。`from` 是 URL 里写的那个域名 / IP（或 `*.example.com`），`to` 是目标 IP / 域名，可带 `:端口`。任何一条不合法都会让整个 PUT 失败 —— 不会出现半张表生效的情况。任务也可以带自己的一份，与这里取并集。 |
 
-#### `GET /api/hostmap/resolve`
+#### `GET /api/hostmap/resolve` · `POST /api/hostmap/resolve`
 
 诊断：这个域名最终会被连到哪儿。`?host=` 接受域名、IP 或整条 URL；再带
 `&task_id=` 就按那个任务的生效表算（全局 ∪ 任务级）。
@@ -181,6 +245,23 @@ curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
 { "host": "cdn.example.com", "mapped_to": "1.2.3.4:8443",
   "addresses": ["1.2.3.4"], "error": null, "proxy_env": "HTTPS_PROXY" }
 ```
+
+POST 那版还能测**还没保存**的规则 —— 面板上的 ⚡ 走的就是它：按下测试的时机，
+恰恰是刚改完规则、还没保存的时候。
+
+```bash
+curl -X POST http://127.0.0.1:9527/api/hostmap/resolve \
+  -H 'content-type: application/json' \
+  -d '{"host": "cdn.example.com", "scope": "task",
+       "mappings": [{"from": "cdn.example.com", "to": "1.2.3.4", "enabled": true}]}'
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `host` | 域名、IP，或整条 URL。 |
+| `mappings` | 要测的规则。不传就按已保存的算（等价于 GET）。只填了一半的行会被忽略；规则本身写错时报成错误 —— 那正是按下测试想知道的答案。 |
+| `scope` | `task`（默认）把 `mappings` 盖在当前生效的全局规则之上，和任务真跑起来时一致；`global` 表示 `mappings` 就是全部规则 —— 在设置里删掉一条再测，才能正确地报「没有规则命中」。 |
+| `task_id` | 只在不传 `mappings` 时用到。 |
 
 #### `GET /api/global`
 
@@ -205,7 +286,7 @@ curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
 # 1. 创建任务
 TASK=$(curl -s -X POST http://127.0.0.1:9527/api/tasks \
   -H 'content-type: application/json' \
-  -d '{"urls":["https://your-source/file.mp4"],"max_threads":16,"max_split":"5M"}' \
+  -d '{"url":"https://your-source/file.mp4"}' \
   | sed 's/.*"task_id":"\([^"]*\)".*/\1/')
 
 # 2. 在任意客户端打开短链
@@ -215,6 +296,28 @@ wget        "http://127.0.0.1:9527/stream/$TASK"
 ```
 
 客户端看到的是一条纯 HTTP/1.1 流。Hydraria 在内部把实际抓取扇出成多个并发 range 请求，分摊到所有配置的源。
+
+## 示例：写一个 `hydra-add` 脚本
+
+创建接口是照着 `aria2c <url>` 的手感设计的，所以把它接进现有的下载习惯、浏览器
+扩展或者 `*arr` 那类自动化里，一行就够：
+
+```bash
+#!/usr/bin/env bash
+# hydra-add <url> [任务名] —— 建任务并立刻开始缓存。
+set -euo pipefail
+HYDRARIA=${HYDRARIA:-http://127.0.0.1:9527}
+
+curl -sS -X POST "$HYDRARIA/api/tasks?start_cache=1" \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --arg url "$1" --arg name "${2:-}" \
+        '{url: $url} + (if $name == "" then {} else {name: $name} end)')" \
+  | jq -r 'if .cache_error then "已创建 \(.task_id)，但缓存没起来：\(.cache_error)"
+           else "\(.proxy_url)" end'
+```
+
+进度看 `GET /api/tasks` 里的 `cache_job.done_bytes` / `.total_bytes`；或者干脆
+把 `proxy_url` 丢给播放器，让播放本身去拉需要的部分。
 
 ## 分块流的工作原理
 

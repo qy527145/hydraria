@@ -78,7 +78,13 @@ pub struct TaskConfig {
     #[serde(default)]
     pub rate_limit_algorithm: Algorithm,
     /// Persist this task across restarts.
-    #[serde(default)]
+    ///
+    /// Defaults to **on**: a proxy short link that evaporates on restart is a
+    /// broken link in whatever playlist / script / player it was pasted into,
+    /// and "keep it" is what someone who bothered to create a task almost
+    /// always meant. Opting out is one checkbox; recreating a lost task by
+    /// hand is not.
+    #[serde(default = "default_true")]
     pub persist: bool,
     /// Post-processing plugins applied to bytes on the proxy → client path.
     /// Stored in **forward order** (sender's pre-distribution application
@@ -120,6 +126,10 @@ pub enum ContentDispositionMode {
 /// 线程总数的硬上限。与校验里历史沿用的 128 一致。
 pub const MAX_THREADS: usize = 128;
 
+/// 手填 `max_split` 时的下限。再小的分片，每个请求的头部开销就开始盖过收益了；
+/// `0` 仍然表示自动。
+pub const MIN_SPLIT: u64 = 64 * 1024;
+
 fn default_threads() -> usize {
     8
 }
@@ -129,6 +139,10 @@ fn default_per_volume() -> usize {
 }
 
 fn default_auto_filename() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -207,7 +221,12 @@ pub struct TaskUpdate {
     pub max_split: Option<u64>,
     pub cache: Option<bool>,
     pub headers: Option<HashMap<String, String>>,
+    /// 外层 `Option` = 「这次 PATCH 提没提这个字段」，内层 = 字段的新值。
+    /// 传 `null` 是清空任务名，字段缺席才是「别动它」—— 见
+    /// [`deserialize_double_option`]。
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub output_filename: Option<Option<String>>,
     pub auto_filename: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_size")]
@@ -217,6 +236,23 @@ pub struct TaskUpdate {
     pub plugins: Option<Vec<TaskPluginConfig>>,
     pub content_disposition: Option<ContentDispositionMode>,
     pub host_mappings: Option<Vec<crate::hostmap::HostMapping>>,
+}
+
+/// `Option<Option<T>>` 的老问题：serde 默认会让外层 `Option` 把 `null` 一并吃掉，
+/// 于是「字段缺席」和「显式传 `null`」解出来是同一个 `None` —— 而这两件事在 PATCH
+/// 里的含义正好相反（**别动它** vs **清空它**）。
+///
+/// 后果不是抽象的：面板保存任务时发的是完整配置，把任务名删空就是 `name: null`，
+/// 而它曾经被读成「别动」，于是名字怎么也删不掉，脚本也没有任何办法清空它。
+///
+/// 配合 `#[serde(default)]`：字段缺席走 `Default`（`None`），出现了才调这里 ——
+/// `null` → `Some(None)`（清空），有值 → `Some(Some(v))`。
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -512,6 +548,24 @@ impl TaskConfig {
         crate::hostmap::validate(&self.host_mappings).map_err(|e| format!("host mapping: {e}"))
     }
 
+    /// 建任务时的取值校验（`normalize` 之后调）。
+    ///
+    /// 这几条必须和 [`TaskEntry::apply_update`] 里的完全一致：同一个值 PATCH 拒绝、
+    /// POST 放过的话，「一次建好」和「先建再改」会得到两个不同的任务 —— 而脚本
+    /// 通常两条路都走。
+    ///
+    /// 只在控制面调，不在恢复持久化状态时调：磁盘上那份是过去某个版本写的，宽容
+    /// 地读进来比启动失败好。
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.max_per_volume == 0 {
+            return Err("max_per_volume must be >= 1".into());
+        }
+        if self.max_split != 0 && self.max_split < MIN_SPLIT {
+            return Err("max_split must be 0 (auto) or >= 64K".into());
+        }
+        self.validate_host_mappings()
+    }
+
     /// 线程总数 = 单卷并发上限 × 卷数，不再单独配置。
     ///
     /// 两个数字各配一份时它们总在打架，而且哪一个赢完全取决于任务形状：单卷
@@ -616,10 +670,7 @@ impl TaskEntry {
             self.claim_wall.clear();
         }
         // `max_threads` 是派生值，PATCH 里带上也只会被下面重新算出来 —— 保留
-        // 这个字段只为兼容老客户端的请求体，不让它报错。
-        if upd.max_threads == Some(0) {
-            return Err("max_threads must be >= 1".into());
-        }
+        // 这个字段只为兼容老客户端的请求体，收下即忽略。
         if let Some(p) = upd.max_per_volume {
             if p == 0 {
                 return Err("max_per_volume must be >= 1".into());
@@ -630,7 +681,7 @@ impl TaskEntry {
         if let Some(s) = upd.max_split {
             // 0 = automatic: the scheduler sizes claims from the remaining work
             // and the thread count, with no ceiling.
-            if s != 0 && s < 64 * 1024 {
+            if s != 0 && s < MIN_SPLIT {
                 return Err("max_split must be 0 (auto) or >= 64K".into());
             }
             cfg.max_split = s;
@@ -645,7 +696,9 @@ impl TaskEntry {
             *self.probe_cache.lock() = None;
         }
         if let Some(n) = upd.name {
-            cfg.name = n;
+            // 空白名字和没有名字是一回事 —— 存下一个 `" "` 只会让列表里出现一个
+            // 看不见的任务名，而搜索和显示都拿它没办法。
+            cfg.name = n.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         }
         if let Some(of) = upd.output_filename {
             cfg.output_filename = of.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -1264,7 +1317,7 @@ mod tests {
         assert!(
             entry
                 .apply_update(TaskUpdate {
-                    max_threads: Some(0),
+                    max_per_volume: Some(0),
                     ..Default::default()
                 })
                 .is_err()
@@ -1276,8 +1329,7 @@ mod tests {
         );
     }
 
-    /// `max_threads` 是派生值：单卷并发上限 × 卷数。用户只配前者。
-    ///
+    /// `max_threads` 是派生值：单卷并发上限 × 卷数。用户只配前者。    ///
     /// 这两个数字曾经各配一份，于是总有一个会输 —— 单卷文件配 16 线程实际只
     /// 跑 `max_per_volume` 条，多卷任务配小线程数则让大半卷没人认领。
     #[test]
@@ -1322,5 +1374,42 @@ mod tests {
         huge.max_per_volume = 8;
         huge.normalize();
         assert_eq!(huge.max_threads, MAX_THREADS);
+    }
+
+    /// PATCH 的两种「没给值」必须分得开：字段缺席 = 别动，`null` = 清空。
+    ///
+    /// serde 默认会让 `Option<Option<T>>` 的外层把 `null` 吃掉，两者解出来一模一样
+    /// —— 于是任务名怎么也删不掉（面板把空名字发成 `null`，被读成了「别动」）。
+    #[test]
+    fn a_null_clears_a_nullable_field_while_an_absent_one_leaves_it_alone() {
+        let mut cfg = config("named");
+        cfg.output_filename = Some("movie.mkv".into());
+        let entry = TaskEntry::new(cfg);
+
+        // 缺席：只改别的字段，名字和文件名都留着。
+        entry
+            .apply_update(serde_json::from_value(serde_json::json!({"cache": true})).unwrap())
+            .unwrap();
+        assert_eq!(entry.config.read().name.as_deref(), Some("named"));
+        assert_eq!(
+            entry.config.read().output_filename.as_deref(),
+            Some("movie.mkv")
+        );
+
+        // 显式 null：清空。
+        entry
+            .apply_update(
+                serde_json::from_value(serde_json::json!({"name": null, "output_filename": null}))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(entry.config.read().name, None);
+        assert_eq!(entry.config.read().output_filename, None);
+
+        // 全空白等同于清空 —— 存一个看不见的名字对谁都没用。
+        entry
+            .apply_update(serde_json::from_value(serde_json::json!({"name": "  "})).unwrap())
+            .unwrap();
+        assert_eq!(entry.config.read().name, None);
     }
 }

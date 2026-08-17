@@ -232,6 +232,11 @@ impl HostTable {
             Target::Host(h, port) => (h, port),
         };
         parsed.set_host(Some(&new_host)).ok()?;
+        // 这里和域名那条路**不对称**，而且是故意的：改写 URL 意味着映射里的端口
+        // 直接盖掉原 URL 的端口，而走 DNS 解析器时 hyper 会反过来让原 URL 的显式
+        // 端口赢（见 `system_lookup`）。裸 IP 源本来就是「这台机器上的这个服务」，
+        // 换机器常常连端口一起换，所以让写下来的端口说了算更符合意图。
+        // 两条路的差别有 `tests/hostmap_port_e2e.rs` 盯着。
         if new_port != 0 {
             parsed.set_port(Some(new_port)).ok()?;
         }
@@ -536,16 +541,20 @@ pub struct Diagnosis {
     pub proxy_env: Option<String>,
 }
 
+/// 装载全局表的用例互相会踩 —— 同一个二进制里的测试是并行跑的，而全局表是
+/// 进程唯一的一份。凡是碰 [`install`] 的用例都先拿这把锁，包括 `routes` 那边
+/// 测「草稿规则叠在全局之上」的那几个，所以它必须在这里、而不是某个测试模块内部。
+#[cfg(test)]
+pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_global() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 装载全局表的用例互相会踩 —— 同一个二进制里的测试是并行跑的。
-    static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_global() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn rule(from: &str, to: &str) -> HostMapping {
         HostMapping {

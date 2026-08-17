@@ -24,10 +24,11 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 - **Passthrough fallback** — if the origin doesn't advertise byte-range support, Hydraria automatically falls back to a single-stream passthrough so unrangeable sources still work.
 - **Backpressure-aware streaming** — the chunk planner uses a bounded-channel pipeline (`tokio::sync::mpsc`), so a slow client throttles upstream fetches instead of blowing memory.
 - **Custom headers per task** — set `Cookie`, `User-Agent`, `Referer`, etc. once at task creation; every upstream chunk request carries them.
-- **Host mapping** — the equivalent of `curl --resolve`, settable globally *and* per task (`host_mappings`; the two are unioned, task wins on a conflicting source). `--map from=to` on the CLI. Point a hostname at an IP or a backup host when public DNS can't resolve it. Only the TCP target moves: the URL, the `Host` header and the TLS SNI stay exactly as written, so signed URLs keep verifying. Supports `*.example.com` suffixes, a port on the target, and bare-IP sources. A mapped request automatically **bypasses the proxy** — otherwise the proxy resolves the hostname itself and the mapping silently does nothing. `GET /api/hostmap/resolve?host=…` (and the ⚡ button in the dashboard) reports where a host actually ends up.
+- **Host mapping** — the equivalent of `curl --resolve`, settable globally *and* per task (`host_mappings`; the two are unioned, task wins on a conflicting source). `--map from=to` on the CLI. Point a hostname at an IP or a backup host when public DNS can't resolve it. Only the TCP target moves: the URL, the `Host` header and the TLS SNI stay exactly as written, so signed URLs keep verifying. Supports `*.example.com` suffixes, a port on the target, and bare-IP sources. A mapped request automatically **bypasses the proxy** — otherwise the proxy resolves the hostname itself and the mapping silently does nothing. `POST /api/hostmap/resolve` (and the ⚡ button in the dashboard) reports where a host actually ends up — including for rules you are still typing, since it accepts the draft rule set rather than only what's saved.
 - **Pause / resume / edit** — tasks can be paused (stream returns 503 while config + cache stay intact) and live-edited via `PATCH /api/tasks/:id`. No need to delete and recreate.
 - **Rate limiting** — per-task and global token-bucket limiters (`rate_limit_bps` on the task config, `global_rate_limit_bps` on settings). Small bursts allowed; long-run average held to the cap.
-- **Persistence** — opt-in `persist: true` on a task writes it to `~/.hydraria/tasks.json` (atomic write every ~5s when state changes). Settings persist alongside it. Restored automatically at next startup.
+- **Persistence** — `persist` is **on by default**; tasks are written to `~/.hydraria/tasks.json` (atomic write every ~5s when state changes) and restored at next startup, so a short link pasted into a playlist or script keeps working across restarts. Settings persist alongside. Set `persist: false` for throwaway tasks.
+- **Scriptable** — `POST /api/tasks` takes `{"url": "…"}` (or `urls` / `uris` / `volumes`), everything else defaulted, and `?start_cache=1` makes it "add and start downloading" the way `aria2c`/Motrix/Gopeed do. See [API](#api).
 - **Per-source health** — each task tracks per-URL last status, TTFB latency, current throughput, total bytes contributed and last error — surfaced in the dashboard's "源状态看板".
 - **Real-time sparkline** — both global throughput and per-task throughput are sampled at ~1 Hz; the dashboard renders a live 60-sample SVG curve.
 - **Embedded dashboard** — the web UI is compiled into the binary (`rust-embed`); no external static-file directory needed.
@@ -93,20 +94,88 @@ control verbosity with `RUST_LOG`, e.g. `RUST_LOG=hydraria=debug,info`.
 
 ## API
 
+Everything the dashboard can configure, the API can configure — the dashboard
+uses these same endpoints and has no private channel. Below is the tour;
+**[docs/API.md](docs/API.md) is the complete reference**: every task field with
+its type and default, every endpoint, every error, plus one request example with
+all fields filled in.
+
 ### Control plane
 
 #### `POST /api/tasks`
 
 Create a new proxy task. Returns the short link.
 
+The only required input is the URL(s). Everything else falls back to the same
+defaults the dashboard's create form uses, so a script never has to spell out a
+full config:
+
+```bash
+curl -X POST http://127.0.0.1:9527/api/tasks \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://server1.com/file.mp4"}'
+```
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3" }
+```
+
+URLs may be written any of these ways — `uri`/`uris` are accepted as aliases of
+`url`/`urls`, matching aria2's naming. The source list is **two-dimensional**:
+the outer level is volumes (concatenated in order into one file), the inner
+level is mirrors of that volume (interchangeable copies):
+
+| Body | Vol × mirror | Meaning |
+| --- | --- | --- |
+| `{"url": "https://a/f.mp4"}` | 1 × 1 | one file, one source |
+| `{"urls": ["https://a/f.mp4", "https://b/f.mp4"]}` | 1 × 2 | one file, two **mirrors** |
+| `{"volumes": [["https://a/p1"], ["https://a/p2"]]}` | 2 × 1 | two **volumes**, concatenated in order |
+| `{"volumes": [["https://a/p1", "https://b/p1"], ["https://a/p2", "https://b/p2"]]}` | 2 × 2 | two volumes, **two mirrors each** |
+
+For volumes *and* mirrors together, use the last form — the 2-D `volumes` field
+is the only one that can express both levels. Volume order **is** the file's byte
+order; mirror order is only a preference.
+
+Mixing strings and arrays in one list is rejected rather than guessed — the cost
+of guessing wrong is a task that looks fine and plays garbage.
+
+Every other field (`headers`, `max_per_volume`, `host_mappings`, `plugins`, …)
+goes in the same JSON object; see [docs/API.md](docs/API.md) for the full table.
+
+`?start_cache=1` (or `"start_cache": true` in the body) also kicks off the
+whole-file cache fill immediately, i.e. "add and start downloading":
+
+```bash
+curl -X POST 'http://127.0.0.1:9527/api/tasks?start_cache=1' \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://server1.com/file.mp4", "name": "movie"}'
+```
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3",
+  "cache_started": true }
+```
+
+The task is created even when the fill can't start (origin unreachable, no Range
+support); the reason comes back separately so a script can tell "the task wasn't
+created" from "the task exists but the origin is down right now":
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "…", "cache_started": false,
+  "cache_error": "internal: cannot reach the upstream: upstream returned non-success status: 404" }
+```
+
+Any other `TaskConfig` field can be supplied alongside:
+
 ```bash
 curl -X POST http://127.0.0.1:9527/api/tasks \
   -H 'content-type: application/json' \
   -d '{
     "urls": ["https://server1.com/file.mp4", "https://server2.com/file.mp4"],
-    "max_threads": 16,
+    "max_per_volume": 8,
     "max_split": "5M",
-    "cache": false,
+    "cache": true,
+    "persist": true,
     "headers": {
       "User-Agent": "Mozilla/5.0",
       "Cookie": "session=xxxx"
@@ -114,13 +183,8 @@ curl -X POST http://127.0.0.1:9527/api/tasks \
   }'
 ```
 
-Response:
-
-```json
-{ "task_id": "a1b2c3", "proxy_url": "http://127.0.0.1:9527/stream/a1b2c3" }
-```
-
 `max_split` accepts either a number of bytes or a human-readable string: `"5M"`, `"512K"`, `"1G"`, etc.
+`max_threads` is derived (`max_per_volume` × volume count) and ignored if sent.
 
 #### `GET /api/tasks`
 
@@ -136,13 +200,19 @@ Stop & remove a task. Returns `204`.
 
 #### `PATCH /api/tasks/:task_id`
 
-Partially update a task in place — any subset of `urls`, `max_threads`,
-`max_split`, `cache`, `headers`, `name`. Returns the updated `TaskInfo`.
+Partially update a task in place — any subset of `TaskConfig`. Returns the
+updated `TaskInfo`. URLs accept the same aliases as create, so rotating an
+expired signed link is one line; a PATCH that never mentions URLs leaves the
+source list untouched.
 
 ```bash
 curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
   -H 'content-type: application/json' \
-  -d '{"max_threads": 32, "cache": true}'
+  -d '{"url": "https://server1.com/file.mp4?sign=fresh"}'
+
+curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
+  -H 'content-type: application/json' \
+  -d '{"max_per_volume": 8, "cache": true}'
 ```
 
 #### `POST /api/tasks/:task_id/pause` and `…/resume`
@@ -181,7 +251,7 @@ touched.
 | `download_dir` | Default directory for the download button. |
 | `host_mappings` | `[{from, to, enabled}]`. `from` is the host as written in the URL (or `*.example.com`); `to` is an IP or host, optionally `:port`. A bad rule fails the whole PUT — the table is never left half-applied. Tasks can carry their own list, unioned over this one. |
 
-#### `GET /api/hostmap/resolve`
+#### `GET /api/hostmap/resolve` · `POST /api/hostmap/resolve`
 
 Diagnostic: where does a host actually end up? `?host=` takes a hostname, an IP,
 or a whole URL; `&task_id=` evaluates it against that task's effective table
@@ -191,6 +261,24 @@ or a whole URL; `&task_id=` evaluates it against that task's effective table
 { "host": "cdn.example.com", "mapped_to": "1.2.3.4:8443",
   "addresses": ["1.2.3.4"], "error": null, "proxy_env": "HTTPS_PROXY" }
 ```
+
+The POST form additionally evaluates rules that **aren't saved yet** — which is
+what the dashboard's ⚡ button uses, because you press it right after editing a
+rule and before saving it:
+
+```bash
+curl -X POST http://127.0.0.1:9527/api/hostmap/resolve \
+  -H 'content-type: application/json' \
+  -d '{"host": "cdn.example.com", "scope": "task",
+       "mappings": [{"from": "cdn.example.com", "to": "1.2.3.4", "enabled": true}]}'
+```
+
+| Field | Meaning |
+| --- | --- |
+| `host` | hostname, IP, or a whole URL |
+| `mappings` | the rules to evaluate. Omit to use what's saved (identical to GET). Half-filled rows are ignored; an invalid rule is reported as an error, since that's the answer you were looking for. |
+| `scope` | `task` (default) layers `mappings` over the live global rules, exactly as a running task would. `global` treats `mappings` as the complete set — so deleting a rule in the settings panel correctly reports "no rule matched". |
+| `task_id` | only used when `mappings` is omitted. |
 
 #### `GET /api/global`
 
@@ -216,7 +304,7 @@ The endpoint clients consume. Behaves like a regular HTTP file server:
 # 1. Create task
 TASK=$(curl -s -X POST http://127.0.0.1:9527/api/tasks \
   -H 'content-type: application/json' \
-  -d '{"urls":["https://your-source/file.mp4"],"max_threads":16,"max_split":"5M"}' \
+  -d '{"url":"https://your-source/file.mp4"}' \
   | sed 's/.*"task_id":"\([^"]*\)".*/\1/')
 
 # 2. Open the short link in any client
@@ -226,6 +314,30 @@ wget        "http://127.0.0.1:9527/stream/$TASK"
 ```
 
 The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetching out to many parallel range requests across all configured origins.
+
+## Example: a `hydra-add` script
+
+The create API is deliberately shaped like `aria2c <url>` so a one-liner is
+enough to wire it into a download-manager habit, a browser extension, or a
+`*arr`-style automation:
+
+```bash
+#!/usr/bin/env bash
+# hydra-add <url> [name] — create a task and start caching it right away.
+set -euo pipefail
+HYDRARIA=${HYDRARIA:-http://127.0.0.1:9527}
+
+curl -sS -X POST "$HYDRARIA/api/tasks?start_cache=1" \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --arg url "$1" --arg name "${2:-}" \
+        '{url: $url} + (if $name == "" then {} else {name: $name} end)')" \
+  | jq -r 'if .cache_error then "created \(.task_id) but caching failed: \(.cache_error)"
+           else "\(.proxy_url)" end'
+```
+
+Poll `GET /api/tasks` for `cache_job.done_bytes` / `.total_bytes` to track
+progress, or just hand `proxy_url` to a player and let playback pull what it
+needs.
 
 ## How chunked streaming works
 

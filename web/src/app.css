@@ -134,7 +134,8 @@ button, input { font: inherit; }
   font-size: 14px;
   font-weight: 600;
 }
-.tc-name { cursor: default; }
+.tc-name { cursor: pointer; }
+.tc-name:hover { color: var(--hy-accent); }
 .tc-age { flex-shrink: 0; color: var(--hy-muted); font-size: 11px; }
 
 /* 悬停任务名时的源提示：代理短链长得都一样，认任务得看它指向哪个文件 */
@@ -145,6 +146,24 @@ button, input { font: inherit; }
 .tc-badges { margin-left: auto; display: flex; gap: 4px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
 .tc-badges .ant-tag { margin: 0 !important; font-size: 10px; line-height: 17px; padding: 0 6px; }
 .tc-head .ant-btn { flex-shrink: 0; }
+
+/* 读数区整块就是「打开详情」的入口 —— 详情原先是 ⋯ 菜单的第一项，而它是
+   看完这些数字之后最想点的东西。悬停时整块微微提亮，说明它可点；这块里没有
+   别的可点元素，所以整块给出去不会误伤。 */
+.tc-readout {
+  display: grid;
+  gap: 8px;
+  padding: 2px;
+  margin: -2px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background .18s ease, box-shadow .18s ease;
+}
+.tc-readout:hover { background: rgba(110, 168, 255, .06); }
+.tc-readout:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--hy-accent);
+}
 
 .tc-spark {
   display: flex;
@@ -273,6 +292,24 @@ button, input { font: inherit; }
 .hostmap-row { display: flex; align-items: center; gap: 8px; }
 .hostmap-row .ant-input { flex: 1; min-width: 0; }
 .hostmap-arrow { color: var(--hy-muted); flex: none; }
+
+/* 卷 URL 里出现过的域名，点一下就变成一条规则的原地址。 */
+.hostmap-suggest { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.hostmap-chip { cursor: pointer; margin: 0 !important; font-family: ui-monospace, SFMono-Regular, monospace; }
+.hostmap-chip:hover { color: var(--hy-accent); border-color: var(--hy-accent); }
+
+/* 当前生效的全局映射，只读。任务真正用的是「全局 ∪ 任务级」，只显示后一半
+   等于让人对着半张表排查。 */
+.hostmap-global {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px dashed var(--hy-border);
+  border-radius: 8px;
+}
+.hostmap-global-row { display: flex; align-items: center; gap: 6px; }
+.hostmap-global-row code { color: var(--hy-muted); font-size: 11.5px; }
+.hostmap-global-row .ant-tag { margin: 0; font-size: 10px; line-height: 17px; }
 
 .plugin-card { margin-bottom: 14px; }
 .plugin-card p { color: #7e899e; font-size: 12px; }

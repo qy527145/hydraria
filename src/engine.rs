@@ -1112,12 +1112,25 @@ impl Engine {
             }
         }
 
-        // 两步探测都没拿回任何响应 —— 把**真实原因**带出去。这里原本返回一个
-        // 笼统的 `NoUpstream`，它的文案是「no upstream URL available」，读起来
+        // 两步探测都没拿回任何**可用**的响应 —— 把真实原因带出去。这里原本返回
+        // 一个笼统的 `NoUpstream`，它的文案是「no upstream URL available」，读起来
         // 像「你没配 URL」，而真实情况是 DNS 解不出来 / 连接被拒 / TLS 握手失败。
         // 调用方（整盘缓存）会把这句话原样念给用户听，笼统就等于把人指错方向。
-        if let (None, Err(error)) = (&head, range_get) {
-            return Err(ProxyError::Upstream(error));
+        //
+        // HEAD 被拒本身不算失败（不少网盘只认 GET），但那一发 Range GET 也回了
+        // 非 2xx 的话，这个地址就是真的用不了：报状态码，别把它算成「活着，只是
+        // 不支持 Range」。后者会把人送去查源站的 Range 配置，而实际问题是 403 /
+        // 404（链接过期）或 502（中间有代理挡着）。
+        if head.is_none() {
+            match range_get {
+                Err(error) => return Err(ProxyError::Upstream(error)),
+                Ok(resp) if !resp.status().is_success() => {
+                    let status = resp.status().as_u16();
+                    self.record_failure(url, Some(status), &format!("probe got HTTP {status}"));
+                    return Err(ProxyError::BadStatus(status));
+                }
+                Ok(_) => {}
+            }
         }
 
         if filename.is_none() {

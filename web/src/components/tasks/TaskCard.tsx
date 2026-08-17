@@ -1,12 +1,12 @@
 import {
+  CopyOutlined,
   DeleteOutlined,
   EditOutlined,
   EllipsisOutlined,
   ExportOutlined,
-  InfoCircleOutlined,
 } from '@ant-design/icons';
 import { Button, Dropdown, Popconfirm, Tag, Tooltip, message, type MenuProps } from 'antd';
-import { useState } from 'react';
+import { useState, type KeyboardEvent } from 'react';
 import type { TaskConfig, TaskInfo } from '../../api/client';
 import { api } from '../../api/client';
 import { useDashboard } from '../../stores/dashboard';
@@ -66,6 +66,10 @@ function sourceHint(config: TaskConfig) {
  * 读数在上、动作在下，而不是按场景切成左右两栏：`served`、`conns`、`split`
  * 这些数字对播放和缓存都成立，硬塞进某一栏只会被复制两遍或被丢掉一份。真正
  * 分场景的只有按钮——那正是下面两条操作条的职责。
+ *
+ * 详情与编辑是这张卡上最常点的两件事，所以它们不在 `⋯` 菜单里：**读数区整块**
+ * 点开就是详情（读数看不够了自然会想往下看），编辑是卡头上一个独立的按钮。
+ * `⋯` 只留真正低频的克隆 / 复制 / 导出。
  */
 export default function TaskCard({ task, onEdit, onClone }: Props) {
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -76,9 +80,7 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
     message.success('配置 JSON 已复制');
   };
   const menu: MenuProps['items'] = [
-    { key: 'details', icon: <InfoCircleOutlined />, label: '源看板 / 任务详情', onClick: () => setDetailsOpen(true) },
-    { key: 'edit', icon: <EditOutlined />, label: '编辑完整配置', onClick: () => onEdit(task) },
-    { key: 'clone', label: '克隆配置', onClick: () => onClone(task) },
+    { key: 'clone', icon: <CopyOutlined />, label: '克隆配置', onClick: () => onClone(task) },
     { key: 'copy', label: '复制 JSON', onClick: () => void copyJson() },
     {
       key: 'export',
@@ -90,6 +92,14 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
       ),
     },
   ];
+
+  // 键盘也要能打开：读数区是个 div，不会自带 Enter / Space 的语义。
+  const openDetails = () => setDetailsOpen(true);
+  const onKey = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    openDetails();
+  };
 
   const job = task.cache_job;
   const cache = task.cache;
@@ -133,8 +143,18 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
     <article className={`task-card${task.paused ? ' paused' : ''}`}>
       <header className="tc-head">
         <span className="tc-id">{task.task_id}</span>
-        <Tooltip title={sourceHint(task.config)} placement="topLeft">
-          <span className="tc-name">{task.config.name || '(未命名)'}</span>
+        <Tooltip
+          title={
+            <>
+              {sourceHint(task.config)}
+              <div className="tc-hint-cap">点击查看任务详情</div>
+            </>
+          }
+          placement="topLeft"
+        >
+          <span className="tc-name" role="button" tabIndex={0} onClick={openDetails} onKeyDown={onKey}>
+            {task.config.name || '(未命名)'}
+          </span>
         </Tooltip>
         <Tooltip title={`${task.updated_at > task.created_at ? '最后编辑' : '创建'}于 ${new Date((task.updated_at || task.created_at) * 1000).toLocaleString('zh-CN')}`}>
           <span className="tc-age">{timeAgo(task.updated_at || task.created_at)}</span>
@@ -146,13 +166,23 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
             <Tag color="success">running</Tag>
           )}
           {task.config.cache && <Tag color="processing">cache</Tag>}
-          {task.config.persist && <Tag color="purple">persist</Tag>}
+          {/* 持久化默认开着，所以标出来的是**反常**的那一个：一张写着 persist
+              的徽章出现在每张卡上等于什么都没说，还挤掉了任务名的宽度。 */}
+          {!task.config.persist && (
+            <Tooltip title="临时任务：重启后不会恢复（在「输出与行为」里勾上「重启后保留任务」即可）">
+              <Tag color="default">临时</Tag>
+            </Tooltip>
+          )}
           {task.config.rate_limit_bps > 0 && (
             <Tag color="red">
               ≤{formatSpeed(task.config.rate_limit_bps)}
             </Tag>
           )}
         </span>
+        {/* 编辑是高频动作，不该藏在 ⋯ 里多点一次 */}
+        <Tooltip title="编辑任务配置">
+          <Button type="text" size="small" icon={<EditOutlined />} onClick={() => onEdit(task)} />
+        </Tooltip>
         <Dropdown menu={{ items: menu }} trigger={['click']}>
           <Button type="text" size="small" icon={<EllipsisOutlined />} />
         </Dropdown>
@@ -165,64 +195,76 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
         </Popconfirm>
       </header>
 
-      {/* 一张卡片上其实有两条方向相反的流：发给客户端的（bytes_served）和从
-          源站拉进磁盘的（缓存填充）。曲线只有一条，所以显示**正在发生的那条**
-          并如实标注 —— 早先固定显示前者，于是按下「缓存整个文件」后，250 MB/s
-          的下载在卡片上写着 0 B/s。两者相加不是办法：边播边缓存时同一批字节会
-          被数两遍。 */}
-      <Tooltip
-        title={
-          <>
-            <div>发给客户端：{formatSpeed(task.current_speed_bps)}</div>
-            <div>从源站拉取：{formatSpeed(job?.current_speed_bps ?? 0)}</div>
-          </>
-        }
+      {/* 整个读数区就是「打开详情」的入口：看完这几个数字之后想知道的
+          （逐源健康、完整分布图、原始配置）全在详情里，而它原先要先点开
+          ⋯ 菜单才够得着。这里没有别的可点的东西，所以整块给出去不会误伤。 */}
+      <div
+        className="tc-readout"
+        role="button"
+        tabIndex={0}
+        aria-label="查看任务详情"
+        onClick={openDetails}
+        onKeyDown={onKey}
       >
-        <div className="tc-spark">
-          <span className="tc-cap">{filling ? '缓存拉取' : '实时吞吐'}</span>
-          <Sparkline samples={filling ? (job?.speed_samples ?? []) : task.speed_samples} />
-          <b>{formatSpeed(filling ? (job?.current_speed_bps ?? 0) : task.current_speed_bps)}</b>
-        </div>
-      </Tooltip>
-
-      {/* 进度条和分布条即使没有本地数据也占位。同一行里有的卡片有、有的没有的话，
-          卡片高度就参差不齐；空态本身也是信息（"这个任务还没落过盘"）。 */}
-      <Tooltip
-        title={
-          total > 0
-            ? `本地 ${formatBytes(done)} / ${formatBytes(total)}（播放与缓存共享，已落盘的区间不会重复下载）`
-            : '本地还没有数据'
-        }
-      >
-        <div className="tc-local">
-          <div className="tc-progress">
-            <div className="tc-progress-bar" style={{ width: `${pct}%` }} />
+        {/* 一张卡片上其实有两条方向相反的流：发给客户端的（bytes_served）和从
+            源站拉进磁盘的（缓存填充）。曲线只有一条，所以显示**正在发生的那条**
+            并如实标注 —— 早先固定显示前者，于是按下「缓存整个文件」后，250 MB/s
+            的下载在卡片上写着 0 B/s。两者相加不是办法：边播边缓存时同一批字节会
+            被数两遍。 */}
+        <Tooltip
+          title={
+            <>
+              <div>发给客户端：{formatSpeed(task.current_speed_bps)}</div>
+              <div>从源站拉取：{formatSpeed(job?.current_speed_bps ?? 0)}</div>
+            </>
+          }
+        >
+          <div className="tc-spark">
+            <span className="tc-cap">{filling ? '缓存拉取' : '实时吞吐'}</span>
+            <Sparkline samples={filling ? (job?.speed_samples ?? []) : task.speed_samples} />
+            <b>{formatSpeed(filling ? (job?.current_speed_bps ?? 0) : task.current_speed_bps)}</b>
           </div>
-          {heat.length > 0 ? (
-            <div className="tc-heat" aria-label="本地分片分布">
-              {heat.map((value, index) => (
-                <span
-                  key={index}
-                  style={{ background: `rgba(110,168,255,${(0.08 + (value / 100) * 0.92).toFixed(2)})` }}
-                />
-              ))}
-            </div>
-          ) : (
-            <div className="tc-heat empty" aria-label="本地暂无分片" />
-          )}
-        </div>
-      </Tooltip>
+        </Tooltip>
 
-      <div className="tc-metrics">
-        {metrics.map(metric => (
-          <div className="tc-cell" key={metric.label} title={metric.title}>
-            <div className="tc-cap">{metric.label}</div>
-            <div className="tc-val">
-              {metric.value}
-              {metric.sub && <small>{metric.sub}</small>}
+        {/* 进度条和分布条即使没有本地数据也占位。同一行里有的卡片有、有的没有的话，
+            卡片高度就参差不齐；空态本身也是信息（"这个任务还没落过盘"）。 */}
+        <Tooltip
+          title={
+            total > 0
+              ? `本地 ${formatBytes(done)} / ${formatBytes(total)}（播放与缓存共享，已落盘的区间不会重复下载）`
+              : '本地还没有数据'
+          }
+        >
+          <div className="tc-local">
+            <div className="tc-progress">
+              <div className="tc-progress-bar" style={{ width: `${pct}%` }} />
             </div>
+            {heat.length > 0 ? (
+              <div className="tc-heat" aria-label="本地分片分布">
+                {heat.map((value, index) => (
+                  <span
+                    key={index}
+                    style={{ background: `rgba(110,168,255,${(0.08 + (value / 100) * 0.92).toFixed(2)})` }}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="tc-heat empty" aria-label="本地暂无分片" />
+            )}
           </div>
-        ))}
+        </Tooltip>
+
+        <div className="tc-metrics">
+          {metrics.map(metric => (
+            <div className="tc-cell" key={metric.label} title={metric.title}>
+              <div className="tc-cap">{metric.label}</div>
+              <div className="tc-val">
+                {metric.value}
+                {metric.sub && <small>{metric.sub}</small>}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
       <footer className="tc-scenarios">
@@ -230,7 +272,15 @@ export default function TaskCard({ task, onEdit, onClone }: Props) {
         <CacheSection task={task} />
       </footer>
 
-      <TaskDetails task={task} open={detailsOpen} onClose={() => setDetailsOpen(false)} />
+      <TaskDetails
+        task={task}
+        open={detailsOpen}
+        onClose={() => setDetailsOpen(false)}
+        onEdit={() => {
+          setDetailsOpen(false);
+          onEdit(task);
+        }}
+      />
     </article>
   );
 }

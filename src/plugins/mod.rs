@@ -418,6 +418,41 @@ impl PluginRegistry {
         }
         Ok(pipeline)
     }
+
+    /// 校验一个任务的插件配置，**在任务被建立 / 修改之前**。
+    ///
+    /// 不校验的后果不是「没校验」，而是把错误挪到了一个完全不相干的请求里：一条
+    /// 写错的密钥会被 `POST /api/tasks` 原样收下并回 200，然后在某个客户端来播的
+    /// 时候变成 500 —— 那时请求里已经没有「你刚提交的那份配置」这个上下文了，
+    /// 而对脚本来说，它拿到 200 就认为任务能用了。
+    ///
+    /// 只看**启用**的插件：停用的插件配置根本不会被读到，把它标成必填等于「想建
+    /// 任务？先给一个你根本不打算用的加密插件编一个密钥」。同理，停用的槽位引用
+    /// 一个本机没注册的插件也放过 —— 那通常是换了个不带该插件的构建，配置留着
+    /// 无害（[`build_pipeline`](Self::build_pipeline) 也是跳过而非报错）。
+    pub fn validate_task_configs(
+        &self,
+        plugin_configs: &[TaskPluginConfig],
+        globals: &HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        for pc in plugin_configs.iter().filter(|pc| pc.enabled) {
+            let plugin = self.by_id.get(&pc.id).ok_or_else(|| {
+                format!(
+                    "unknown plugin '{}' (registered: {})",
+                    pc.id,
+                    self.ids().join(", ")
+                )
+            })?;
+            let global = globals
+                .get(&pc.id)
+                .cloned()
+                .unwrap_or_else(|| plugin.default_global_config());
+            plugin
+                .validate_task_config(&global, &pc.config)
+                .map_err(|e| format!("plugin '{}': {}", pc.id, e))?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for PluginRegistry {

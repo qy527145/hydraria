@@ -13,6 +13,7 @@ import {
   Space,
   Switch,
   Tabs,
+  Tooltip,
   Typography,
   message,
 } from 'antd';
@@ -35,12 +36,20 @@ import HostMapEditor from '../settings/HostMapEditor';
 import HeadersEditor from './HeadersEditor';
 import VolumeEditor from './VolumeEditor';
 
-const DRAFT_KEY = 'hydraria.createDraft.v2';
+// v3：`persist` 的默认值从关变成开，而草稿会把上一次的关原样带回来 ——
+// 一个存了半年的草稿不该继续压着新的默认值。
+const DRAFT_KEY = 'hydraria.createDraft.v3';
 
 /** 后端 `max_split` 的下限：0 表示自动，否则至少 64K。 */
 const MIN_SPLIT = 64 * 1024;
 
-/** 新任务的初始配置。`cache: true` 让播放与缓存默认落在同一份持久文件上。 */
+/**
+ * 新任务的初始配置。
+ *
+ * `cache: true` 让播放与缓存默认落在同一份持久文件上；`persist: true` 因为
+ * 代理短链一旦发出去（播放列表、脚本、别人的播放器里）就不该在下次重启后变成
+ * 死链 —— 取消勾选是一次点击，丢了任务再手动重建不是。
+ */
 const newTaskConfig: TaskConfig = {
   volumes: [[]],
   // 派生值：保存时按「单卷并发 × 卷数」重算，这里只是让类型完整。
@@ -54,7 +63,7 @@ const newTaskConfig: TaskConfig = {
   auto_filename: true,
   rate_limit_bps: 0,
   rate_limit_algorithm: 'token_bucket',
-  persist: false,
+  persist: true,
   plugins: [],
   content_disposition: 'auto',
   host_mappings: [],
@@ -175,8 +184,7 @@ function toTaskConfig(
  * 分卷的校验结果。URL 在这里就要挑出毛病：留到任务跑起来才报错的话，
  * 用户看到的是「上游 0 字节」，而不是「第 2 卷第 1 行不是合法地址」。
  */
-function checkVolumes(volumes: string[][]): string | null {
-  const filled = volumes.filter(volume => volume.length > 0);
+function checkVolumes(volumes: string[][]): string | null {  const filled = volumes.filter(volume => volume.length > 0);
   if (!filled.length) return '至少填写一个源 URL';
   for (const [index, volume] of volumes.entries()) {
     for (const url of volume) {
@@ -194,8 +202,30 @@ function checkVolumes(volumes: string[][]): string | null {
   return null;
 }
 
-/** 大小输入框的通用校验：留空合法，填了就必须解析得出来，且不小于 `min`。 */
-function sizeRule(min = 0, hint?: string) {
+/**
+ * 卷 URL 里出现过的 host，去重后按出现顺序排列。
+ *
+ * 域名映射的原地址只可能是它们中的一个 —— 让人回到上面的 textarea 里把域名
+ * 抄一遍（还得抄对）纯属白费手，所以直接给成候选。半截 URL 直接跳过：编辑时
+ * 输入框里随时是不完整的。
+ */
+export function volumeHosts(volumes: string[][]): string[] {
+  const out: string[] = [];
+  for (const url of volumes.flat()) {
+    let host: string;
+    try {
+      // IPv6 的 hostname 带方括号，而映射表按裸地址查 —— 带着括号存进去就永远
+      // 命不中。
+      host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    } catch {
+      continue;
+    }
+    if (host && !out.includes(host)) out.push(host);
+  }
+  return out;
+}
+
+/** 大小输入框的通用校验：留空合法，填了就必须解析得出来，且不小于 `min`。 */function sizeRule(min = 0, hint?: string) {
   return {
     validator: (_: unknown, value: string) => {
       if (!value?.trim()) return Promise.resolve();
@@ -258,6 +288,8 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
 
   // 提交前就能看到，而不是按下保存才弹一条红色 message。
   const volumeIssue = useMemo(() => checkVolumes(volumes), [volumes]);
+  // 域名映射的原地址候选，直接来自当前填的卷 URL。
+  const hosts = useMemo(() => volumeHosts(volumes), [volumes]);
 
   // 线程总数是派生值，不再是一个可填的字段 —— 但用户仍然需要看见它，否则
   // 「单卷并发上限」就成了一个不知道会放大多少倍的旋钮。
@@ -380,7 +412,7 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
         label="域名映射（仅本任务）"
         tooltip="等价于 curl --resolve：只换 TCP 连接的目标地址，URL 与 Host 头保持原样，签名参数不受影响。与全局设置里的规则取并集，同名以这里为准。"
       >
-        <HostMapEditor taskId={task?.task_id} />
+        <HostMapEditor scope="task" taskId={task?.task_id} hosts={hosts} />
       </Form.Item>
 
       <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -481,7 +513,11 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
           <Checkbox>自动检测文件名</Checkbox>
         </Form.Item>
         <Form.Item name="persist" valuePropName="checked" noStyle>
-          <Checkbox>重启后保留任务</Checkbox>
+          <Checkbox>
+            <Tooltip title="默认开启。代理短链一旦贴进播放器、播放列表或脚本，就不该在下次重启后变成死链。">
+              重启后保留任务
+            </Tooltip>
+          </Checkbox>
         </Form.Item>
       </Space>
     </>

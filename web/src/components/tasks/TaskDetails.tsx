@@ -1,4 +1,5 @@
-import { Badge, Descriptions, Drawer, Table, Typography } from 'antd';
+import { EditOutlined } from '@ant-design/icons';
+import { Badge, Button, Descriptions, Drawer, Table, Typography } from 'antd';
 import type { TaskInfo, UrlHealth } from '../../api/client';
 import { formatBytes, formatSpeed } from '../../utils/format';
 import CacheHeatmap from './CacheHeatmap';
@@ -7,16 +8,30 @@ interface Props {
   task: TaskInfo;
   open: boolean;
   onClose: () => void;
+  /** 详情里发现要改的东西，就地转到编辑 —— 而不是关掉抽屉再去卡片上找入口。 */
+  onEdit?: () => void;
 }
 
 /** 只读诊断面板。卡片正面只放两个场景的操作，排障信息全部收到这里。 */
-export default function TaskDetails({ task, open, onClose }: Props) {
+export default function TaskDetails({ task, open, onClose, onEdit }: Props) {
   const { config } = task;
   // 卡片上的分布条是压扁的，容不下逐段的字节区间；这里放全尺寸的带 tooltip 版本。
   const heat = task.cache_job?.bitmap_summary ?? task.cache?.bitmap_summary ?? [];
   const total = task.cache_job?.total_bytes ?? task.cache?.total_size ?? 0;
   return (
-    <Drawer title={`${config.name || task.task_id} · 任务详情`} width={760} open={open} onClose={onClose}>
+    <Drawer
+      title={`${config.name || task.task_id} · 任务详情`}
+      width={760}
+      open={open}
+      onClose={onClose}
+      extra={
+        onEdit && (
+          <Button type="primary" icon={<EditOutlined />} onClick={onEdit}>
+            编辑配置
+          </Button>
+        )
+      }
+    >
       <Descriptions
         column={2}
         size="small"

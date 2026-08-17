@@ -16,7 +16,7 @@
 7. [任务字段全量参考](#7-任务字段全量参考)
 8. [分卷 + 加密完整流程](#8-分卷--加密完整流程)
 9. [CLI 用法](#9-cli-用法)
-10. [REST API 参考](#10-rest-api-参考)
+10. [REST API 参考](#10-rest-api-参考) · [完整版：docs/API.md](API.md)
 11. [常见问题 FAQ](#11-常见问题-faq)
 12. [故障排查](#12-故障排查)
 13. [合规与隐私声明](#13-合规与隐私声明)
@@ -136,7 +136,12 @@ URL 里的域名公共 DNS 解析不出来，域名本身又不能改（一改�
 - 弹窗操作栏 sticky 在底部，长表单也能随时关闭
 
 ### 💽 任务持久化
-开启 `persist: true` 的任务自动写入 `~/.hydraria/tasks.json`，重启自动恢复。每 5 秒检查脏状态，原子写盘。
+`persist` **默认开启**：任务自动写入 `~/.hydraria/tasks.json`，重启自动恢复。每 5 秒检查脏状态，原子写盘。
+短链一旦贴进播放器、播放列表或脚本，就不该因为重启变成死链；临时任务把这个勾去掉（或 API 传 `"persist": false`）即可。
+
+### 🤖 可脚本化的创建接口
+`POST /api/tasks` 只要一个 `{"url": "…"}`（`urls` / `uris` / `volumes` 都认），加 `?start_cache=1`
+就是 aria2 / Motrix / Gopeed 那种「加进来就开始下」。详见 [§10](#10-rest-api-参考)。
 
 ---
 
@@ -257,14 +262,16 @@ hydraria \
 读数（served / conns / split 这些）对播放和缓存都成立，硬拆进某一栏只会被抄两遍；
 真正分场景的只有按钮。
 
-**读数区**
+**读数区**（整块可点 —— 点开就是任务详情）
 
-- **任务头**：`task_id` · 任务名 · 最近编辑时间 · 状态徽章（running / paused / cache / persist / 限速）。
+- **任务头**：`task_id` · 任务名 · 最近编辑时间 · 状态徽章（running / paused / cache / 限速 / **临时**）。
+  持久化默认开着，所以徽章标的是反常的那一个：`临时` = 重启后不会恢复。
 - **proxy URL**：整条点击即复制。
 - **实时吞吐**：sparkline + 数字。没有流量时不画线（一条贴底的直线只会被当成渲染 bug）。
 - **进度条 + 落盘分布条**：始终占位，本地没数据时是一条虚线框。乱序下载时分布条比进度条有用得多。
-- **六格读数**：`sources`（源数 · 线程）/ `served` / `cached` / `hit-rate` / `conns` / `split`。
+- **四格读数**：`sources`（源数 · 线程）/ `served` / `cached` / `hit-rate`。
   空值留 `—` 而不是让格子消失——格子对不齐就没法横向比较多个任务了。悬停看明细。
+  （`conns` 在播放操作条的状态行里，`split` 在详情抽屉里：它是配置，不是读数。）
 
 **操作区**（两条，左侧色带区分场景）
 
@@ -273,7 +280,14 @@ hydraria \
 | 🔵 代理播放 | 暂停/恢复 · 复制地址 · 新标签打开 | 待连接 / N 个连接 / N 路读取 · seek 优先调度 |
 | 🟣 完整缓存 | 缓存整个文件 / 暂停 / 继续 · 清缓存 | 进度 · 速度 · 线程数，或「播放顺手落盘」 |
 
-其余低频操作（源看板、编辑、克隆、导出、复制 JSON）收进 `⋯` 菜单，删除单独一个按钮。
+**详情与编辑是两个高频动作，都不在 `⋯` 里**：
+
+- **看详情** —— 点读数区任意位置（或任务名）即可。抽屉里是源看板、全尺寸落盘分布图、
+  原始配置 JSON。它原先是 `⋯` 菜单的第一项，而它恰恰是看完这几个数字之后最想点的
+  东西。抽屉右上角还有一个 **编辑配置**，在详情里发现要改的东西可以就地转过去。
+- **编辑** —— 卡头上的 ✏️ 按钮，一次点击直达完整配置表单。
+
+`⋯` 只留真正低频的：克隆配置、复制 JSON、导出 JSON；删除是旁边单独一个按钮。
 
 ### 6.3 新建 / 编辑任务
 
@@ -289,17 +303,17 @@ hydraria \
 #### 主要字段
 | 字段 | 说明 |
 |---|---|
-| 最大并发线程 | `max_threads`，默认 16，1-128。 |
+| 最大并发线程 | `max_threads`，**派生值**（单卷并发上限 × 卷数，封顶 128），不再单独配置。 |
 | 单卷并发上限 | `max_per_volume`，默认 4，按源站单 IP 连接限制填。 |
 | 分片大小 | `max_split`，**留空 = 自动（推荐）**；手填时最小 64K，且是所有分片的硬上限。 |
-| 自定义请求头 | JSON 对象，常用 `Cookie` / `Referer` / `User-Agent`。 |
-| 域名映射（仅本任务） | `host_mappings`，与全局那份取并集，同名以任务级为准。见 [§6.5](#65-域名映射等价于-curl---resolve)。 |
+| 自定义请求头 | 常用的 Referer / Cookie / UA 直接填表单，其余切到 raw JSON 写。 |
+| 域名映射（仅本任务） | `host_mappings`，与全局那份取并集，同名以任务级为准；原地址可从卷 URL 一键填入，也能一键升格为全局。见 [§6.5](#65-域名映射等价于-curl---resolve)。 |
 | 任务名 | 用于仪表盘搜索和列表显示。 |
 | 单任务限速 | `2M` / `512K`；空 = 不限。 |
 | 下载文件名 + 自动检测 | 不勾自动检测时用此字段；勾选后运行时探测覆盖。 |
 | 限速算法 | 令牌桶 / 滑动窗口。 |
 | 启用本地磁盘缓存 | 开启 = 命中后零外发。 |
-| 持久化保存 | 重启后自动恢复。 |
+| 重启后保留任务 | `persist`，**默认开启**。短链一旦贴进播放器、播放列表或脚本，就不该在下次重启后变成死链；临时任务取消勾选即可。 |
 | 浏览器行为 | auto / 强制预览 / 强制下载（详见 §2）。 |
 | 插件 | 勾选要启用的插件并填写每任务密钥等。 |
 
@@ -350,19 +364,38 @@ hydraria \
 |---|---|---|
 | `cdn.example.com` | `1.2.3.4` | 连 `1.2.3.4`，请求里仍然是 `cdn.example.com` |
 | `cdn.example.com` | `backup.example.com` | 先解析备用域名，再连它的 IP；请求内容不变 |
-| `cdn.example.com` | `1.2.3.4:8443` | 同上，并且连 8443 端口 |
+| `cdn.example.com` | `1.2.3.4:8443` | 同上，并且连 8443 端口 —— 但**原 URL 上写了端口的话以它为准**，见下面「几个必须知道的点」 |
+| `cdn.example.com` | `[::1]:8443` | IPv6 目标写方括号 |
 | `*.example.com` | `1.2.3.4` | 通配后缀；精确匹配优先，多个通配取最长的那条 |
-| `10.0.0.1` | `1.2.3.4` | 原地址是裸 IP 也支持 |
+| `10.0.0.1` | `1.2.3.4:8080` | 原地址是裸 IP 也支持；这条路径下映射里的端口总是生效 |
 
 规则右侧的开关可以临时停用某条而不必删掉。
+
+**原地址不用手抄**：任务表单里的映射编辑器会把当前卷 URL 里出现过的域名列成候选
+（输入框有下拉，下面还有一排 `+ 域名` 的小标签，点一下就加一行），「添加映射」也
+会直接预填第一个还没配过的域名。映射的原地址几乎总是这些域名之一，让人翻回上面的
+textarea 把域名抄一遍（还得抄对）纯属白费手。
+
+**任务级规则可以一键升格为全局**：编辑器里的 **设为全局** 会把当前这几条写进全局
+设置（对所有任务生效），同时从本任务的列表里移走。同一个内网回源域名通常对所有
+任务都成立，没道理每建一个任务再敲一遍。任务表单里也会**列出当前生效的全局映射**
+（只读，被本任务同名规则盖住的会标出来）—— 任务真正用的是「全局 ∪ 任务级」，只
+显示后一半等于让人对着半张表排查。
 
 #### 怎么确认映射生效了
 
 每行末尾的 **⚡** 直接问后端「这个域名现在会被连到哪儿」，回答形如
-`已映射到 1.2.3.4:8443 → 1.2.3.4`。它读的是**已保存**的规则，所以刚改完要先保存
-再测。任务表单里的 ⚡ 按该任务的生效表算（全局 ∪ 任务级）。
+`已映射到 1.2.3.4:8443 → 1.2.3.4`。它测的是**屏幕上这份**规则，**不需要先保存**
+—— 按下测试的时机恰恰是刚改完还没保存的时候。改了原地址或目标之后，上一次的结果
+会先消失（它已经不是这一行的答案了），再点 ⚡ 得到的就是新规则的结果。
 
-对应的 REST 接口是 `GET /api/hostmap/resolve?host=<域名或整条 URL>[&task_id=xxx]`。
+任务表单里的 ⚡ 按该任务的生效表算（全局 ∪ 编辑中的任务级规则），和任务真跑起来
+时一致；全局设置里的 ⚡ 则把编辑器里那份当作**全部**规则，所以在那儿删掉一条再测，
+会如实报「没有规则命中」。
+
+对应的 REST 接口是 `POST /api/hostmap/resolve`，请求体
+`{"host": "<域名或整条 URL>", "scope": "task" | "global", "mappings": [...]}`；
+只想按已保存的规则测的话，`GET /api/hostmap/resolve?host=…[&task_id=xxx]` 仍然可用。
 
 日志侧（`RUST_LOG=hydraria=info` 即可看到）：
 
@@ -383,8 +416,13 @@ WARN hydraria::hostmap: host map: cdn.example.com -> backup.example.com, but the
   去解析，映射根本没有机会生效 —— 而系统级代理（macOS 网络设置、各种 fake-ip
   代理工具）默认就开着，且不易察觉。既然你已经明确指定了「连这里」，Hydraria 就
   把这条请求从代理里摘出来直连。**没命中映射的请求不受影响，照常走代理。**
-- **只有原 URL 没有显式写端口时，目标里的端口才生效**（显式端口优先，这是
-  hyper 的规则）。想换端口就别在源 URL 上写端口。
+- **`to` 里的端口，原地址是域名和裸 IP 时效力不一样。**
+  - 原地址是**域名**：端口只在**原 URL 没有显式写端口**时才生效 —— URL 上写了
+    `:8000`，它就盖过映射里的端口（只有主机被换掉，这是 hyper 的规则）。想靠映射
+    换端口，就别在源 URL 上写端口。
+  - 原地址是**裸 IP**：URL 被整条改写，映射里的端口**总是**说了算，哪怕原 URL 写了
+    别的端口。
+  - 不确定就点 ⚡ 或看日志里那行 `host map: …`。
 - **原地址是裸 IP 且 URL 是 https 时**，证书按目标地址校验（因为 SNI 只能跟着
   连接目标走）。原地址本来就是 IP 的情况下，证书里带 IP SAN 本就罕见，通常无碍。
 - 改映射对**新建立的连接**立即生效；已经在跑的那条流会用旧表跑完。
@@ -402,11 +440,15 @@ WARN hydraria::hostmap: host map: cdn.example.com -> backup.example.com, but the
     ["https://cdn1.com/movie.part02.mp4"]
   ],
 
-  "max_threads": 16,                   // int, 默认 16
+  "max_threads": 16,                   // int, **派生值**：单卷并发上限 × 卷数，传了会被重算
   "max_per_volume": 4,                 // int, 默认 4
   "max_split": 0,                      // 0 = 自动(默认); 或 "5M" 这样的可读字符串
   "cache": false,                      // bool, 默认 false
-  "persist": false,                    // bool, 默认 false
+  "persist": true,                     // bool, **默认 true**（重启后自动恢复）
+
+  "host_mappings": [                   // 任务级域名映射，与全局那份取并集
+    { "from": "cdn.example.com", "to": "1.2.3.4:8443", "enabled": true }
+  ],
 
   "headers": {                         // object<string,string>
     "User-Agent": "Mozilla/5.0",
@@ -436,8 +478,10 @@ WARN hydraria::hostmap: host map: cdn.example.com -> backup.example.com, but the
 ```
 
 字段细节：
+- **只有 `volumes` 是必填的**，而且脚本可以用 `url` / `urls` / `uri` / `uris` 这些别名代替（见 [§10](#10-rest-api-参考)）。其余字段不写就走上面标注的默认值。
 - `max_split`：0 或留空 = 自动（下载按线程均分剩余量；播放是紧贴读头铺开的等长小分片，默认 2 MiB，只在读者攒出余量后按"余量÷线程数"放大。只在源站"整段攒齐才发第一个字节"时才自动降到 8 MiB，下限 1 MiB）。手填时 ≥ 64K，是所有分片的硬上限，只在源站对单次 Range 长度有硬性要求时才需要。
 - `rate_limit_bps`：0 不限；非零时算法决定突发性。
+- `persist`：默认开。短链一旦贴进播放器、播放列表或脚本，就不该在重启后变成死链；临时任务显式写 `false`。
 - 单卷多镜像 ≡ 历史的"多源镜像同一文件"模式。
 - `output_filename` 和 `auto_filename`：勾选自动检测时优先用上游探测；否则用 `output_filename` 字面值（空 = 不发 Content-Disposition）。
 
@@ -539,14 +583,17 @@ hydraria download https://cdn.example.com/file.iso \
 
 ## 10. REST API 参考
 
+> 这一章是速查表。**任务的每个字段、每个端点、每种错误**在
+> [docs/API.md](API.md) 里有完整版，含一份把所有字段都写满的请求示例。
+
 ### 控制平面
 
 | 方法 路径 | 作用 |
 |---|---|
-| `POST /api/tasks` | 创建任务，返回 `{task_id, proxy_url}` |
+| `POST /api/tasks` | 创建任务，返回 `{task_id, proxy_url}`；`?start_cache=1` 顺便开始缓存 |
 | `GET /api/tasks` | 列表 + 实时统计 |
 | `GET /api/tasks/:id` | 单任务详情 |
-| `PATCH /api/tasks/:id` | 部分更新（任意 TaskConfig 字段） |
+| `PATCH /api/tasks/:id` | 部分更新（任意 TaskConfig 字段，URL 认同一批别名） |
 | `DELETE /api/tasks/:id` | 删除任务（缓存保留） |
 | `POST /api/tasks/:id/pause` · `…/resume` | 暂停/恢复 |
 | `POST /api/tasks/:id/cache` · `…/cache/pause` | 开始/暂停把整个文件补齐到缓存 |
@@ -554,7 +601,8 @@ hydraria download https://cdn.example.com/file.iso \
 | `GET /api/tasks/:id/export` | 下载任务配置 JSON |
 | `POST /api/probe` | 一次性探测，返回 `{filename, total_size, content_type, accepts_ranges}` |
 | `GET /api/settings` · `PUT /api/settings` | 全局设置（限速 + 插件全局配置 + 域名映射 `host_mappings`） |
-| `GET /api/hostmap/resolve` | 诊断：`?host=<域名 / IP / 整条 URL>[&task_id=xxx]`，返回命中的映射和最终解析出的地址 |
+| `GET /api/hostmap/resolve` | 诊断已保存的规则：`?host=<域名 / IP / 整条 URL>[&task_id=xxx]` |
+| `POST /api/hostmap/resolve` | 同上，但可带**编辑中**的规则：`{host, scope: "task"\|"global", mappings}` |
 | `GET /api/global` | 仪表盘全局快照 |
 | `GET /api/plugins` | 插件目录 + 全局配置 |
 | `GET/PUT /api/plugins/:id/global` | 单插件全局配置 |
@@ -572,6 +620,54 @@ hydraria download https://cdn.example.com/file.iso \
 
 ### 创建任务示例
 
+**脚本下发任务只需要一个 URL** —— 其余字段服务端补齐，和面板新建表单用的是同一套
+默认值（含 `persist: true`、`cache: true` 之外的部分见 [§7](#7-任务字段全量参考)）：
+
+```bash
+curl -X POST http://127.0.0.1:9527/api/tasks \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://cdn1/movie.mp4"}'
+# → {"task_id":"a1b2c3","proxy_url":"http://127.0.0.1:9527/stream/a1b2c3"}
+```
+
+URL 有四种等价写法（`uri` / `uris` 是 aria2 的叫法，一并接受）：
+
+| 请求体 | 卷 × 镜像 | 含义 |
+|---|---|---|
+| `{"url": "https://a/f.mp4"}` | 1 × 1 | 一个文件、一个源 |
+| `{"urls": ["https://a/f.mp4", "https://b/f.mp4"]}` | 1 × 2 | 一个文件、两个**镜像** |
+| `{"volumes": [["https://a/p1"], ["https://a/p2"]]}` | 2 × 1 | 两个**分卷**，顺序拼接 |
+| `{"volumes": ["https://a/f", "https://b/f"]}` | 1 × 2 | 扁平写法 = 一卷两镜像 |
+| `{"volumes": [["https://a/p1", "https://b/p1"], ["https://a/p2", "https://b/p2"]]}` | 2 × 2 | 两卷，**每卷各两个镜像** |
+
+既有分卷又有镜像就用最后那种（二维 `volumes` 是唯一能同时表达两层的形式）。卷的顺序
+就是文件的字节顺序，镜像的顺序只是偏好。
+
+一个列表里混着字符串和数组时会被拒绝，而不是去猜 —— 猜错的代价是一个看起来建成
+了、播出来却是错的任务。
+
+其余字段（请求头、并发、限速、域名映射、插件……）写在同一个 JSON 对象里，逐字段说明
+见 [docs/API.md](API.md#2-任务配置字段全表)。
+
+**加进来就开始下**（aria2 / Motrix / Gopeed 的手感）：
+
+```bash
+curl -X POST 'http://127.0.0.1:9527/api/tasks?start_cache=1' \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://cdn1/movie.mp4", "name": "电影"}'
+# → {"task_id":"a1b2c3","proxy_url":"…","cache_started":true}
+```
+
+缓存起不来时**任务照样建成**，原因单独报回来 —— 脚本才能区分「任务没建成」和
+「任务建好了，只是源站现在不通」：
+
+```json
+{ "task_id": "a1b2c3", "proxy_url": "…", "cache_started": false,
+  "cache_error": "internal: cannot reach the upstream: upstream returned non-success status: 404" }
+```
+
+完整配置照样可以一次写全：
+
 ```bash
 curl -X POST http://127.0.0.1:9527/api/tasks \
   -H 'content-type: application/json' \
@@ -579,13 +675,50 @@ curl -X POST http://127.0.0.1:9527/api/tasks \
     "volumes": [
       ["https://cdn1/movie.mp4", "https://cdn2/movie.mp4"]
     ],
-    "max_threads": 16,
+    "max_per_volume": 8,
     "max_split": 0,
     "cache": true,
     "headers": {"User-Agent": "Mozilla/5.0"},
     "content_disposition": "inline"
   }'
 ```
+
+### 换掉过期的签名链接
+
+签名 URL 过期后不用删了重建 —— PATCH 认与创建相同的别名，已缓存的数据也会跟着
+迁移（缓存键随 URL 变化，见 [§8](#8-分卷--加密完整流程)）：
+
+```bash
+curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://cdn1/movie.mp4?sign=fresh"}'
+```
+
+没有提到 URL 的 PATCH 不会动源列表：
+
+```bash
+curl -X PATCH http://127.0.0.1:9527/api/tasks/a1b2c3 \
+  -H 'content-type: application/json' -d '{"cache": true}'
+```
+
+### 一个可用的 `hydra-add` 脚本
+
+```bash
+#!/usr/bin/env bash
+# hydra-add <url> [任务名] —— 建任务并立刻开始缓存。
+set -euo pipefail
+HYDRARIA=${HYDRARIA:-http://127.0.0.1:9527}
+
+curl -sS -X POST "$HYDRARIA/api/tasks?start_cache=1" \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --arg url "$1" --arg name "${2:-}" \
+        '{url: $url} + (if $name == "" then {} else {name: $name} end)')" \
+  | jq -r 'if .cache_error then "已创建 \(.task_id)，但缓存没起来：\(.cache_error)"
+           else "\(.proxy_url)" end'
+```
+
+进度看 `GET /api/tasks` 里的 `cache_job.done_bytes` / `.total_bytes`；或者直接把
+`proxy_url` 丢给播放器，让播放本身去拉需要的部分。
 
 ---
 
@@ -634,7 +767,7 @@ A：fetcher 在所有镜像都尝试后报错，客户端拿到 502。源看板�
 - **416 Range Not Satisfiable**：客户端发了非法 Range（例如 start > total）。一般是播放器 bug。
 - **403 / 401**：上游需要鉴权 header，确认 `headers` 字段填全。Cookie 有时效。
 - **`dns error` / `failed to lookup address`**：域名没被公共 DNS 收录。配一条域名映射（§6.5）指到已知的 IP 或备用域名 —— 别去改 URL 里的域名，签名会失效。
-- **配了域名映射但毫无变化**：先点规则行末的 ⚡ 确认规则本身命中了（它读的是已保存的规则）。命中却仍连不上，多半是原 URL 显式写了端口、把映射里的端口顶掉了；或者你改完没保存。命中映射的请求已经会自动绕开代理，所以代理不再是这里的嫌疑。
+- **配了域名映射但毫无变化**：先点规则行末的 ⚡ 确认规则本身命中了（它按屏幕上这份规则算，不需要先保存 —— 但**真正生效**仍然要保存）。命中却仍连不上，多半是原地址是域名、而原 URL 显式写了端口，把映射里的端口顶掉了（裸 IP 源不会有这个问题）；或者规则测通了却忘了保存。命中映射的请求已经会自动绕开代理，所以代理不再是这里的嫌疑。
 - **任务正常拉但播放器一直缓冲**：很可能上游不支持 Range；Hydraria 会自动降级成 passthrough 模式（单源单流），多线程加速失效。看任务源看板的 `accepts_ranges` 是否 `true`。
 
 ### 加密相关
