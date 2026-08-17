@@ -270,6 +270,10 @@ button, input { font: inherit; }
   background: rgba(14, 17, 25, .7);
 }
 
+.hostmap-row { display: flex; align-items: center; gap: 8px; }
+.hostmap-row .ant-input { flex: 1; min-width: 0; }
+.hostmap-arrow { color: var(--hy-muted); flex: none; }
+
 .plugin-card { margin-bottom: 14px; }
 .plugin-card p { color: #7e899e; font-size: 12px; }
 .plugin-note { margin: 10px 0 0; color: var(--hy-muted) !important; font-size: 11px !important; }

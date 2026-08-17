@@ -4,6 +4,7 @@ pub mod download;
 pub mod engine;
 pub mod error;
 pub mod fs_pick;
+pub mod hostmap;
 pub mod models;
 pub mod plugins;
 pub mod ratelimit;

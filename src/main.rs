@@ -55,6 +55,14 @@ enum Command {
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
 
+        /// Resolve a host to somewhere else, `curl --resolve` style
+        /// (`--map old.example.com=1.2.3.4`, repeatable). Only the TCP target
+        /// changes: the URL, Host header and TLS SNI stay as written, so signed
+        /// URLs keep working. Target may be an IP or another host, optionally
+        /// with `:port`; the source may be `*.example.com`.
+        #[arg(long = "map")]
+        maps: Vec<String>,
+
         /// Max concurrent chunk fetchers.
         #[arg(long, default_value_t = 16)]
         threads: usize,
@@ -96,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             urls,
             output,
             headers,
+            maps,
             threads,
             split,
             volumes,
@@ -106,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(|| home_subdir("cache"));
             run_download(
-                urls, output, headers, threads, split, volumes, cache, cache_dir,
+                urls, output, headers, maps, threads, split, volumes, cache, cache_dir,
             )
             .await
         }
@@ -198,6 +207,7 @@ async fn run_download(
     urls: Vec<String>,
     output: PathBuf,
     raw_headers: Vec<String>,
+    raw_maps: Vec<String>,
     threads: usize,
     split: String,
     volumes_mode: bool,
@@ -209,6 +219,10 @@ async fn run_download(
     }
 
     let headers = parse_header_args(&raw_headers)?;
+    // Host mappings live in a process-wide table (the client's DNS resolver
+    // reads it), so this installs them rather than putting them on the config.
+    hydraria::hostmap::install(&parse_map_args(&raw_maps)?)
+        .map_err(|e| anyhow::anyhow!("--map: {e}"))?;
 
     // Build a one-off TaskConfig and run it through the same engine the
     // server uses. We construct `volumes` directly from the CLI URL list:
@@ -339,6 +353,26 @@ fn parse_header_args(raw: &[String]) -> anyhow::Result<HashMap<String, String>> 
         out.insert(k.trim().to_string(), v.trim().to_string());
     }
     Ok(out)
+}
+
+/// `--map old.example.com=1.2.3.4` / `--map *.a.com=backup.b.com:8443`.
+/// Also accepts `:` as the separator (`curl --resolve` muscle memory), but only
+/// when the source has no colon of its own — an IPv6 source has plenty.
+fn parse_map_args(raw: &[String]) -> anyhow::Result<Vec<hydraria::hostmap::HostMapping>> {
+    raw.iter()
+        .map(|m| {
+            let split = m
+                .split_once('=')
+                .or_else(|| m.split_once(':').filter(|(from, _)| !from.contains(':')));
+            let (from, to) =
+                split.ok_or_else(|| anyhow::anyhow!("map must be `from=to`, got: {m}"))?;
+            Ok(hydraria::hostmap::HostMapping {
+                from: from.trim().to_string(),
+                to: to.trim().to_string(),
+                enabled: true,
+            })
+        })
+        .collect()
 }
 
 fn fmt_size(n: u64) -> String {

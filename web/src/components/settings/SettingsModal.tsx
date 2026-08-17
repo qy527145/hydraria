@@ -1,13 +1,15 @@
 import { DeleteOutlined } from '@ant-design/icons';
 import { Button, Form, Input, Modal, Popconfirm, Select, Statistic, message } from 'antd';
 import { useEffect } from 'react';
-import { api, type GlobalState, type RateAlgorithm } from '../../api/client';
+import { api, type GlobalState, type HostMapping, type RateAlgorithm } from '../../api/client';
 import { useDashboard } from '../../stores/dashboard';
 import { formatBytes, parseSize, sizeInput } from '../../utils/format';
+import HostMapEditor from './HostMapEditor';
 
 interface SettingsForm {
   global_rate_limit_bps: string;
   global_rate_limit_algorithm: RateAlgorithm;
+  host_mappings: HostMapping[];
 }
 
 interface Props {
@@ -26,6 +28,7 @@ export default function SettingsModal({ open, onClose, global }: Props) {
       form.setFieldsValue({
         global_rate_limit_bps: sizeInput(settings.global_rate_limit_bps),
         global_rate_limit_algorithm: settings.global_rate_limit_algorithm,
+        host_mappings: settings.host_mappings ?? [],
       }),
     );
   }, [open, form]);
@@ -39,6 +42,8 @@ export default function SettingsModal({ open, onClose, global }: Props) {
             ? parseSize(values.global_rate_limit_bps)
             : 0,
           global_rate_limit_algorithm: values.global_rate_limit_algorithm,
+          // 两头都空的行是加了又没填的，后端也会丢掉，这里先滤一遍免得白跑一趟。
+          host_mappings: (values.host_mappings ?? []).filter(m => m.from.trim() || m.to.trim()),
         }),
       );
       message.success('全局设置已保存');
@@ -61,6 +66,13 @@ export default function SettingsModal({ open, onClose, global }: Props) {
               { value: 'sliding_window', label: '滑动窗口 — 严格一秒窗口' },
             ]}
           />
+        </Form.Item>
+        <Form.Item
+          name="host_mappings"
+          label="域名映射（域名解析不了、又不能改 URL 时用）"
+          tooltip="等价于 curl --resolve：只换 TCP 连接的目标地址，URL 与 Host 头保持原样，签名参数不受影响。对所有任务生效。"
+        >
+          <HostMapEditor />
         </Form.Item>
       </Form>
       <div className="settings-cache">

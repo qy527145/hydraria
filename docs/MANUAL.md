@@ -71,6 +71,9 @@ Hydraria 把一个**慢的、单源的 HTTP 下载**变成**并行的多源拉�
 
 Hydraria 在 probe 阶段就探明每个卷的大小、ETag、accept-ranges，按合并坐标系（merged offset）规划 chunk，确保任意一个 chunk 只命中一个卷的一个 URL，简单且不会拼接错位。
 
+### 🧭 域名映射（`curl --resolve` 的等价物）
+URL 里的域名公共 DNS 解析不出来，域名本身又不能改（一改签名就失效）时，加一条 `原域名 → 目标 IP / 备用域名` 即可。**只换 TCP 连到哪儿**：URL、`Host` 头、TLS SNI 全部保持原样，源站看到的仍是签名时的那个域名。全局和任务级都能配（并集，同名以任务级为准），支持 `*.example.com` 通配、目标带端口、原地址是裸 IP，并且**命中映射的请求会自动绕开系统代理**——否则域名由代理解析，映射静默失效。详见 [§6.5](#65-域名映射等价于-curl---resolve)。
+
 ### 🔐 ChaCha20 端到端加密插件
 内置插件：发送端用 `forward` 工具加密源文件（可选同时分卷），分发到任意 HTTP 服务器；接收端在 Hydraria 任务里填入合并密钥（key+nonce 88 hex），代理在流式分发时实时解密。
 
@@ -290,6 +293,7 @@ hydraria \
 | 单卷并发上限 | `max_per_volume`，默认 4，按源站单 IP 连接限制填。 |
 | 分片大小 | `max_split`，**留空 = 自动（推荐）**；手填时最小 64K，且是所有分片的硬上限。 |
 | 自定义请求头 | JSON 对象，常用 `Cookie` / `Referer` / `User-Agent`。 |
+| 域名映射（仅本任务） | `host_mappings`，与全局那份取并集，同名以任务级为准。见 [§6.5](#65-域名映射等价于-curl---resolve)。 |
 | 任务名 | 用于仪表盘搜索和列表显示。 |
 | 单任务限速 | `2M` / `512K`；空 = 不限。 |
 | 下载文件名 + 自动检测 | 不勾自动检测时用此字段；勾选后运行时探测覆盖。 |
@@ -325,6 +329,66 @@ hydraria \
 | 解密密钥（key+nonce 合并） | 88 hex；正向时若启用了"自动生成"，会自动填入 |
 
 执行后结果区的 `secret` 字段就是接收方需要粘贴的那一串。
+
+### 6.5 域名映射（等价于 `curl --resolve`）
+
+两处都能配，规则相同：
+
+* **全局** —— 顶栏 **设置**，对所有任务生效。
+* **任务级** —— 新建 / 编辑任务的「源与分卷」页，只对该任务生效。
+
+两层**取并集**；`原地址` 撞车时**以任务级为准**。
+
+用来解决这一类问题：URL 里的域名公共 DNS 解析不出来（私有 CDN、内网回源域名、
+只在某地区解析的加速域名），而域名本身又**不能改** —— 一改签名参数就对不上，
+源站直接 403。
+
+映射改的只有一件事：**TCP 连到哪儿**。URL 原样发出，`Host` 头、TLS SNI、证书
+校验用的仍然是原域名，所以签名、防盗链、CDN 的 vhost 路由全都照常工作。
+
+| 原地址 | 目标 | 效果 |
+|---|---|---|
+| `cdn.example.com` | `1.2.3.4` | 连 `1.2.3.4`，请求里仍然是 `cdn.example.com` |
+| `cdn.example.com` | `backup.example.com` | 先解析备用域名，再连它的 IP；请求内容不变 |
+| `cdn.example.com` | `1.2.3.4:8443` | 同上，并且连 8443 端口 |
+| `*.example.com` | `1.2.3.4` | 通配后缀；精确匹配优先，多个通配取最长的那条 |
+| `10.0.0.1` | `1.2.3.4` | 原地址是裸 IP 也支持 |
+
+规则右侧的开关可以临时停用某条而不必删掉。
+
+#### 怎么确认映射生效了
+
+每行末尾的 **⚡** 直接问后端「这个域名现在会被连到哪儿」，回答形如
+`已映射到 1.2.3.4:8443 → 1.2.3.4`。它读的是**已保存**的规则，所以刚改完要先保存
+再测。任务表单里的 ⚡ 按该任务的生效表算（全局 ∪ 任务级）。
+
+对应的 REST 接口是 `GET /api/hostmap/resolve?host=<域名或整条 URL>[&task_id=xxx]`。
+
+日志侧（`RUST_LOG=hydraria=info` 即可看到）：
+
+```
+INFO hydraria::hostmap: host mapping (global): cdn.example.com -> 1.2.3.4   # 装载时，每条一行
+INFO hydraria::hostmap: host map: cdn.example.com resolved to 1.2.3.4 (mapped, no DNS lookup)
+INFO hydraria::hostmap: host map: cdn.example.com resolved via backup.example.com to 5.6.7.8
+WARN hydraria::hostmap: host map: cdn.example.com -> backup.example.com, but the target failed to resolve: …
+```
+
+最后一条要特别留意：它说明**映射本身命中了**，是你填的目标解析不出来 —— 和
+「规则没配对」是两回事。想看具体是哪条请求走了映射，开
+`RUST_LOG=hydraria=debug`，每条上游请求都会打一行 `host map: GET <url> via [规则]`。
+
+#### 几个必须知道的点
+
+- **命中映射的请求会自动绕开代理。** 走代理时请求是整条交给代理发的，域名由代理
+  去解析，映射根本没有机会生效 —— 而系统级代理（macOS 网络设置、各种 fake-ip
+  代理工具）默认就开着，且不易察觉。既然你已经明确指定了「连这里」，Hydraria 就
+  把这条请求从代理里摘出来直连。**没命中映射的请求不受影响，照常走代理。**
+- **只有原 URL 没有显式写端口时，目标里的端口才生效**（显式端口优先，这是
+  hyper 的规则）。想换端口就别在源 URL 上写端口。
+- **原地址是裸 IP 且 URL 是 https 时**，证书按目标地址校验（因为 SNI 只能跟着
+  连接目标走）。原地址本来就是 IP 的情况下，证书里带 IP SAN 本就罕见，通常无碍。
+- 改映射对**新建立的连接**立即生效；已经在跑的那条流会用旧表跑完。
+
 
 ---
 
@@ -453,6 +517,7 @@ hydraria download https://cdn.example.com/file.iso \
   --threads 16 \
   --split 5M \
   -H "Cookie: session=xxxx" \
+  --map cdn.example.com=1.2.3.4 \
   --cache
 ```
 
@@ -464,6 +529,7 @@ hydraria download https://cdn.example.com/file.iso \
 | `--threads` | 并发数（默认 16） |
 | `--split` | 分片大小（默认 5M） |
 | `-H, --header` | 重复传 `-H "k: v"` 加请求头 |
+| `--map` | 重复传 `--map 原域名=目标`，等价于 `curl --resolve`：只换连接目标，URL / Host 头不动（详见 §6.5） |
 | `--volumes` | 把 URL 视为有序分卷（默认是镜像） |
 | `--cache` | 共用主服务的缓存目录，断点续传 |
 
@@ -487,7 +553,8 @@ hydraria download https://cdn.example.com/file.iso \
 | `DELETE /api/tasks/:id/cache` | 清空该任务的磁盘缓存 |
 | `GET /api/tasks/:id/export` | 下载任务配置 JSON |
 | `POST /api/probe` | 一次性探测，返回 `{filename, total_size, content_type, accepts_ranges}` |
-| `GET /api/settings` · `PUT /api/settings` | 全局设置（限速 + 插件全局配置） |
+| `GET /api/settings` · `PUT /api/settings` | 全局设置（限速 + 插件全局配置 + 域名映射 `host_mappings`） |
+| `GET /api/hostmap/resolve` | 诊断：`?host=<域名 / IP / 整条 URL>[&task_id=xxx]`，返回命中的映射和最终解析出的地址 |
 | `GET /api/global` | 仪表盘全局快照 |
 | `GET /api/plugins` | 插件目录 + 全局配置 |
 | `GET/PUT /api/plugins/:id/global` | 单插件全局配置 |
@@ -545,6 +612,12 @@ A：可以。`cargo build --release --target aarch64-unknown-linux-gnu` 之类�
 **Q：仪表盘怎么暴露给公网？**
 A：当前**没有做认证**，请勿直接绑 `0.0.0.0` 暴露公网。建议局域网或通过 nginx + Basic Auth / OAuth 反代。鉴权在 Roadmap。
 
+**Q：源 URL 的域名解析不出来（`dns error`），但域名改不得，怎么办？**
+A：加一条域名映射（全局设置里，或者任务表单的「源与分卷」页）：原域名 → 你知道的 IP 或备用域名。只有连接目标会变，URL 和 `Host` 头保持原样，所以签名参数不受影响。配完点行末的 ⚡ 就能确认它生效了。详见 [§6.5](#65-域名映射等价于-curl---resolve)。
+
+**Q：机器上开着代理（Clash / Surge / 公司代理），域名映射还有用吗？**
+A：有。命中映射的请求会被自动摘出代理直连 —— 否则请求整条交给代理，域名由代理解析，映射不会有任何效果。没命中映射的请求照常走代理。
+
 **Q：上游 URL 失效后任务会怎样？**
 A：fetcher 在所有镜像都尝试后报错，客户端拿到 502。源看板会显示每个 URL 的错误信息和状态码，方便排查是哪一个失效了。
 
@@ -560,6 +633,8 @@ A：fetcher 在所有镜像都尝试后报错，客户端拿到 502。源看板�
 - **502 Bad Gateway**：上游探测全失败。开 `RUST_LOG=hydraria=debug` 看具体哪个 URL、什么错误。
 - **416 Range Not Satisfiable**：客户端发了非法 Range（例如 start > total）。一般是播放器 bug。
 - **403 / 401**：上游需要鉴权 header，确认 `headers` 字段填全。Cookie 有时效。
+- **`dns error` / `failed to lookup address`**：域名没被公共 DNS 收录。配一条域名映射（§6.5）指到已知的 IP 或备用域名 —— 别去改 URL 里的域名，签名会失效。
+- **配了域名映射但毫无变化**：先点规则行末的 ⚡ 确认规则本身命中了（它读的是已保存的规则）。命中却仍连不上，多半是原 URL 显式写了端口、把映射里的端口顶掉了；或者你改完没保存。命中映射的请求已经会自动绕开代理，所以代理不再是这里的嫌疑。
 - **任务正常拉但播放器一直缓冲**：很可能上游不支持 Range；Hydraria 会自动降级成 passthrough 模式（单源单流），多线程加速失效。看任务源看板的 `accepts_ranges` 是否 `true`。
 
 ### 加密相关

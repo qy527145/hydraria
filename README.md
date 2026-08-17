@@ -24,6 +24,7 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 - **Passthrough fallback** — if the origin doesn't advertise byte-range support, Hydraria automatically falls back to a single-stream passthrough so unrangeable sources still work.
 - **Backpressure-aware streaming** — the chunk planner uses a bounded-channel pipeline (`tokio::sync::mpsc`), so a slow client throttles upstream fetches instead of blowing memory.
 - **Custom headers per task** — set `Cookie`, `User-Agent`, `Referer`, etc. once at task creation; every upstream chunk request carries them.
+- **Host mapping** — the equivalent of `curl --resolve`, settable globally *and* per task (`host_mappings`; the two are unioned, task wins on a conflicting source). `--map from=to` on the CLI. Point a hostname at an IP or a backup host when public DNS can't resolve it. Only the TCP target moves: the URL, the `Host` header and the TLS SNI stay exactly as written, so signed URLs keep verifying. Supports `*.example.com` suffixes, a port on the target, and bare-IP sources. A mapped request automatically **bypasses the proxy** — otherwise the proxy resolves the hostname itself and the mapping silently does nothing. `GET /api/hostmap/resolve?host=…` (and the ⚡ button in the dashboard) reports where a host actually ends up.
 - **Pause / resume / edit** — tasks can be paused (stream returns 503 while config + cache stay intact) and live-edited via `PATCH /api/tasks/:id`. No need to delete and recreate.
 - **Rate limiting** — per-task and global token-bucket limiters (`rate_limit_bps` on the task config, `global_rate_limit_bps` on settings). Small bursts allowed; long-run average held to the cap.
 - **Persistence** — opt-in `persist: true` on a task writes it to `~/.hydraria/tasks.json` (atomic write every ~5s when state changes). Settings persist alongside it. Restored automatically at next startup.
@@ -38,6 +39,7 @@ Hydraria turns a slow, single-source HTTP download into a parallelized, multi-so
 | Core engine (data plane) | [src/engine.rs](src/engine.rs) | Probe upstream, plan chunks, run the parallel fetcher with a sliding-window scheduler, serialize chunks back into a single ordered byte stream. Records per-URL fetch outcomes. |
 | Cache | [src/cache.rs](src/cache.rs) | Per-URL-set sparse-file cache with a 1 MB block bitmap. Auto-clears on ETag mismatch. |
 | Rate limiter | [src/ratelimit.rs](src/ratelimit.rs) | Token-bucket limiter (per-task and global). |
+| Host mapping | [src/hostmap.rs](src/hostmap.rs) | `curl --resolve` equivalent: a hot-swappable table behind the client's DNS resolver, so only the TCP target moves. |
 | Control plane | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | Task manager, REST API, short-link generation, in-memory task store, per-task health tracker, throughput sampler, persistence. |
 | Application layer | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI (`--bind`, `--cache-dir`, `--state-file`), axum server, embedded dashboard at `/`. |
 | Web UI | [web/index.html](web/index.html) | Single-file dashboard (vanilla JS, no build step) with: modal create form, grid/list toggle, search, source health panel, live sparkline, live input validation, copy-with-✓ feedback. |
@@ -168,8 +170,27 @@ task pointing at the same content stops writing to it too.
 
 #### `GET /api/settings` · `PUT /api/settings`
 
-Global settings (currently `global_rate_limit_bps`, in B/s or human size
-strings like `"10M"`; `0`/null = unlimited). The PUT body is a partial update.
+Global settings. The PUT body is a partial update; only the keys present are
+touched.
+
+| Key | Meaning |
+| --- | --- |
+| `global_rate_limit_bps` | B/s, or a human size string like `"10M"`. `0`/null = unlimited. |
+| `global_rate_limit_algorithm` | `token_bucket` \| `sliding_window`. |
+| `plugin_globals` | Per-plugin global config blob, keyed by plugin id. |
+| `download_dir` | Default directory for the download button. |
+| `host_mappings` | `[{from, to, enabled}]`. `from` is the host as written in the URL (or `*.example.com`); `to` is an IP or host, optionally `:port`. A bad rule fails the whole PUT — the table is never left half-applied. Tasks can carry their own list, unioned over this one. |
+
+#### `GET /api/hostmap/resolve`
+
+Diagnostic: where does a host actually end up? `?host=` takes a hostname, an IP,
+or a whole URL; `&task_id=` evaluates it against that task's effective table
+(global ∪ task-level) instead of the global one.
+
+```json
+{ "host": "cdn.example.com", "mapped_to": "1.2.3.4:8443",
+  "addresses": ["1.2.3.4"], "error": null, "proxy_env": "HTTPS_PROXY" }
+```
 
 #### `GET /api/global`
 
@@ -225,6 +246,7 @@ The client sees a single, plain HTTP/1.1 stream. Hydraria fans the actual fetchi
 | `max_split` | `int` or human string | `0` (auto) | Hard ceiling on one range request. `0` lets the scheduler size claims itself; a non-zero value caps every claim. |
 | `cache` | `bool` | `false` | Reserved for future on-disk caching. |
 | `headers` | `object<string,string>` | `{}` | Headers to attach to every upstream request. |
+| `host_mappings` | `[{from, to, enabled}]` | `[]` | Task-level host mappings, unioned over the global ones (task wins on a conflicting `from`). |
 | `name` | `string?` | `null` | Optional friendly name shown in the dashboard. |
 
 ## Project layout

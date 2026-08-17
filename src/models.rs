@@ -92,6 +92,10 @@ pub struct TaskConfig {
     /// downloads). `Inline` and `Attachment` are the explicit overrides.
     #[serde(default)]
     pub content_disposition: ContentDispositionMode,
+    /// 任务级域名映射，与全局设置里的那份取并集；`from` 撞车时以这里为准。
+    /// 语义和全局的完全一样（只改 TCP 连到哪儿），见 [`crate::hostmap`]。
+    #[serde(default)]
+    pub host_mappings: Vec<crate::hostmap::HostMapping>,
 }
 
 /// User-facing knob for the served `Content-Disposition` (and a touch of
@@ -212,6 +216,7 @@ pub struct TaskUpdate {
     pub persist: Option<bool>,
     pub plugins: Option<Vec<TaskPluginConfig>>,
     pub content_disposition: Option<ContentDispositionMode>,
+    pub host_mappings: Option<Vec<crate::hostmap::HostMapping>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -496,6 +501,15 @@ impl TaskConfig {
     pub fn normalize(&mut self) {
         self.volumes = self.effective_volumes();
         self.max_threads = Self::derive_threads(self.max_per_volume, self.volumes.len());
+        // 表单里加了一行又没填完的，丢掉而不是报错。
+        self.host_mappings
+            .retain(|m| !m.from.trim().is_empty() || !m.to.trim().is_empty());
+    }
+
+    /// 任务级域名映射的校验，创建和编辑时各调一次。放在这里而不是 `normalize`
+    /// 里，是因为它会失败，而 `normalize` 的契约是「只整形，不拒绝」。
+    pub fn validate_host_mappings(&self) -> std::result::Result<(), String> {
+        crate::hostmap::validate(&self.host_mappings).map_err(|e| format!("host mapping: {e}"))
     }
 
     /// 线程总数 = 单卷并发上限 × 卷数，不再单独配置。
@@ -656,6 +670,13 @@ impl TaskEntry {
         if let Some(cd) = upd.content_disposition {
             cfg.content_disposition = cd;
         }
+        if let Some(mut maps) = upd.host_mappings {
+            maps.retain(|m| !m.from.trim().is_empty() || !m.to.trim().is_empty());
+            crate::hostmap::validate(&maps).map_err(|e| format!("host mapping: {e}"))?;
+            cfg.host_mappings = maps;
+            // 探测走的也是映射后的地址，换了映射，缓存的探测结果就未必还成立。
+            *self.probe_cache.lock() = None;
+        }
         // Only on the success path: a rejected edit changed nothing the user
         // asked for, so it should not reorder the dashboard either.
         self.updated_at.store(Self::now(), Ordering::Relaxed);
@@ -703,6 +724,12 @@ pub struct GlobalSettings {
     /// with a message rather than guessing at somewhere in the filesystem.
     #[serde(default)]
     pub download_dir: Option<String>,
+    /// 自定义域名 / IP 映射，语义等同 `curl --resolve`：只改 TCP 连到哪儿，
+    /// URL、Host 头、TLS SNI 一律保持原样，所以带签名的地址不会因此失效。
+    /// 全局而非按任务，理由见 [`crate::hostmap`]：解析发生在进程唯一的那个
+    /// 连接池里，拿不到「这条请求属于哪个任务」的上下文。
+    #[serde(default)]
+    pub host_mappings: Vec<crate::hostmap::HostMapping>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -712,6 +739,7 @@ pub struct GlobalSettingsUpdate {
     pub global_rate_limit_algorithm: Option<Algorithm>,
     pub plugin_globals: Option<HashMap<String, serde_json::Value>>,
     pub download_dir: Option<String>,
+    pub host_mappings: Option<Vec<crate::hostmap::HostMapping>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -896,8 +924,15 @@ impl AppState {
 
     pub fn update_settings(
         &self,
-        upd: GlobalSettingsUpdate,
+        mut upd: GlobalSettingsUpdate,
     ) -> std::result::Result<GlobalSettings, String> {
+        // 域名映射先于任何写入校验：一条写错的规则应该让整个保存失败，而不是
+        // 「限速改了、映射没改」这种只改了一半的状态。
+        if let Some(maps) = upd.host_mappings.as_mut() {
+            // 空行是表单里删了一半的残留，直接丢掉而不是报错。
+            maps.retain(|m| !m.from.trim().is_empty() || !m.to.trim().is_empty());
+            crate::hostmap::validate(maps).map_err(|e| format!("host mapping: {e}"))?;
+        }
         let mut s = self.settings.write();
         if let Some(r) = upd.global_rate_limit_bps {
             s.global_rate_limit_bps = r;
@@ -929,6 +964,12 @@ impl AppState {
                 // forward-compat with plugins added in a future build.
             }
             s.plugin_globals = pg;
+        }
+        if let Some(maps) = upd.host_mappings {
+            // 上面已经校验过，这里 install 不会失败；真失败了也只是这张表没换，
+            // 报错回去让用户看见比 unwrap 掉进程好。
+            crate::hostmap::install(&maps).map_err(|e| format!("host mapping: {e}"))?;
+            s.host_mappings = maps;
         }
         Ok(s.clone())
     }
@@ -1035,6 +1076,11 @@ impl AppState {
             .set_rate(p.settings.global_rate_limit_bps);
         self.global_limiter
             .set_algorithm(p.settings.global_rate_limit_algorithm);
+        // 装载域名映射。一条坏规则不该拦住整个启动 —— 记一条警告，其余配置照常
+        // 恢复，用户在设置里改回来即可。
+        if let Err(e) = crate::hostmap::install(&p.settings.host_mappings) {
+            tracing::warn!("persisted host mappings are invalid, ignoring them: {e}");
+        }
 
         let mut count = 0;
         for pt in p.tasks {
@@ -1110,6 +1156,14 @@ impl AppState {
                     .hash(&mut hasher);
             }
         }
+        // 这两项也只在设置里改，不跟着任务变 —— 不进哈希的话，只改了它们的那次
+        // 保存永远等不到落盘时机，重启就丢了。
+        s.download_dir.hash(&mut hasher);
+        for m in &s.host_mappings {
+            m.from.hash(&mut hasher);
+            m.to.hash(&mut hasher);
+            m.enabled.hash(&mut hasher);
+        }
         drop(s);
         for (id, e) in self.tasks.read().iter() {
             let cfg = e.config.read();
@@ -1138,6 +1192,11 @@ impl AppState {
             for (k, v) in &cfg.headers {
                 k.hash(&mut hasher);
                 v.hash(&mut hasher);
+            }
+            for m in &cfg.host_mappings {
+                m.from.hash(&mut hasher);
+                m.to.hash(&mut hasher);
+                m.enabled.hash(&mut hasher);
             }
             // Plugin slots: id + enabled + serialized config. Same plugin
             // listed twice (legal but unusual) hashes correctly because each

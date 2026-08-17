@@ -7,8 +7,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
 use reqwest::{Client, StatusCode};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -159,6 +160,11 @@ pub struct UpstreamProbe {
 
 pub struct Engine {
     client: Client,
+    /// 命中域名映射的请求走这个客户端：不走代理，DNS 绑定 `hostmap`。
+    /// `None` = 这个任务一条映射也没有。见 [`direct_client_for`]。
+    direct: Option<Client>,
+    /// 这个任务实际生效的映射表（全局 ∪ 任务级），建 engine 时快照。
+    hostmap: crate::hostmap::Effective,
     config: Arc<TaskConfig>,
     rr_counter: AtomicUsize,
     cache: Option<Arc<CacheEntry>>,
@@ -220,6 +226,16 @@ struct FetchTarget {
 /// shrink an oversized claim (see `Scheduler::note_claim_outcome`). TCP
 /// keepalive covers peers that vanish without closing.
 pub fn build_upstream_client() -> Result<Client> {
+    client_builder()
+        // 自定义域名映射的挂载点。全局表是热更新的，所以这里装一次就够了 ——
+        // 改映射不需要重建 client（重建会连带扔掉整个连接池）。
+        .dns_resolver(crate::hostmap::MappedResolver::global())
+        .build()
+        .map_err(ProxyError::Upstream)
+}
+
+/// 两个客户端共用的那套参数，见 [`build_upstream_client`] 的说明。
+fn client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
@@ -228,17 +244,70 @@ pub fn build_upstream_client() -> Result<Client> {
         .connect_timeout(Duration::from_secs(15))
         .http1_only()
         .http1_title_case_headers()
+}
+
+/// 命中域名映射的请求走的客户端：**不走任何代理**，并绑定这个任务的映射表。
+///
+/// 为什么必须另起一个客户端：代理是按 client 配的，而走代理时请求是整条交给代理
+/// 发出去的 —— 域名由代理解析，DNS 钩子根本不会被调用，映射静默失效。系统级代理
+/// （macOS 网络设置、各种 fake-ip 工具）默认就开着，很难自己想到这一层。用户既然
+/// 明确写了「连这里」，那条请求就不该再被代理接管。
+///
+/// 没命中映射的请求仍然走主客户端，代理设置照常生效 —— 这个决定是按请求做的，
+/// 见 `Engine::upstream`。
+///
+/// 相同映射表的任务共用同一个客户端（也就共用连接池）；全局表一变，整个注册表
+/// 作废重建。
+pub fn direct_client_for(effective: &crate::hostmap::Effective) -> Result<Client> {
+    static REGISTRY: LazyLock<parking_lot::Mutex<(u64, HashMap<u64, Client>)>> =
+        LazyLock::new(|| parking_lot::Mutex::new((0, HashMap::new())));
+
+    let generation = crate::hostmap::generation();
+    let mut guard = REGISTRY.lock();
+    // 全局表换了，所有快照客户端一起作废 —— 也顺手给这张表封了顶，它只会长到
+    // 「当前存在多少种不同的任务级映射」那么大。
+    if guard.0 != generation {
+        guard.0 = generation;
+        guard.1.clear();
+    }
+    if let Some(c) = guard.1.get(&effective.key()) {
+        return Ok(c.clone());
+    }
+    let client = client_builder()
+        .no_proxy()
+        .dns_resolver(crate::hostmap::MappedResolver::fixed(Arc::clone(
+            &effective.table,
+        )))
         .build()
-        .map_err(ProxyError::Upstream)
+        .map_err(ProxyError::Upstream)?;
+    guard.1.insert(effective.key(), client.clone());
+    Ok(client)
 }
 
 impl Engine {
     /// `client` must be the process-wide client from [`build_upstream_client`],
     /// cloned. Building a fresh one here would give every engine its own empty
     /// connection pool.
+    ///
+    /// 域名映射在这里定型：全局表叠上 `config.host_mappings`，快照一份给这个
+    /// engine 用。engine 是每条客户端连接建一个的，所以改设置对新连接立即生效。
     pub fn new(config: Arc<TaskConfig>, client: Client) -> Self {
+        let hostmap = crate::hostmap::effective_for(&config.host_mappings).unwrap_or_else(|e| {
+            // 创建 / 编辑任务时已经校验过，走到这里说明是从盘上恢复的老配置。
+            tracing::warn!("task host mappings are invalid, falling back to the global table: {e}");
+            crate::hostmap::effective_for(&[]).expect("global rules were validated on install")
+        });
+        let direct = if hostmap.is_empty() {
+            None
+        } else {
+            direct_client_for(&hostmap)
+                .map_err(|e| tracing::warn!("could not build the direct client: {e}"))
+                .ok()
+        };
         Self {
             client,
+            direct,
+            hostmap,
             config,
             rr_counter: AtomicUsize::new(0),
             cache: None,
@@ -461,6 +530,49 @@ impl Engine {
             );
         }
         Ok(headers)
+    }
+
+    /// Every upstream request goes through here so custom host mappings apply
+    /// uniformly (probe, chunk fetch, cache fill — all of it). The mapping
+    /// itself lives in [`crate::hostmap`]; this is just the one funnel it
+    /// hooks into.
+    ///
+    /// A mapped request is also moved onto the proxy-bypassing client — see
+    /// [`direct_client_for`] for why that is the only way the mapping can
+    /// actually take effect.
+    fn upstream(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        mut headers: HeaderMap,
+    ) -> reqwest::RequestBuilder {
+        let Some(routed) = self.hostmap.route(url) else {
+            return self.client.request(method, url).headers(headers);
+        };
+        if let Some(host) = &routed.host_header {
+            // 用户自己写死的 Host 头优先级最高。
+            if let Ok(v) = HeaderValue::from_str(host) {
+                headers.entry(reqwest::header::HOST).or_insert(v);
+            }
+        }
+        let client = match &self.direct {
+            Some(c) => c,
+            // 表非空却没建起直连客户端（构建失败已经 warn 过），退回主客户端：
+            // 映射至少在 DNS 层还有机会生效，比整条请求发不出去强。
+            None => &self.client,
+        };
+        tracing::debug!(
+            "host map: {} {} via [{}]{}",
+            method,
+            url,
+            routed.matched,
+            if routed.host_header.is_some() {
+                ", URL rewritten + explicit Host"
+            } else {
+                ""
+            }
+        );
+        client.request(method, routed.url).headers(headers)
     }
 
     fn pick_url(&self) -> Result<String> {
@@ -881,9 +993,7 @@ impl Engine {
         } else {
             let head_start = Instant::now();
             let r = self
-                .client
-                .head(url)
-                .headers(base_headers.clone())
+                .upstream(reqwest::Method::HEAD, url, base_headers.clone())
                 .send()
                 .await
                 .ok()
@@ -942,7 +1052,10 @@ impl Engine {
         // supports byte ranges (even if it didn't advertise `Accept-Ranges`).
         let mut probe_headers = base_headers.clone();
         probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
-        let range_get = self.client.get(url).headers(probe_headers).send().await;
+        let range_get = self
+            .upstream(reqwest::Method::GET, url, probe_headers)
+            .send()
+            .await;
 
         let mut accepts_ranges = head_accept_ranges;
         if let Ok(resp) = &range_get {
@@ -1032,9 +1145,7 @@ impl Engine {
         let extra = client_range.map(|(s, e)| (s, e.unwrap_or(u64::MAX)));
         let headers = self.build_headers(extra)?;
         let resp = self
-            .client
-            .get(url)
-            .headers(headers)
+            .upstream(reqwest::Method::GET, &url, headers)
             .send()
             .await
             .map_err(ProxyError::Upstream)?;
@@ -1595,7 +1706,11 @@ impl Engine {
 
             let req_start = Instant::now();
             let _in_flight = self.in_flight_guard(&target.url);
-            let resp = match self.client.get(&target.url).headers(headers).send().await {
+            let resp = match self
+                .upstream(reqwest::Method::GET, &target.url, headers)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -1907,7 +2022,11 @@ impl Engine {
             );
             let req_start = Instant::now();
             let _in_flight = self.in_flight_guard(&target.url);
-            let resp = match self.client.get(&target.url).headers(headers).send().await {
+            let resp = match self
+                .upstream(reqwest::Method::GET, &target.url, headers)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -2090,7 +2209,11 @@ impl Engine {
             );
             let req_start = Instant::now();
             let _in_flight = self.in_flight_guard(&target.url);
-            let resp = match self.client.get(&target.url).headers(headers).send().await {
+            let resp = match self
+                .upstream(reqwest::Method::GET, &target.url, headers)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -2957,6 +3080,7 @@ mod tests {
             persist: false,
             plugins: Vec::new(),
             content_disposition: Default::default(),
+            host_mappings: Vec::new(),
         };
         let mut e = Engine::new(
             Arc::new(cfg),
@@ -3409,6 +3533,7 @@ mod tests {
             persist: false,
             plugins: Vec::new(),
             content_disposition: Default::default(),
+            host_mappings: Vec::new(),
         };
         // Empty mirror strings and empty volumes are scrubbed; valid order
         // is preserved.

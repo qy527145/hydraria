@@ -30,6 +30,8 @@ export interface TaskConfig {
   persist: boolean;
   plugins: TaskPluginConfig[];
   content_disposition: Disposition;
+  /** 任务级域名映射，与全局设置里的那份取并集，同名以任务级为准。 */
+  host_mappings: HostMapping[];
 }
 
 /** 磁盘上这份缓存的统计，由 CacheStore 汇总。 */
@@ -90,11 +92,35 @@ export interface TaskInfo {
   speed_samples: number[];
 }
 
+/**
+ * 一条域名映射：只改 TCP 连到哪儿，URL / Host 头 / TLS SNI 都保持原样，
+ * 所以带签名的地址不会因为换了出口而失效。
+ */
+export interface HostMapping {
+  /** 原域名、原 IP，或 `*.example.com` 形式的通配后缀。 */
+  from: string;
+  /** 目标域名或 IP，可带 `:端口`。 */
+  to: string;
+  enabled: boolean;
+}
+
+/** `GET /api/hostmap/resolve` 的响应：这个 host 到底会被连到哪儿。 */
+export interface HostResolution {
+  host: string;
+  /** 命中的映射目标；null = 没有规则命中，走的是正常 DNS。 */
+  mapped_to: string | null;
+  addresses: string[];
+  error: string | null;
+  /** 检测到的代理环境变量名。命中映射的请求会自动绕开代理，这里只是告知。 */
+  proxy_env: string | null;
+}
+
 export interface GlobalSettings {
   global_rate_limit_bps: number;
   global_rate_limit_algorithm: RateAlgorithm;
   plugin_globals: Record<string, unknown>;
   download_dir?: string | null;
+  host_mappings: HostMapping[];
 }
 
 export interface GlobalState {
@@ -197,8 +223,16 @@ export const api = {
 
   saveSettings: (settings: Partial<GlobalSettings>) =>
     request<GlobalSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(settings) }),
-  probe: (volumes: string[][], headers: Record<string, string>) =>
-    request<ProbeResult>('/api/probe', { method: 'POST', body: JSON.stringify({ volumes, headers }) }),
+  probe: (volumes: string[][], headers: Record<string, string>, host_mappings: HostMapping[] = []) =>
+    request<ProbeResult>('/api/probe', {
+      method: 'POST',
+      body: JSON.stringify({ volumes, headers, host_mappings }),
+    }),
+  /** 诊断：这个域名最终会被连到哪儿。带 taskId 就按该任务的生效表算。 */
+  resolveHost: (host: string, taskId?: string) =>
+    request<HostResolution>(
+      `/api/hostmap/resolve?host=${encodeURIComponent(host)}${taskId ? `&task_id=${taskId}` : ''}`,
+    ),
   savePluginGlobal: (id: string, config: unknown) =>
     request<void>(`/api/plugins/${id}/global`, { method: 'PUT', body: JSON.stringify(config) }),
 };

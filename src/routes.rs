@@ -10,7 +10,7 @@ use crate::models::{
 use crate::plugins::PluginInfo;
 use crate::schedule::Strategy;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -35,6 +35,15 @@ struct ApiError {
 }
 
 #[derive(Deserialize)]
+struct ResolveQuery {
+    /// 域名、IP，或者干脆整条 URL。
+    host: String,
+    /// 带上就按这个任务的生效表算（含它自己的任务级映射）。
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ProbeReq {
     /// Structured volume layout to probe. Each inner Vec is one volume's
     /// mirror URL list. The probe walks every volume, returning the merged
@@ -43,6 +52,10 @@ struct ProbeReq {
     volumes: Vec<Vec<String>>,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    /// 任务级域名映射。探测走的路径必须和真正播放时一致，否则「探测通过但一播
+    /// 就 502」会非常费解。
+    #[serde(default)]
+    host_mappings: Vec<crate::hostmap::HostMapping>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +116,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}/export", get(export_task))
         .route("/api/probe", post(probe_urls))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/hostmap/resolve", get(resolve_host))
         .route("/api/global", get(get_global))
         .route("/api/plugins", get(list_plugins))
         .route(
@@ -131,6 +145,42 @@ async fn put_settings(
     Ok(Json(s))
 }
 
+/// 诊断：这个 host 到底会被连到哪儿去。面板的「测试」按钮和排查时手动 curl 用的
+/// 都是它 —— 光看日志得先复现一次请求，这里可以随时问。
+///
+/// `task_id` 传了就用那个任务的生效表（全局 ∪ 任务级），不传就只看全局。
+async fn resolve_host(
+    State(state): State<AppState>,
+    Query(q): Query<ResolveQuery>,
+) -> Result<Json<crate::hostmap::Diagnosis>, ProxyError> {
+    let host = q.host.trim();
+    if host.is_empty() {
+        return Err(ProxyError::Internal("host must not be empty".into()));
+    }
+    // 顺手接受整条 URL —— 排查的时候手里有的通常是 URL，不是光秃秃一个域名。
+    let host = reqwest::Url::parse(host)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| host.to_string());
+
+    let table = match q.task_id.as_deref() {
+        Some(id) => {
+            let entry = state
+                .tasks
+                .read()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ProxyError::Internal(format!("no such task: {id}")))?;
+            let rules = entry.config.read().host_mappings.clone();
+            crate::hostmap::effective_for(&rules)
+                .map_err(ProxyError::Internal)?
+                .table
+        }
+        None => crate::hostmap::global_table(),
+    };
+    Ok(Json(crate::hostmap::diagnose(&table, &host).await))
+}
+
 async fn get_global(State(state): State<AppState>) -> Json<GlobalState> {
     Json(state.global_state())
 }
@@ -145,6 +195,7 @@ async fn create_task(
             "at least one URL is required across all volumes".into(),
         ));
     }
+    cfg.validate_host_mappings().map_err(ProxyError::Internal)?;
     let id = {
         let mut tries = 0;
         loop {
@@ -196,8 +247,10 @@ async fn probe_urls(
         persist: false,
         plugins: Vec::new(),
         content_disposition: Default::default(),
+        host_mappings: req.host_mappings.clone(),
     };
     cfg.normalize();
+    cfg.validate_host_mappings().map_err(ProxyError::Internal)?;
     let layout = cfg.effective_volumes();
     let engine = Engine::new(Arc::new(cfg), state.upstream.clone());
     let probe = engine.probe().await?;

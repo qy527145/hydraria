@@ -20,6 +20,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { FormInstance } from 'antd';
 import type {
   Disposition,
+  HostMapping,
   PluginEntry,
   ProbeResult,
   RateAlgorithm,
@@ -30,6 +31,7 @@ import type {
 import { api } from '../../api/client';
 import { useDashboard } from '../../stores/dashboard';
 import { formatBytes, parseSize, sizeInput } from '../../utils/format';
+import HostMapEditor from '../settings/HostMapEditor';
 import HeadersEditor from './HeadersEditor';
 import VolumeEditor from './VolumeEditor';
 
@@ -55,6 +57,7 @@ const newTaskConfig: TaskConfig = {
   persist: false,
   plugins: [],
   content_disposition: 'auto',
+  host_mappings: [],
 };
 
 /**
@@ -67,6 +70,7 @@ interface FormValues {
   rate_limit_bps: string;
   rate_limit_algorithm: RateAlgorithm;
   headers: string;
+  host_mappings: HostMapping[];
   name: string;
   output_filename: string;
   auto_filename: boolean;
@@ -87,6 +91,7 @@ function toFormValues(config: TaskConfig): FormValues {
     rate_limit_bps: sizeInput(config.rate_limit_bps),
     rate_limit_algorithm: config.rate_limit_algorithm,
     headers: Object.keys(config.headers).length ? JSON.stringify(config.headers, null, 2) : '',
+    host_mappings: config.host_mappings ?? [],
     name: config.name ?? '',
     output_filename: config.output_filename ?? '',
     auto_filename: config.auto_filename,
@@ -161,6 +166,8 @@ function toTaskConfig(
     persist: values.persist,
     plugins: toPluginConfigs(values, plugins, existing),
     content_disposition: values.content_disposition,
+    // 两头都空的行是加了没填完的，后端也会丢掉。
+    host_mappings: (values.host_mappings ?? []).filter(m => m.from.trim() || m.to.trim()),
   };
 }
 
@@ -320,7 +327,9 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
       setProbing(true);
       const raw = form.getFieldValue('headers') as string | undefined;
       const headers = raw?.trim() ? (JSON.parse(raw) as Record<string, string>) : {};
-      const result = await api.probe(volumes, headers);
+      // 探测必须和播放走同一条路：带上任务级映射，否则「探测通过一播就 502」。
+      const mappings = (form.getFieldValue('host_mappings') as HostMapping[] | undefined) ?? [];
+      const result = await api.probe(volumes, headers, mappings);
       setProbe(result);
       if (result.suggested_filename) form.setFieldValue('output_filename', result.suggested_filename);
     } catch (error) {
@@ -364,6 +373,14 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
         ]}
       >
         <HeadersEditor />
+      </Form.Item>
+
+      <Form.Item
+        name="host_mappings"
+        label="域名映射（仅本任务）"
+        tooltip="等价于 curl --resolve：只换 TCP 连接的目标地址，URL 与 Host 头保持原样，签名参数不受影响。与全局设置里的规则取并集，同名以这里为准。"
+      >
+        <HostMapEditor taskId={task?.task_id} />
       </Form.Item>
 
       <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -519,7 +536,7 @@ export default function TaskFormModal({ open, task, seed, onClose }: Props) {
 
 /** 表单字段 → 它所在的分组，用于校验失败时自动切过去。 */
 function tabOfField(name: string): string {
-  if (name === 'headers') return 'source';
+  if (name === 'headers' || name === 'host_mappings') return 'source';
   if (['max_per_volume', 'max_split', 'rate_limit_bps', 'rate_limit_algorithm', 'cache'].includes(name)) {
     return 'transfer';
   }
