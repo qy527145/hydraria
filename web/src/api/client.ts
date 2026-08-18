@@ -113,6 +113,9 @@ export interface HostResolution {
   error: string | null;
   /** 检测到的代理环境变量名。命中映射的请求会自动绕开代理，这里只是告知。 */
   proxy_env: string | null;
+  /** 这次解析是谁做的：`system`，或具体的 DoT 服务器（`tls://1.1.1.1`）。
+   *  只有命中映射、且目标还是域名时才可能不是 system。 */
+  resolver: string;
 }
 
 /**
@@ -129,6 +132,9 @@ export interface GlobalSettings {
   plugin_globals: Record<string, unknown>;
   download_dir?: string | null;
   host_mappings: HostMapping[];
+  /** 解析**映射目标**用的 DNS。null/空 = 系统解析；`tls://1.1.1.1` = 走 DoT
+   *  自己解析（绕开 TUN 代理的 fake-ip 劫持）。只作用于映射目标那一次解析。 */
+  dns?: string | null;
 }
 
 export interface GlobalState {

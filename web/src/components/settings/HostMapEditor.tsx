@@ -293,7 +293,11 @@ function ResultLine({ result }: { result: HostResolution | string }) {
       banner
       message={
         result.mapped_to
-          ? `已映射到 ${result.mapped_to}${addrs ? ` → ${addrs}` : ''}`
+          ? `已映射到 ${result.mapped_to}${addrs ? ` → ${addrs}` : ''}${
+              // 走了自建 DoT 就说一声：TUN 环境下这是「拿到的是真实地址还是
+              // fake-ip」的唯一区别，出问题时第一个要看的就是它。
+              result.resolver && result.resolver !== 'system' ? `（经 ${result.resolver} 解析）` : ''
+            }`
           : `没有规则命中，走正常 DNS${addrs ? `：${addrs}` : ''}`
       }
     />

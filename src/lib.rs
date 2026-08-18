@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cache;
+pub mod dns;
 pub mod download;
 pub mod engine;
 pub mod error;

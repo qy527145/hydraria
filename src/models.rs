@@ -783,6 +783,14 @@ pub struct GlobalSettings {
     /// 连接池里，拿不到「这条请求属于哪个任务」的上下文。
     #[serde(default)]
     pub host_mappings: Vec<crate::hostmap::HostMapping>,
+    /// 解析**映射目标**用的 DNS。`None` / 空 = 系统解析器（默认）。
+    /// 写 `tls://1.1.1.1` 则自己走 DoT 查 —— 开着 TUN 模式的代理时系统解析会
+    /// 返回 fake-ip，域名映射会因此静默失效，详见 [`crate::dns`]。
+    ///
+    /// 与 `host_mappings` 一样放全局：解析发生在进程唯一那个连接池里，拿不到
+    /// 「这条请求属于哪个任务」的上下文；而 TUN 本来也是整机状态。
+    #[serde(default)]
+    pub dns: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -793,6 +801,7 @@ pub struct GlobalSettingsUpdate {
     pub plugin_globals: Option<HashMap<String, serde_json::Value>>,
     pub download_dir: Option<String>,
     pub host_mappings: Option<Vec<crate::hostmap::HostMapping>>,
+    pub dns: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -986,6 +995,11 @@ impl AppState {
             maps.retain(|m| !m.from.trim().is_empty() || !m.to.trim().is_empty());
             crate::hostmap::validate(maps).map_err(|e| format!("host mapping: {e}"))?;
         }
+        // DNS 同理：配错了整个保存失败，不留「限速改了、DNS 没改」的半吊子状态。
+        let dns_mode = match upd.dns.as_deref() {
+            Some(raw) => Some(crate::dns::parse_mode(Some(raw))?),
+            None => None,
+        };
         let mut s = self.settings.write();
         if let Some(r) = upd.global_rate_limit_bps {
             s.global_rate_limit_bps = r;
@@ -1023,6 +1037,10 @@ impl AppState {
             // 报错回去让用户看见比 unwrap 掉进程好。
             crate::hostmap::install(&maps).map_err(|e| format!("host mapping: {e}"))?;
             s.host_mappings = maps;
+        }
+        if let Some(mode) = dns_mode {
+            crate::hostmap::install_dns(&mode)?;
+            s.dns = crate::dns::describe(&mode);
         }
         Ok(s.clone())
     }
@@ -1133,6 +1151,15 @@ impl AppState {
         // 恢复，用户在设置里改回来即可。
         if let Err(e) = crate::hostmap::install(&p.settings.host_mappings) {
             tracing::warn!("persisted host mappings are invalid, ignoring them: {e}");
+        }
+        // 解析映射目标用的 DNS，同样「坏配置不拦启动」：装不上就退回系统解析。
+        match crate::dns::parse_mode(p.settings.dns.as_deref())
+            .and_then(|mode| crate::hostmap::install_dns(&mode))
+        {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!("persisted dns setting is invalid, using the system resolver: {e}")
+            }
         }
 
         let mut count = 0;

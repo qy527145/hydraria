@@ -10,6 +10,7 @@ interface SettingsForm {
   global_rate_limit_bps: string;
   global_rate_limit_algorithm: RateAlgorithm;
   host_mappings: HostMapping[];
+  dns: string;
 }
 
 interface Props {
@@ -29,6 +30,7 @@ export default function SettingsModal({ open, onClose, global }: Props) {
         global_rate_limit_bps: sizeInput(settings.global_rate_limit_bps),
         global_rate_limit_algorithm: settings.global_rate_limit_algorithm,
         host_mappings: settings.host_mappings ?? [],
+        dns: settings.dns ?? '',
       }),
     );
   }, [open, form]);
@@ -44,6 +46,7 @@ export default function SettingsModal({ open, onClose, global }: Props) {
           global_rate_limit_algorithm: values.global_rate_limit_algorithm,
           // 两头都空的行是加了又没填的，后端也会丢掉，这里先滤一遍免得白跑一趟。
           host_mappings: (values.host_mappings ?? []).filter(m => m.from.trim() || m.to.trim()),
+          dns: (values.dns ?? '').trim(),
         }),
       );
       message.success('全局设置已保存');
@@ -73,6 +76,14 @@ export default function SettingsModal({ open, onClose, global }: Props) {
           tooltip="等价于 curl --resolve：只换 TCP 连接的目标地址，URL 与 Host 头保持原样，签名参数不受影响。对所有任务生效。"
         >
           <HostMapEditor scope="global" />
+        </Form.Item>
+        <Form.Item
+          name="dns"
+          label="映射目标的解析 DNS（空=系统解析）"
+          tooltip="只用来解析上面那些映射目标的域名，其余请求一律照常走系统解析。开着 TUN 模式的代理时系统解析会返回 fake-ip（198.18.x.x），映射就会静默失效——表现为连上了、状态码也对、但一个字节都不来。这时填 tls://1.1.1.1 让 Hydraria 自己走 DNS over TLS 查真实地址即可。只收 IP 地址；查不通会自动退回系统解析。"
+          extra="开了 TUN 代理而下载不动时填它；国内可用 tls://223.5.5.5，通常更快"
+        >
+          <Input placeholder="留空=系统解析；tls://1.1.1.1" />
         </Form.Item>
       </Form>
       <div className="settings-cache">

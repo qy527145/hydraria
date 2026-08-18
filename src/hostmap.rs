@@ -271,6 +271,45 @@ static GLOBAL_RULES: LazyLock<RwLock<Arc<Vec<HostMapping>>>> =
     LazyLock::new(|| RwLock::new(Arc::new(Vec::new())));
 /// 每换一次全局表加一。任务级的表和客户端是快照，靠它作废重建。
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// 解析映射目标用的 DoT 解析器。`None` = 交给系统解析器（默认，老行为）。
+///
+/// 只在**映射命中、且目标是域名**时才会用到它，见 [`resolve_target`]。开着 TUN
+/// 模式的代理时系统解析会给出 fake-ip，映射因此静默失效 —— 详见 [`crate::dns`]。
+static DOT: LazyLock<RwLock<Option<Arc<crate::dns::DotResolver>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// 装载解析映射目标用的 DNS。与 [`install`] 一样，启动恢复配置和每次保存全局
+/// 设置时各调一次。
+pub fn install_dns(mode: &crate::dns::DnsMode) -> Result<(), String> {
+    match mode {
+        crate::dns::DnsMode::System => {
+            if DOT.read().is_some() {
+                tracing::info!("host map dns: back to the system resolver");
+            }
+            *DOT.write() = None;
+        }
+        crate::dns::DnsMode::Dot(server) => {
+            let resolver = Arc::new(crate::dns::DotResolver::new(*server)?);
+            tracing::info!("host map dns: resolving mapping targets over DoT via {server}");
+            *DOT.write() = Some(resolver);
+        }
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 当前装载的解析器，没装就是 `None`。
+fn dot() -> Option<Arc<crate::dns::DotResolver>> {
+    DOT.read().clone()
+}
+
+/// 当前 DNS 设置的原样回显（给设置接口读回去）。
+pub fn dns_setting() -> Option<String> {
+    dot().map(|r| {
+        crate::dns::describe(&crate::dns::DnsMode::Dot(r.server()))
+            .unwrap_or_else(|| r.server().to_string())
+    })
+}
 
 /// 校验并装载一组全局规则。启动恢复配置和每次保存全局设置时各调一次。
 ///
@@ -418,6 +457,41 @@ async fn system_lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io
         .map(|it| it.collect())
 }
 
+/// 解析**映射目标**的域名。装了 DoT 就走 DoT，否则（或 DoT 失败）走系统解析。
+///
+/// 这是 DoT 的唯一作用点，故意不放进 [`system_lookup`]：那个函数也负责「没命中
+/// 映射」的那条路，而没命中映射的请求不该改变任何行为 —— 命中映射才意味着用户
+/// 明确指定了「连这里」，也只有那条链路会被 TUN 的 fake-ip 搞坏。
+///
+/// DoT 失败一律退回系统解析，宁可回到老行为，也不要因为 DNS 配错就把整条下载
+/// 判死。
+async fn resolve_target(host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+    let Some(resolver) = dot() else {
+        return system_lookup(host, port).await;
+    };
+    match resolver.lookup(host).await {
+        Ok(ips) => {
+            tracing::debug!(
+                "host map dns: {host} resolved over DoT to {}",
+                ips.iter()
+                    .map(IpAddr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Ok(ips
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect())
+        }
+        Err(e) => {
+            tracing::warn!(
+                "host map dns: DoT lookup for {host} failed, falling back to the system resolver: {e}"
+            );
+            system_lookup(host, port).await
+        }
+    }
+}
+
 /// 装在上游 `reqwest::Client` 上的 DNS 解析器：命中映射就返回目标地址，否则原样
 /// 交给系统解析器。
 ///
@@ -462,7 +536,13 @@ impl Resolve for MappedResolver {
                 Some(Target::Host(h, port)) => (h, port, true),
                 None => (host.clone(), 0, false),
             };
-            match system_lookup(&lookup_host, port).await {
+            // 命中映射的目标走 resolve_target（可能是 DoT）；没命中的一律系统解析。
+            let looked_up = if mapped {
+                resolve_target(&lookup_host, port).await
+            } else {
+                system_lookup(&lookup_host, port).await
+            };
+            match looked_up {
                 Ok(addrs) if mapped => {
                     tracing::info!(
                         "host map: {host} resolved via {lookup_host} to {}",
@@ -509,7 +589,9 @@ pub async fn diagnose(table: &HostTable, host: &str) -> Diagnosis {
     let lookup = match table.lookup(bare) {
         // 目标就是 IP，没有解析这一步。
         Some(Target::Ip(ip, _)) => Ok(vec![SocketAddr::new(ip, 0)]),
-        Some(Target::Host(h, _)) => system_lookup(&h, 0).await,
+        // 命中映射：这一跳与真实请求走同一条解析路径（可能是 DoT），
+        // 否则「测试」测的就不是实际会发生的事。
+        Some(Target::Host(h, _)) => resolve_target(&h, 0).await,
         None if bare.parse::<IpAddr>().is_ok() => {
             Ok(vec![SocketAddr::new(bare.parse().unwrap(), 0)])
         }
@@ -525,7 +607,17 @@ pub async fn diagnose(table: &HostTable, host: &str) -> Diagnosis {
         addresses,
         error,
         proxy_env: proxy_env(),
+        // 只有命中映射的目标域名才会走 DoT，所以这里如实反映「这次是谁解析的」。
+        resolver: match (&mapped_to_is_host(table, bare), dns_setting()) {
+            (true, Some(dns)) => dns,
+            _ => "system".to_owned(),
+        },
     }
+}
+
+/// 这个 host 命中的映射目标是不是一个「还需要解析」的域名。
+fn mapped_to_is_host(table: &HostTable, host: &str) -> bool {
+    matches!(table.lookup(host), Some(Target::Host(_, _)))
 }
 
 /// [`diagnose`] 的结果，也是 `GET /api/hostmap/resolve` 的响应体。
@@ -539,6 +631,9 @@ pub struct Diagnosis {
     pub error: Option<String>,
     /// 检测到的代理环境变量名。命中映射的请求会绕开代理，这里只是告知。
     pub proxy_env: Option<String>,
+    /// 这次解析是谁做的：`system`，或者具体的 DoT 服务器（`tls://1.1.1.1`）。
+    /// 只有命中映射、且目标还是域名时才可能不是 `system`。
+    pub resolver: String,
 }
 
 /// 装载全局表的用例互相会踩 —— 同一个二进制里的测试是并行跑的，而全局表是

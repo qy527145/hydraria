@@ -464,11 +464,14 @@ curl -X POST http://127.0.0.1:9527/api/probe -H 'content-type: application/json'
 
 ```json
 { "host": "cdn.example.com", "mapped_to": "1.2.3.4:8443",
-  "addresses": ["1.2.3.4"], "error": null, "proxy_env": "HTTPS_PROXY" }
+  "addresses": ["1.2.3.4"], "error": null, "proxy_env": "HTTPS_PROXY",
+  "resolver": "system" }
 ```
 
 `mapped_to: null` = 没有规则命中，走的是正常 DNS。`proxy_env` 只是告知检测到了代理
-环境变量（命中映射的请求本来就会绕开代理）。
+环境变量（命中映射的请求本来就会绕开代理）。`resolver` 是这次解析的执行者：
+`system`，或具体的 DoT 服务器（`tls://1.1.1.1`）—— 只有「命中映射、且目标还是
+域名」时才可能不是 `system`，TUN 环境下排查「拿到的是真实地址还是 fake-ip」先看它。
 
 ### `POST /api/hostmap/resolve` — 诊断**编辑中**的映射
 
@@ -497,6 +500,7 @@ PUT 是局部更新，只动出现过的键。
 | `global_rate_limit_bps` | 全局限速，`0` = 不限，收 `"10M"` 这类写法 |
 | `global_rate_limit_algorithm` | `token_bucket` / `sliding_window` |
 | `host_mappings` | 全局域名映射，对所有任务生效。**任何一条不合法都会让整个 PUT 失败** —— 半张表比没有表更难排查 |
+| `dns` | 解析**映射目标**用的 DNS。空 / 省略 = 系统解析器；`tls://1.1.1.1` = 自己走 DoT 查（只收 IP 地址，非 IP 会让整个 PUT 失败）。开着 TUN 模式的代理时系统解析会给 fake-ip，域名映射会静默失效 —— 见 [MANUAL §6.5](MANUAL.md#65-域名映射等价于-curl---resolve)。**只作用于映射目标那一次解析**，没命中映射的请求照常走系统解析；DoT 查不通自动退回系统解析 |
 | `plugin_globals` | 按插件 id 索引的全局配置 |
 | `download_dir` | 下载按钮的默认目录 |
 

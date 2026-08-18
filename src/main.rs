@@ -63,6 +63,14 @@ enum Command {
         #[arg(long = "map")]
         maps: Vec<String>,
 
+        /// DNS used to resolve **mapping targets**, e.g. `--dns tls://1.1.1.1`
+        /// (DNS-over-TLS, IP address only). Needed when a TUN-mode proxy
+        /// hijacks resolution into fake-ips, which silently breaks host
+        /// mapping. Unset = the system resolver. Only mapped targets go
+        /// through it; everything else resolves as before.
+        #[arg(long)]
+        dns: Option<String>,
+
         /// Max concurrent chunk fetchers.
         #[arg(long, default_value_t = 16)]
         threads: usize,
@@ -105,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             headers,
             maps,
+            dns,
             threads,
             split,
             volumes,
@@ -115,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(|| home_subdir("cache"));
             run_download(
-                urls, output, headers, maps, threads, split, volumes, cache, cache_dir,
+                urls, output, headers, maps, dns, threads, split, volumes, cache, cache_dir,
             )
             .await
         }
@@ -208,6 +217,7 @@ async fn run_download(
     output: PathBuf,
     raw_headers: Vec<String>,
     raw_maps: Vec<String>,
+    dns: Option<String>,
     threads: usize,
     split: String,
     volumes_mode: bool,
@@ -223,6 +233,11 @@ async fn run_download(
     // reads it), so this installs them rather than putting them on the config.
     hydraria::hostmap::install(&parse_map_args(&raw_maps)?)
         .map_err(|e| anyhow::anyhow!("--map: {e}"))?;
+    // 映射目标怎么解析。开着 TUN 模式的代理时系统解析会给 fake-ip，映射静默
+    // 失效 —— `--dns tls://1.1.1.1` 让它自己去查真实地址。
+    let dns_mode =
+        hydraria::dns::parse_mode(dns.as_deref()).map_err(|e| anyhow::anyhow!("--dns: {e}"))?;
+    hydraria::hostmap::install_dns(&dns_mode).map_err(|e| anyhow::anyhow!("--dns: {e}"))?;
 
     // Build a one-off TaskConfig and run it through the same engine the
     // server uses. We construct `volumes` directly from the CLI URL list:

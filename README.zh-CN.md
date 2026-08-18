@@ -25,6 +25,7 @@ Hydraria 把一个慢的、单一来源的 HTTP 下载，重写成多源并行�
 - **背压感知流** —— chunk planner 走有界 `tokio::sync::mpsc` 管线，客户端读慢就会自然反压到上游抓取，不会爆内存。
 - **任务级自定义请求头** —— 任务创建时一次设好 `Cookie`、`User-Agent`、`Referer` 等，所有上游 chunk 请求都会带上。
 - **域名映射** —— 等价于 `curl --resolve`，全局和任务级都能配（`host_mappings`，两层取并集、同名以任务级为准；CLI 用 `--map 原域名=目标`）。域名公共 DNS 解析不出来、又不能改 URL（一改签名失效）时，把它指到已知 IP 或备用域名即可。**只换 TCP 连到哪儿**：URL、`Host` 头、TLS SNI 全部保持原样，签名照常通过。支持 `*.example.com` 通配、目标带端口、原地址是裸 IP。命中映射的请求会**自动绕开代理** —— 否则域名由代理解析，映射静默失效。`POST /api/hostmap/resolve`（面板上是每行末尾的 ⚡）可以随时查这个域名最终会被连到哪儿 —— 包括还在编辑、尚未保存的规则。
+- **映射目标的 DNS（DoT）** —— 开着 **TUN 模式**的代理时，系统解析会把映射目标返回成 fake-ip（`198.18.0.0/15`），域名映射因此静默失效：连得上、状态码也对、但一个字节都不来。设置里的 `dns` 填 `tls://1.1.1.1`（CLI 是 `--dns`）即可让 Hydraria 自己走 DNS-over-TLS 查真实地址 —— TUN 环境里 UDP 53 往往也一并被劫持，所以走的是 TLS。**作用范围只有映射目标那一次解析**：没命中映射的请求照常走系统解析，行为一个字节不变；DoT 查不通会自动退回系统解析，不会把原本好用的下载弄坏。只收 IP 地址（解析器地址本身要是还得先解析一次域名，就又回到起点了）。
 - **暂停 / 恢复 / 编辑** —— 任务可暂停（流返回 503，配置和缓存仍在），可通过 `PATCH /api/tasks/:id` 在线编辑，无需删了重建。
 - **限速** —— 任务级和全局级令牌桶（任务上 `rate_limit_bps`，设置里 `global_rate_limit_bps`）。允许小幅突发，长程均值压在上限。
 - **持久化** —— `persist` **默认开启**：任务落盘到 `~/.hydraria/tasks.json`（状态变化时每 ~5s 原子写一次），下次启动自动恢复，贴进播放列表或脚本里的短链不会因为重启变成死链。设置也一并持久化。临时任务把 `persist` 关掉即可。
@@ -41,6 +42,7 @@ Hydraria 把一个慢的、单一来源的 HTTP 下载，重写成多源并行�
 | 缓存 | [src/cache.rs](src/cache.rs) | 按 URL 集合分桶的稀疏文件 + 1 MB 块位图，ETag 不匹配自动失效。 |
 | 限速 | [src/ratelimit.rs](src/ratelimit.rs) | 令牌桶（任务级 + 全局）。 |
 | 域名映射 | [src/hostmap.rs](src/hostmap.rs) | `curl --resolve` 的等价物：一张挂在客户端 DNS 解析器背后、可热更新的表，只改 TCP 连到哪儿。 |
+| DoT 解析器 | [src/dns.rs](src/dns.rs) | 自己解析映射目标，绕开 TUN 代理的 fake-ip 劫持。只在映射命中时使用，失败退回系统解析。 |
 | 控制面 | [src/routes.rs](src/routes.rs), [src/models.rs](src/models.rs) | 任务管理器、REST API、短链生成、内存任务表、每任务健康度跟踪、吞吐采样、持久化。 |
 | 应用层 | [src/main.rs](src/main.rs), [src/assets.rs](src/assets.rs) | CLI（`--bind`、`--cache-dir`、`--state-file`），axum 服务，根路径暴露面板。 |
 | Web UI | [web/index.html](web/index.html) | 单文件面板（原生 JS，零构建步骤）：弹窗创建表单、网格/列表切换、搜索、源健康度面板、实时迷你图、表单实时校验、复制带✓ 反馈。 |

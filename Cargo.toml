@@ -68,6 +68,12 @@ chacha20 = "0.9"
 rand = "0.8"
 base64 = "0.22"
 httpdate = "1.0.3"
+# DoT 解析器用（见 src/dns.rs）。版本与 reqwest 传递进来的那份一致，特性是可加的，
+# 不会多编一份 rustls；provider 与根证书都跟着 reqwest 的选择（aws-lc-rs +
+# platform-verifier），不额外引入第二个 crypto 后端或另一份证书数据。
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
 
 [profile.release]
 opt-level = 3
